@@ -72,6 +72,7 @@ def load_sops():
                     previous = node_id
         sops.append({
             "id": sop_id,
+            "raw_id": sop_id,
             "name": sop.get("name", sop_id),
             "title": sop.get("title", sop.get("name", sop_id)),
             "version": sop.get("version", ""),
@@ -81,12 +82,18 @@ def load_sops():
             "sop_file": str(sop_file),
             "nodes": nodes,
         })
+    counts = {}
+    for sop in sops:
+        counts[sop["id"]] = counts.get(sop["id"], 0) + 1
+    for sop in sops:
+        if counts.get(sop["id"], 0) > 1:
+            sop["id"] = sop["wiki_dir"]
     return sops
 
 
 def find_sop(sop_id):
     for sop in load_sops():
-        if sop_id in {sop["id"], sop["name"], sop["wiki_dir"]}:
+        if sop_id in {sop["id"], sop["raw_id"], sop["name"], sop["wiki_dir"], sop.get("repo", "")}:
             return sop
     return None
 
