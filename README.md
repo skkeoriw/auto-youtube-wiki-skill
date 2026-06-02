@@ -52,15 +52,16 @@ bash <(curl -fsSL 'https://skill.vyibc.com/install-youtube-wiki.sh')
 
 本 skill 将本地 shell 脚本包装成 HTTP 服务，再通过 auto-domain 暴露到公网。
 
-**在服务所在机器上，按顺序执行：**
+**在服务所在机器上，执行标准 setup 脚本：**
 
 ```bash
-# 1. 启动本地 HTTP bridge（包装 scripts/local-script.sh）
-./scripts/start-local-service.sh --port=18121 --daemon
-
-# 2. 用 auto-domain 打洞到公网
-bash <(curl -fsSL https://skill.vyibc.com/auto-domain.sh) --port=18121 --name=youtube-wiki --daemon
+./scripts/setup-service.sh \
+  --name=youtube-wiki \
+  --repo=skkeoriw/llm-wiki-210-smoke
 ```
+
+脚本会启动本地 HTTP bridge、注册 auto-domain 隧道，并把可复制的
+Skill/CLI 命令以 JSON metadata 写入 tunnel-admin。
 
 之后在任何地方执行 skill，都会调用到这台机器上的本地脚本：
 
@@ -71,6 +72,7 @@ bash <(curl -fsSL https://skill.vyibc.com/youtube-wiki.sh) --mode=...
 - `scripts/local-script.sh` — 本地重量级脚本，编辑此文件实现业务逻辑
 - `scripts/bridge.py` — Python HTTP bridge，无需修改
 - `scripts/start-local-service.sh` — bridge 启动脚本
+- `scripts/setup-service.sh` — 标准服务部署脚本，负责 bridge + tunnel metadata
 
 ---
 
@@ -118,7 +120,8 @@ bash <(curl -fsSL https://skill.vyibc.com/publish-youtube-wiki.sh)
 README.md
 scripts/
   youtube-wiki.sh                    # CLI 直接执行入口
-    start-local-service.sh      # 启动本地脚本服务
+  start-local-service.sh             # 启动本地脚本服务
+  setup-service.sh                   # 部署 bridge + auto-domain
   publish-youtube-wiki.sh             # 远程一键发布
   publish-skill.sh             # 本地发布
   upload-file.sh               # R2 上传工具
