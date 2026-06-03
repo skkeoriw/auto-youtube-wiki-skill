@@ -8,6 +8,8 @@ PORT="18121"
 NAME="${YOUTUBE_WIKI_PUBLIC_NAME:-youtube-wiki}"
 ENDPOINT=""
 REPO="${WIKI_GITHUB_REPO:-}"
+RUNTIME_ID="${YOUTUBE_WIKI_RUNTIME_ID:-youtube-wiki}"
+UI_URL="${SOP_UI_URL:-https://sop-ui.chxyka.ccwu.cc}"
 AUTO_DOMAIN_SERVER="${AUTO_DOMAIN_SERVER:-wss://tunnel-api.chxyka.ccwu.cc}"
 AGENT_URL="${AGENT_URL:-https://skill.vyibc.com/agent.js}"
 
@@ -17,6 +19,8 @@ while [ "$#" -gt 0 ]; do
     --name=*) NAME="${1#--name=}" ; shift ;;
     --endpoint=*) ENDPOINT="${1#--endpoint=}" ; shift ;;
     --repo=*) REPO="${1#--repo=}" ; shift ;;
+    --runtime-id=*) RUNTIME_ID="${1#--runtime-id=}" ; shift ;;
+    --ui-url=*) UI_URL="${1#--ui-url=}" ; shift ;;
     -h|--help)
       cat <<'EOF'
 Usage:
@@ -63,12 +67,19 @@ if [ -f "$CHANNEL_DIR/agent.pid" ] && kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 
 fi
 
 METADATA="$(
-  python3 - "$NAME" "$ENDPOINT" "$REPO" <<'PY'
+  python3 - "$NAME" "$ENDPOINT" "$REPO" "$RUNTIME_ID" "$UI_URL" <<'PY'
 import json, sys
 
-name, endpoint, repo = sys.argv[1:]
+name, endpoint, repo, runtime_id, ui_url = sys.argv[1:]
 print(json.dumps({
     "title": name,
+    "type": "sop-runtime",
+    "runtime_id": runtime_id,
+    "channel_name": name,
+    "channel_url": endpoint,
+    "spi_base_url": f"{endpoint.rstrip('/')}/api/sop",
+    "supported_sop_types": ["youtube-research-wiki"],
+    "ui_url": ui_url,
     "endpoint_url": endpoint,
     "wiki_repo": repo,
     "skill_install_command": "bash <(curl -fsSL 'https://skill.vyibc.com/install-youtube-wiki.sh?ts=20260601121037')",

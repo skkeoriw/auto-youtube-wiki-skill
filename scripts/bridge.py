@@ -3,12 +3,13 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import yaml
 
 PORT = int(os.environ.get("BRIDGE_PORT", "18789"))
 SCRIPT = os.environ.get("BRIDGE_SCRIPT", "")
+REGISTRY_PATH = Path(os.environ.get("SOP_REGISTRY_PATH", str(Path.home() / ".sop" / "registry.json"))).expanduser()
 
 
 def json_response(handler, status, data):
@@ -44,12 +45,27 @@ def read_json(path):
         return None
 
 
-def load_sops():
+def read_yaml(path):
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def read_registry():
+    data = read_json(REGISTRY_PATH) or {}
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("instances"), list):
+        data["instances"] = []
+    return data
+
+
+def scanned_sops():
     sops = []
     for sop_file in sorted(wiki_base().glob("*/sop.yaml")):
-        try:
-            sop = yaml.safe_load(sop_file.read_text(encoding="utf-8")) or {}
-        except Exception:
+        sop = read_yaml(sop_file)
+        if not sop:
             continue
         raw_wiki_path = Path(str(sop.get("wiki_local_path") or sop_file.parent)).expanduser()
         wiki_path = raw_wiki_path if raw_wiki_path.is_absolute() else sop_file.parent
@@ -91,6 +107,64 @@ def load_sops():
     return sops
 
 
+def sop_from_instance(runtime, instance):
+    wiki_path = Path(str(instance.get("local_path", ""))).expanduser()
+    sop_file = wiki_path / "sop.yaml"
+    sop = read_yaml(sop_file)
+    if not sop:
+        return None
+    nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
+    if not nodes:
+        previous = ""
+        for stage in sop.get("pipeline", []):
+            if not isinstance(stage, dict) or not stage.get("stage"):
+                continue
+            node_id = stage["stage"]
+            nodes[node_id] = {
+                "title": node_id,
+                "mode": "manual" if node_id == "retry" else "blocking",
+                "needs": [previous] if previous and node_id != "retry" else [],
+                "webhook_route": stage.get("webhook_route", ""),
+                "trigger": {"type": "file", "path": stage.get("trigger", "")},
+            }
+            if node_id != "retry":
+                previous = node_id
+    instance_id = instance.get("instance_id") or wiki_path.name
+    return {
+        "id": instance_id,
+        "instance_id": instance_id,
+        "raw_id": sop.get("id") or sop.get("name") or instance_id,
+        "sop_type": instance.get("sop_type") or sop.get("id") or sop.get("name", ""),
+        "name": sop.get("name", instance_id),
+        "title": sop.get("title", sop.get("name", instance_id)),
+        "version": sop.get("version", ""),
+        "repo": instance.get("repo") or sop.get("repo", ""),
+        "wiki_dir": wiki_path.name,
+        "wiki_local_path": str(wiki_path),
+        "sop_file": str(sop_file),
+        "nodes": nodes,
+        "enabled": bool(instance.get("enabled", True)),
+        "runtime_id": runtime.get("runtime_id", ""),
+        "channel_name": runtime.get("channel_name", ""),
+        "channel_url": runtime.get("channel_url", ""),
+        "spi_base_url": runtime.get("spi_base_url", ""),
+        "created_at": instance.get("created_at", ""),
+        "updated_at": instance.get("updated_at", ""),
+    }
+
+
+def load_sops():
+    registry = read_registry()
+    sops = []
+    for instance in registry.get("instances", []):
+        if not isinstance(instance, dict) or not instance.get("enabled", True):
+            continue
+        sop = sop_from_instance(registry, instance)
+        if sop:
+            sops.append(sop)
+    return sops
+
+
 def find_sop(sop_id):
     for sop in load_sops():
         if sop_id in {sop["id"], sop["raw_id"], sop["name"], sop["wiki_dir"], sop.get("repo", "")}:
@@ -99,11 +173,21 @@ def find_sop(sop_id):
 
 
 def sop_manifest():
+    registry = read_registry()
     return {
-        "runtime": "youtube-wiki",
+        "runtime": registry.get("runtime_id", "youtube-wiki"),
+        "runtime_id": registry.get("runtime_id", "youtube-wiki"),
+        "channel": {
+            "name": registry.get("channel_name", ""),
+            "url": registry.get("channel_url", ""),
+            "spi_base_url": registry.get("spi_base_url", ""),
+        },
+        "registry_path": str(REGISTRY_PATH),
         "sops": [
             {
                 "id": sop["id"],
+                "instance_id": sop["instance_id"],
+                "sop_type": sop["sop_type"],
                 "title": sop["title"],
                 "version": sop["version"],
                 "repo": sop["repo"],
@@ -113,6 +197,15 @@ def sop_manifest():
             }
             for sop in load_sops()
         ],
+    }
+
+
+def sop_instances():
+    manifest = sop_manifest()
+    return {
+        "runtime_id": manifest["runtime_id"],
+        "channel": manifest["channel"],
+        "instances": manifest["sops"],
     }
 
 
@@ -141,12 +234,20 @@ def run_files(sop):
     return sorted(base.glob("*/run.json"), key=lambda f: f.stat().st_mtime, reverse=True)
 
 
-def sop_runs(sop):
+def sop_runs(sop, query=None):
+    query = query or {}
+    try:
+        limit = max(1, min(200, int((query.get("limit") or ["80"])[0])))
+    except Exception:
+        limit = 80
+    status_filter = (query.get("status") or [""])[0]
     runs = []
-    for run_file in run_files(sop)[:80]:
+    for run_file in run_files(sop):
         data = read_json(run_file)
-        if data:
+        if data and (not status_filter or data.get("status") == status_filter):
             runs.append(data)
+        if len(runs) >= limit:
+            break
     return {"sop_id": sop["id"], "runs": runs}
 
 
@@ -183,10 +284,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+        parsed = urlparse(self.path)
+        path = [unquote(p) for p in parsed.path.strip("/").split("/") if p]
+        query = parse_qs(parsed.query)
         try:
             if path == ["api", "sop"]:
                 return json_response(self, 200, sop_manifest())
+            if path == ["api", "sop", "instances"]:
+                return json_response(self, 200, sop_instances())
+            if path == ["api", "sop", "debug", "scanned"]:
+                return json_response(self, 200, {"sops": scanned_sops()})
             if len(path) >= 3 and path[0] == "api" and path[1] == "sop":
                 sop = find_sop(path[2])
                 if not sop:
@@ -196,7 +303,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(path) == 4 and path[3] == "dag":
                     return json_response(self, 200, sop_dag(sop))
                 if len(path) == 4 and path[3] == "runs":
-                    return json_response(self, 200, sop_runs(sop))
+                    return json_response(self, 200, sop_runs(sop, query))
                 if len(path) == 5 and path[3] == "runs":
                     run_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "run.json"
                     data = read_json(run_file)
