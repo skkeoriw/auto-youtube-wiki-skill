@@ -58,6 +58,17 @@ curl -sf "http://127.0.0.1:$PORT" >/dev/null || {
 CHANNEL_DIR="$HOME/.auto-domain-$NAME"
 mkdir -p "$CHANNEL_DIR"
 curl -fsSL "$AGENT_URL" -o "$CHANNEL_DIR/agent.js"
+python3 - "$CHANNEL_DIR/agent.js" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "body: (method !== 'GET' && method !== 'HEAD') ? Buffer.from(body, 'base64') : undefined,"
+new = "body: (method !== 'GET' && method !== 'HEAD' && body) ? Buffer.from(body, 'base64') : undefined,"
+if old in text:
+    path.write_text(text.replace(old, new), encoding="utf-8")
+PY
 printf '%s\n' '{"name":"auto-domain-youtube-wiki","private":true,"dependencies":{"ws":"^8.18.0"}}' > "$CHANNEL_DIR/package.json"
 (cd "$CHANNEL_DIR" && npm install --silent --prefer-offline)
 
