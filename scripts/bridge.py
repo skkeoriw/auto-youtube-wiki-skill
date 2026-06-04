@@ -245,16 +245,25 @@ def node_runtime_detail(sop, pipeline_id, node_id):
             actual_outputs[name] = [record["path"] for record in records]
             artifacts.extend(records)
 
+    # Only compute discovered candidates for historical runs that have no recorded
+    # actual_outputs. For runs with a proper Run Workspace, actual_outputs is
+    # authoritative and the glob scan adds no value — and grows without bound.
     actual_paths = {artifact["path"] for artifact in artifacts}
     discovered_candidates = []
-    for name, spec in declared_outputs.items():
-        for candidate in resolve_output_artifacts(
-            sop, pipeline_id, node_id, name, spec, context, state.get("run_id", ""),
-            include_context=False,
-        ):
-            if candidate["path"] not in actual_paths:
-                candidate["ownership"] = "unconfirmed"
-                discovered_candidates.append(candidate)
+    if not has_recorded_outputs:
+        _CANDIDATE_LIMIT = 10
+        for name, spec in declared_outputs.items():
+            if len(discovered_candidates) >= _CANDIDATE_LIMIT:
+                break
+            for candidate in resolve_output_artifacts(
+                sop, pipeline_id, node_id, name, spec, context, state.get("run_id", ""),
+                include_context=False,
+            ):
+                if candidate["path"] not in actual_paths:
+                    candidate["ownership"] = "unconfirmed"
+                    discovered_candidates.append(candidate)
+                    if len(discovered_candidates) >= _CANDIDATE_LIMIT:
+                        break
 
     resolved_inputs = {}
     all_inputs = {**declared_inputs, **optional_inputs}
@@ -297,6 +306,61 @@ def node_runtime_detail(sop, pipeline_id, node_id):
             "missing_outputs": recorded_validation.get("missing_outputs", missing),
             "unexpected_outputs": recorded_validation.get("unexpected_outputs", []),
         },
+    }
+
+
+def node_static_config(sop, node_id):
+    """Return static node configuration from sop.yaml, independent of any run."""
+    nodes = sop.get("nodes") or {}
+    config = nodes.get(node_id)
+    if config is None:
+        return None
+
+    plugin_dir = Path(os.environ.get(
+        "YOUTUBE_WIKI_PLUGIN_DIR",
+        str(Path.home() / "agent-brain-plugins" / "youtube-wiki"),
+    )).expanduser()
+    skills_dir = plugin_dir / "skills"
+
+    # Resolve skill script path
+    skill_name = config.get("skill") or config.get("webhook_route") or node_id
+    skill_dir = skills_dir / f"sop-{node_id}"
+    if not skill_dir.exists():
+        skill_dir = skills_dir / skill_name
+    script_candidates = [
+        skill_dir / "scripts" / f"run_{node_id.replace('-', '_')}.sh",
+        skill_dir / "scripts" / f"run_{node_id}.sh",
+    ]
+    skill_script = next((str(p.relative_to(plugin_dir.parent)) for p in script_candidates if p.exists()), None)
+
+    # Read SKILL.md summary (first 800 chars)
+    skill_readme = None
+    for readme_name in ("SKILL.md", "README.md"):
+        readme_path = skill_dir / readme_name
+        if readme_path.exists():
+            try:
+                skill_readme = readme_path.read_text(encoding="utf-8")[:800]
+            except OSError:
+                pass
+            break
+
+    return {
+        "node_id": node_id,
+        "title": config.get("title", node_id),
+        "mode": config.get("mode", "blocking"),
+        "needs": config.get("needs") or [],
+        "executor": {
+            "type": config.get("executor", {}).get("type", "skill") if isinstance(config.get("executor"), dict) else "skill",
+            "skill": config.get("skill", ""),
+            "webhook_route": config.get("webhook_route", ""),
+        },
+        "inputs": config.get("inputs", {}),
+        "outputs": config.get("outputs", {}),
+        "optional_inputs": config.get("optional_inputs", {}),
+        "infra": config.get("infra", {"tg_notify": True, "log_record": True}),
+        "params": config.get("params") or {},
+        "skill_script": skill_script,
+        "skill_readme": skill_readme,
     }
 
 
@@ -812,11 +876,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "discovered_candidates": data["discovered_candidates"],
                         })
                 if len(path) == 7 and path[3] == "runs" and path[5] == "logs":
-                    node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "nodes" / f"{path[6]}.json"
+                    node_id_log = path[6]
+                    node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "nodes" / f"{node_id_log}.json"
                     node = read_json(node_file) or {}
                     log_file = Path(sop["wiki_local_path"]) / "logs" / "stage-events" / f"{node.get('run_id', '')}.jsonl"
-                    log = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
-                    return json_response(self, 200, {"pipeline_id": path[4], "node_id": path[6], "log": log})
+                    log_text = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+                    # Parse structured events belonging to this node
+                    events = []
+                    for line in log_text.splitlines():
+                        try:
+                            ev = json.loads(line)
+                            if ev.get("stage", node_id_log) == node_id_log:
+                                events.append(ev)
+                        except json.JSONDecodeError:
+                            pass
+                    return json_response(self, 200, {
+                        "pipeline_id": path[4],
+                        "node_id": node_id_log,
+                        "log": log_text,
+                        "events": events,
+                    })
+                # GET /api/sop/{instance}/nodes/{node_id} — static node config
+                if len(path) == 5 and path[3] == "nodes":
+                    cfg = node_static_config(sop, path[4])
+                    if cfg is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    return json_response(self, 200, cfg)
             return text_response(self, 200, "ok")
         except Exception as exc:
             return json_response(self, 500, {"detail": str(exc)})
