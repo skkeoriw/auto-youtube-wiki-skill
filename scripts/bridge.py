@@ -1,5 +1,7 @@
 import http.server
+import hashlib
 import json
+import mimetypes
 import os
 import subprocess
 from pathlib import Path
@@ -50,6 +52,215 @@ def read_yaml(path):
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
+
+
+TEXT_FORMATS = {
+    ".md": "markdown",
+    ".txt": "text",
+    ".json": "json",
+    ".jsonl": "jsonl",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".csv": "csv",
+    ".log": "log",
+}
+
+
+def safe_artifact_path(wiki_path, relative_path):
+    """Resolve an artifact path while preventing reads outside the instance."""
+    base = Path(wiki_path).expanduser().resolve()
+    candidate = (base / str(relative_path)).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return None
+    return candidate
+
+
+def artifact_type(node_id, output_name, path):
+    suffix = path.suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        return "image.cover" if "cover" in output_name else "image"
+    if output_name in {"reports", "analysis_file"}:
+        return "research.report" if output_name == "reports" else "research.analysis"
+    if output_name == "transcript_file":
+        return "research.transcript"
+    if output_name == "mindmaps":
+        return "research.mindmap"
+    if output_name in {"pages", "index"}:
+        return "wiki.page"
+    if node_id == "tg-notify":
+        return "notification.archive"
+    return "file"
+
+
+def artifact_record(sop, node_id, output_name, path, resolution):
+    base = Path(sop["wiki_local_path"]).expanduser().resolve()
+    try:
+        relative = path.resolve().relative_to(base).as_posix()
+    except ValueError:
+        return None
+    stat = path.stat()
+    suffix = path.suffix.lower()
+    record = {
+        "id": hashlib.sha256(f"{node_id}:{output_name}:{relative}".encode()).hexdigest()[:16],
+        "producer": node_id,
+        "output": output_name,
+        "type": artifact_type(node_id, output_name, path),
+        "format": TEXT_FORMATS.get(suffix, suffix.lstrip(".") or "binary"),
+        "path": relative,
+        "title": path.name,
+        "size": stat.st_size,
+        "mime_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        "tags": ["wiki-source"] if output_name in {"reports", "analysis_file", "transcript_file"} else [],
+        "metadata": {},
+        "resolution": resolution,
+    }
+    if suffix in TEXT_FORMATS and stat.st_size <= 1024 * 1024:
+        try:
+            record["preview"] = path.read_text(encoding="utf-8", errors="replace")[:16000]
+            record["preview_truncated"] = stat.st_size > len(record["preview"].encode("utf-8"))
+        except OSError:
+            pass
+    return record
+
+
+def run_context(sop, pipeline_id):
+    wiki = Path(sop["wiki_local_path"])
+    candidates = [
+        wiki / "raw" / "pipeline-runs" / pipeline_id / "context.json",
+        wiki / "raw" / "pipeline-context.json",
+    ]
+    for path in candidates:
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        if path.name == "pipeline-context.json" and data.get("pipeline_id") not in {"", None, pipeline_id}:
+            continue
+        return data
+    run_file = wiki / "raw" / "pipeline-runs" / pipeline_id / "run.json"
+    return read_json(run_file) or {}
+
+
+def normalized_contract(value, direction):
+    result = {}
+    if not isinstance(value, dict):
+        return result
+    for name, spec in value.items():
+        if isinstance(spec, dict):
+            result[name] = dict(spec)
+        elif direction == "input":
+            result[name] = {"from": spec, "required": True}
+        else:
+            result[name] = {"path": spec, "type": "files" if "*" in str(spec) else "file"}
+    return result
+
+
+def context_output_paths(node_id, output_name, context):
+    if node_id == "youtube-fetch" and output_name == "metadata_file":
+        return [context.get("stage_b_fetch", {}).get("meta_file", "")]
+    if node_id == "notebooklm-research":
+        files = context.get("stage_b", {}).get("output_files", [])
+        marker = "notebooklm-analysis" if output_name == "reports" else "notebooklm-mindmaps"
+        return [path for path in files if marker in str(path)]
+    if node_id == "wiki-build":
+        if output_name == "pages":
+            return context.get("stage_c", {}).get("file_paths", [])
+        if output_name == "index":
+            return ["index.md"]
+    return []
+
+
+def resolve_output_artifacts(sop, pipeline_id, node_id, output_name, spec, context, run_id=""):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    paths = []
+    for relative in context_output_paths(node_id, output_name, context):
+        path = safe_artifact_path(wiki, relative)
+        if path and path.is_file():
+            paths.append((path, "context"))
+
+    pattern = spec.get("path", "") if isinstance(spec, dict) else str(spec)
+    pattern = pattern.replace("{pipeline_id}", pipeline_id).replace("{run_id}", run_id or "*")
+    if pattern and not paths and not Path(pattern).is_absolute() and ".." not in Path(pattern).parts:
+        for path in wiki.glob(pattern):
+            if path.is_file() and safe_artifact_path(wiki, path.relative_to(wiki)):
+                paths.append((path, "pattern"))
+
+    seen = set()
+    artifacts = []
+    for path, resolution in paths:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        record = artifact_record(sop, node_id, output_name, path, resolution)
+        if record:
+            artifacts.append(record)
+    return artifacts
+
+
+def node_runtime_detail(sop, pipeline_id, node_id):
+    wiki = Path(sop["wiki_local_path"])
+    node_file = wiki / "raw" / "pipeline-runs" / pipeline_id / "nodes" / f"{node_id}.json"
+    state = read_json(node_file) or {}
+    config = (sop.get("nodes") or {}).get(node_id) or {}
+    context = run_context(sop, pipeline_id)
+
+    declared_inputs = normalized_contract(config.get("inputs", state.get("inputs", {})), "input")
+    optional_inputs = normalized_contract(config.get("optional_inputs", state.get("optional_inputs", {})), "input")
+    for spec in optional_inputs.values():
+        spec["required"] = False
+    declared_outputs = normalized_contract(config.get("outputs", state.get("outputs", {})), "output")
+
+    actual_outputs = {}
+    artifacts = []
+    for name, spec in declared_outputs.items():
+        records = resolve_output_artifacts(
+            sop, pipeline_id, node_id, name, spec, context, state.get("run_id", "")
+        )
+        actual_outputs[name] = [record["path"] for record in records]
+        artifacts.extend(records)
+
+    resolved_inputs = {}
+    all_inputs = {**declared_inputs, **optional_inputs}
+    for name, spec in all_inputs.items():
+        source = str(spec.get("from", ""))
+        if source.startswith("context."):
+            value = context
+            for key in source.split(".")[1:]:
+                value = value.get(key) if isinstance(value, dict) else None
+            resolved_inputs[name] = value
+            continue
+        parts = source.split(".outputs.", 1)
+        if len(parts) == 2:
+            upstream = node_runtime_detail(sop, pipeline_id, parts[0])
+            resolved_inputs[name] = upstream.get("actual_outputs", {}).get(parts[1], [])
+        else:
+            resolved_inputs[name] = None
+
+    missing = [name for name, paths in actual_outputs.items() if not paths]
+    validation_status = "passed" if not missing else "warning"
+    return {
+        **state,
+        "pipeline_id": state.get("pipeline_id", pipeline_id),
+        "node_id": state.get("node_id", node_id),
+        "status": state.get("status", "waiting"),
+        "executor": config.get("executor") or {
+            "type": "skill",
+            "skill": config.get("skill", ""),
+            "webhook_route": config.get("webhook_route", config.get("route", "")),
+        },
+        "declared_inputs": declared_inputs,
+        "resolved_inputs": resolved_inputs,
+        "declared_outputs": declared_outputs,
+        "actual_outputs": actual_outputs,
+        "artifacts": artifacts,
+        "validation": {
+            "status": validation_status,
+            "missing_outputs": missing,
+            "unexpected_outputs": [],
+        },
+    }
 
 
 def read_registry():
@@ -309,9 +520,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     data = read_json(run_file)
                     return json_response(self, 200 if data else 404, data or {"detail": "Run not found"})
                 if len(path) == 7 and path[3] == "runs" and path[5] == "nodes":
-                    node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "nodes" / f"{path[6]}.json"
-                    data = read_json(node_file)
-                    return json_response(self, 200 if data else 404, data or {"detail": "Node not found"})
+                    data = node_runtime_detail(sop, path[4], path[6])
+                    return json_response(self, 200, data)
+                if len(path) == 8 and path[3] == "runs" and path[5] == "nodes":
+                    data = node_runtime_detail(sop, path[4], path[6])
+                    section = path[7]
+                    if section == "inputs":
+                        return json_response(self, 200, {
+                            "declared_inputs": data["declared_inputs"],
+                            "resolved_inputs": data["resolved_inputs"],
+                        })
+                    if section == "outputs":
+                        return json_response(self, 200, {
+                            "declared_outputs": data["declared_outputs"],
+                            "actual_outputs": data["actual_outputs"],
+                            "validation": data["validation"],
+                        })
+                    if section == "artifacts":
+                        return json_response(self, 200, {
+                            "pipeline_id": path[4],
+                            "node_id": path[6],
+                            "artifacts": data["artifacts"],
+                        })
                 if len(path) == 7 and path[3] == "runs" and path[5] == "logs":
                     node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "nodes" / f"{path[6]}.json"
                     node = read_json(node_file) or {}
@@ -354,5 +584,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-print(f"[bridge] 127.0.0.1:{PORT}", flush=True)
-http.server.HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+def main():
+    print(f"[bridge] 127.0.0.1:{PORT}", flush=True)
+    http.server.HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
