@@ -16,13 +16,11 @@ def _make_wiki(tmp_path, pipeline_id, node_id="notebooklm-research", node_status
     ctx_dir = wiki / "raw"
     ctx_dir.mkdir(parents=True, exist_ok=True)
 
-    # pipeline-context.json
     (ctx_dir / "pipeline-context.json").write_text(json.dumps({
         "pipeline_id": pipeline_id,
         "source_url": "https://example.com",
     }))
 
-    # run.json
     run_file = wiki / "raw" / "pipeline-runs" / pipeline_id / "run.json"
     run_file.write_text(json.dumps({
         "pipeline_id": pipeline_id,
@@ -31,7 +29,6 @@ def _make_wiki(tmp_path, pipeline_id, node_id="notebooklm-research", node_status
         "updated_at": "2026-06-04T00:00:00Z",
     }))
 
-    # node json
     (run_dir / f"{node_id}.json").write_text(json.dumps({
         "node_id": node_id,
         "status": node_status,
@@ -51,36 +48,65 @@ class CancelRunTest(unittest.TestCase):
     def test_sets_cancelled_status_in_run_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             wiki, sop = _make_wiki(Path(tmp), "pipeline-001")
-            result = cancel_run(sop, "pipeline-001", reason="test cancel")
+            _status, result = cancel_run(sop, "pipeline-001", reason="test cancel")
             self.assertEqual(result["status"], "cancelled")
             run = json.loads((wiki / "raw/pipeline-runs/pipeline-001/run.json").read_text())
             self.assertEqual(run["status"], "cancelled")
             self.assertEqual(run["cancel_reason"], "test cancel")
 
-    def test_sets_cancelled_flag_in_context(self):
+    def test_sets_cancelled_flag_in_context_when_pipeline_matches(self):
         with tempfile.TemporaryDirectory() as tmp:
             wiki, sop = _make_wiki(Path(tmp), "pipeline-002")
             cancel_run(sop, "pipeline-002")
             ctx = json.loads((wiki / "raw/pipeline-context.json").read_text())
             self.assertTrue(ctx.get("cancelled"))
 
-    def test_appends_event(self):
+    def test_does_not_cancel_context_if_different_pipeline_is_active(self):
+        """Regression: cancel must not stomp on an unrelated active pipeline's context."""
         with tempfile.TemporaryDirectory() as tmp:
             wiki, sop = _make_wiki(Path(tmp), "pipeline-003")
+            # Simulate a DIFFERENT pipeline being active in the context
+            ctx_file = wiki / "raw/pipeline-context.json"
+            ctx_file.write_text(json.dumps({
+                "pipeline_id": "OTHER-pipeline",
+                "source_url": "https://example.com",
+            }))
             cancel_run(sop, "pipeline-003")
-            events_file = wiki / "raw/pipeline-runs/pipeline-003/events.jsonl"
+            ctx = json.loads(ctx_file.read_text())
+            # Should NOT have written cancelled flag since active context is a different pipeline
+            self.assertIsNone(ctx.get("cancelled"))
+
+    def test_returns_404_for_nonexistent_pipeline(self):
+        """Regression: cancel must not create fake run directories."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki = Path(tmp) / "wiki"
+            wiki.mkdir()
+            (wiki / "raw").mkdir()
+            sop = {"id": "test", "wiki_local_path": str(wiki)}
+            _status, result = cancel_run(sop, "does-not-exist")
+            self.assertIsNone(_status)
+            self.assertEqual(result["status"], "error")
+            # Must NOT have created a directory
+            self.assertFalse((wiki / "raw/pipeline-runs/does-not-exist").exists())
+
+    def test_appends_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-010")
+            cancel_run(sop, "pipeline-010")
+            events_file = wiki / "raw/pipeline-runs/pipeline-010/events.jsonl"
             self.assertTrue(events_file.exists())
             events = [json.loads(line) for line in events_file.read_text().splitlines()]
             self.assertTrue(any(e["event"] == "pipeline_cancelled" for e in events))
 
     def test_does_not_overwrite_done_run(self):
         with tempfile.TemporaryDirectory() as tmp:
-            wiki, sop = _make_wiki(Path(tmp), "pipeline-004")
-            run_file = wiki / "raw/pipeline-runs/pipeline-004/run.json"
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-011")
+            run_file = wiki / "raw/pipeline-runs/pipeline-011/run.json"
             run_data = json.loads(run_file.read_text())
             run_data["status"] = "done"
             run_file.write_text(json.dumps(run_data))
-            cancel_run(sop, "pipeline-004")
+            _status, result = cancel_run(sop, "pipeline-011")
+            self.assertEqual(result["status"], "done")
             run = json.loads(run_file.read_text())
             self.assertEqual(run["status"], "done")
 
@@ -88,47 +114,62 @@ class CancelRunTest(unittest.TestCase):
 class CancelNodeTest(unittest.TestCase):
     def test_marks_node_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp:
-            wiki, sop = _make_wiki(Path(tmp), "pipeline-010", node_status="running")
-            result = cancel_node(sop, "pipeline-010", "notebooklm-research")
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-020", node_status="running")
+            _status, result = cancel_node(sop, "pipeline-020", "notebooklm-research")
             self.assertEqual(result["status"], "cancelled")
             node = json.loads(
-                (wiki / "raw/pipeline-runs/pipeline-010/nodes/notebooklm-research.json").read_text()
+                (wiki / "raw/pipeline-runs/pipeline-020/nodes/notebooklm-research.json").read_text()
             )
             self.assertEqual(node["status"], "cancelled")
 
     def test_updates_run_nodes_map(self):
         with tempfile.TemporaryDirectory() as tmp:
-            wiki, sop = _make_wiki(Path(tmp), "pipeline-011", node_status="running")
-            cancel_node(sop, "pipeline-011", "notebooklm-research")
-            run = json.loads((wiki / "raw/pipeline-runs/pipeline-011/run.json").read_text())
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-021", node_status="running")
+            cancel_node(sop, "pipeline-021", "notebooklm-research")
+            run = json.loads((wiki / "raw/pipeline-runs/pipeline-021/run.json").read_text())
             self.assertEqual(run["nodes"]["notebooklm-research"], "cancelled")
+
+    def test_returns_404_for_nonexistent_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki = Path(tmp) / "wiki"
+            wiki.mkdir()
+            sop = {"id": "test", "wiki_local_path": str(wiki)}
+            _status, result = cancel_node(sop, "does-not-exist", "some-node")
+            self.assertIsNone(_status)
+            self.assertEqual(result["status"], "error")
 
 
 class RetryNodeTest(unittest.TestCase):
     def test_rejects_running_node(self):
         with tempfile.TemporaryDirectory() as tmp:
-            wiki, sop = _make_wiki(Path(tmp), "pipeline-020", node_status="running")
-            status, result = retry_node(sop, "pipeline-020", "notebooklm-research")
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-030", node_status="running")
+            status, result = retry_node(sop, "pipeline-030", "notebooklm-research")
             self.assertEqual(status, 409)
             self.assertEqual(result["status"], "error")
 
+    def test_returns_404_for_nonexistent_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki = Path(tmp) / "wiki"
+            wiki.mkdir()
+            sop = {"id": "test", "wiki_local_path": str(wiki)}
+            status, result = retry_node(sop, "does-not-exist", "some-node")
+            self.assertEqual(status, 404)
+
     def test_resets_node_to_running_when_script_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
-            wiki, sop = _make_wiki(Path(tmp), "pipeline-021", node_status="failed")
-            status, result = retry_node(sop, "pipeline-021", "notebooklm-research")
-            # Script not found on test machine, falls back to webhook (also missing) → 500
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-031", node_status="failed")
+            status, result = retry_node(sop, "pipeline-031", "notebooklm-research")
             self.assertIn(status, {200, 500})
             node = json.loads(
-                (wiki / "raw/pipeline-runs/pipeline-021/nodes/notebooklm-research.json").read_text()
+                (wiki / "raw/pipeline-runs/pipeline-031/nodes/notebooklm-research.json").read_text()
             )
-            # status should be running (if launched) or failed (if nothing found)
             self.assertIn(node["status"], {"running", "failed"})
 
     def test_appends_retry_event(self):
         with tempfile.TemporaryDirectory() as tmp:
-            wiki, sop = _make_wiki(Path(tmp), "pipeline-022", node_status="failed")
-            retry_node(sop, "pipeline-022", "notebooklm-research")
-            events_file = wiki / "raw/pipeline-runs/pipeline-022/events.jsonl"
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-032", node_status="failed")
+            retry_node(sop, "pipeline-032", "notebooklm-research")
+            events_file = wiki / "raw/pipeline-runs/pipeline-032/events.jsonl"
             if events_file.exists():
                 events = [json.loads(line) for line in events_file.read_text().splitlines()]
                 self.assertTrue(any(e["event"] == "node_retry" for e in events))

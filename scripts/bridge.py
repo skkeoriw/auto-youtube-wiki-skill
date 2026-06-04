@@ -492,7 +492,12 @@ def sop_runs(sop, query=None):
     runs = []
     for run_file in run_files(sop):
         data = read_json(run_file)
-        if data and (not status_filter or data.get("status") == status_filter):
+        if not data:
+            continue
+        # Guarantee pipeline_id is always present; derive from directory name if missing.
+        if not data.get("pipeline_id"):
+            data["pipeline_id"] = run_file.parent.name
+        if not status_filter or data.get("status") == status_filter:
             runs.append(data)
         if len(runs) >= limit:
             break
@@ -538,36 +543,64 @@ def _append_run_event(run_dir, event_type, **kwargs):
 
 
 def cancel_run(sop, pipeline_id, reason="用户取消"):
+    """Cancel a pipeline run.
+
+    Bug fixes vs v1:
+    1. Only writes cancelled flag to pipeline-context.json when the
+       context's pipeline_id matches the requested pipeline_id.
+       Previously it blindly overwrote the shared context, cancelling
+       whatever happened to be running.
+    2. Only updates run.json if the run workspace already exists.
+       Previously it created directories for non-existent pipelines,
+       polluting the runs list with fake entries.
+    """
     wiki = Path(sop["wiki_local_path"])
     run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+    run_file = run_dir / "run.json"
     now = _now_iso_utc()
 
-    # Legacy cancel flag read by stage_runner.py forward_next
+    # Require the run workspace to exist before doing anything.
+    if not run_file.exists():
+        return None, {"status": "error", "message": f"pipeline {pipeline_id!r} not found"}
+
+    run_data = read_json(run_file) or {}
+    if run_data.get("status") in {"done", "cancelled"}:
+        return run_data.get("status"), {
+            "status": run_data["status"],
+            "pipeline_id": pipeline_id,
+            "message": f"pipeline already {run_data['status']}",
+        }
+
+    # Only set the legacy cancel flag when the active context matches.
     ctx_file = wiki / "raw" / "pipeline-context.json"
     ctx = read_json(ctx_file) or {}
-    ctx["cancelled"] = True
-    ctx["cancel_reason"] = reason
-    ctx_file.parent.mkdir(parents=True, exist_ok=True)
-    ctx_file.write_text(json.dumps(ctx, ensure_ascii=False, indent=2))
+    ctx_pid = ctx.get("pipeline_id")
+    if ctx_pid is None or ctx_pid == pipeline_id:
+        ctx["cancelled"] = True
+        ctx["cancel_reason"] = reason
+        ctx_file.write_text(json.dumps(ctx, ensure_ascii=False, indent=2))
 
-    # Update run.json
-    run_file = run_dir / "run.json"
-    run_data = read_json(run_file) or {}
-    if run_data.get("status") not in {"done"}:
-        run_data["status"] = "cancelled"
-        run_data["cancel_reason"] = reason
-        run_data["updated_at"] = now
-        run_dir.mkdir(parents=True, exist_ok=True)
-        run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2))
+    run_data["status"] = "cancelled"
+    run_data["cancel_reason"] = reason
+    run_data["updated_at"] = now
+    run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2))
 
     _append_run_event(run_dir, "pipeline_cancelled", reason=reason)
-    return {"status": "cancelled", "pipeline_id": pipeline_id, "reason": reason}
+    return "cancelled", {"status": "cancelled", "pipeline_id": pipeline_id, "reason": reason}
 
 
 def cancel_node(sop, pipeline_id, node_id, reason="用户取消节点"):
+    """Cancel a specific node.
+
+    Returns 404 if the run workspace does not exist.
+    """
     wiki = Path(sop["wiki_local_path"])
     run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+    run_file = run_dir / "run.json"
     now = _now_iso_utc()
+
+    if not run_file.exists():
+        return None, {"status": "error", "message": f"pipeline {pipeline_id!r} not found"}
 
     node_file = run_dir / "nodes" / f"{node_id}.json"
     node_data = read_json(node_file) or {}
@@ -577,7 +610,6 @@ def cancel_node(sop, pipeline_id, node_id, reason="用户取消节点"):
     node_file.parent.mkdir(parents=True, exist_ok=True)
     node_file.write_text(json.dumps(node_data, ensure_ascii=False, indent=2))
 
-    run_file = run_dir / "run.json"
     run_data = read_json(run_file) or {}
     if isinstance(run_data.get("nodes"), dict):
         run_data["nodes"][node_id] = "cancelled"
@@ -585,13 +617,17 @@ def cancel_node(sop, pipeline_id, node_id, reason="用户取消节点"):
         run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2))
 
     _append_run_event(run_dir, "node_cancelled", node_id=node_id, reason=reason)
-    return {"status": "cancelled", "pipeline_id": pipeline_id, "node_id": node_id}
+    return "cancelled", {"status": "cancelled", "pipeline_id": pipeline_id, "node_id": node_id}
 
 
 def retry_node(sop, pipeline_id, node_id):
     wiki = Path(sop["wiki_local_path"])
     run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
     now = _now_iso_utc()
+
+    run_file = run_dir / "run.json"
+    if not run_file.exists():
+        return 404, {"status": "error", "message": f"pipeline {pipeline_id!r} not found"}
 
     node_file = run_dir / "nodes" / f"{node_id}.json"
     node_data = read_json(node_file) or {}
@@ -725,6 +761,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(path) == 5 and path[3] == "runs":
                     run_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "run.json"
                     data = read_json(run_file)
+                    if data and not data.get("pipeline_id"):
+                        data["pipeline_id"] = path[4]
                     return json_response(self, 200 if data else 404, data or {"detail": "Run not found"})
                 if len(path) == 6 and path[3] == "runs":
                     run_dir = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4]
@@ -806,8 +844,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
-            result = cancel_run(sop, path[4], data.get("reason", "用户取消"))
-            return json_response(self, 200, result)
+            _status, result = cancel_run(sop, path[4], data.get("reason", "用户取消"))
+            http_code = 404 if _status is None else 200
+            return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/runs/{pipeline_id}/nodes/{node_id}/retry
         if (len(path) == 8 and path[:2] == ["api", "sop"]
@@ -815,8 +854,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
-            status, result = retry_node(sop, path[4], path[6])
-            return json_response(self, status, result)
+            http_code, result = retry_node(sop, path[4], path[6])
+            return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/runs/{pipeline_id}/nodes/{node_id}/cancel
         if (len(path) == 8 and path[:2] == ["api", "sop"]
@@ -824,8 +863,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
-            result = cancel_node(sop, path[4], path[6], data.get("reason", "用户取消节点"))
-            return json_response(self, 200, result)
+            _status, result = cancel_node(sop, path[4], path[6], data.get("reason", "用户取消节点"))
+            http_code = 404 if _status is None else 200
+            return json_response(self, http_code, result)
 
         env = {**os.environ}
         for k, v in data.items():
