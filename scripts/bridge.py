@@ -14,6 +14,8 @@ import yaml
 PORT = int(os.environ.get("BRIDGE_PORT", "18789"))
 SCRIPT = os.environ.get("BRIDGE_SCRIPT", "")
 REGISTRY_PATH = Path(os.environ.get("SOP_REGISTRY_PATH", str(Path.home() / ".sop" / "registry.json"))).expanduser()
+SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5"))
+SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 
 
 def json_response(handler, status, data):
@@ -964,13 +966,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-transform")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
+        self.wfile.write(b"retry: 1000\n: connected\n\n")
+        self.wfile.flush()
         events_file = run_dir / "events.jsonl"
         heartbeat_at = time.monotonic()
-        terminal_seen_at = None
+        stream_deadline = time.monotonic() + SSE_STREAM_WINDOW_SECONDS
         while True:
             try:
                 events = read_run_events(events_file, last_sequence)
@@ -980,16 +984,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     last_sequence = event["sequence"]
                 run = read_json(run_dir / "run.json") or {}
                 if run.get("status") in {"done", "failed", "cancelled"}:
-                    terminal_seen_at = terminal_seen_at or time.monotonic()
-                    if time.monotonic() - terminal_seen_at >= 2:
-                        break
-                if time.monotonic() - heartbeat_at >= 15:
+                    break
+                if time.monotonic() - heartbeat_at >= SSE_HEARTBEAT_SECONDS:
                     self.wfile.write(b": heartbeat\n\n")
                     self.wfile.flush()
                     heartbeat_at = time.monotonic()
+                if time.monotonic() >= stream_deadline:
+                    break
                 time.sleep(0.5)
             except (BrokenPipeError, ConnectionResetError):
                 break
+        self.close_connection = True
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))

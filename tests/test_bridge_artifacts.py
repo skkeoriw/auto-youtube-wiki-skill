@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import http.server
 import json
 import os
 import tempfile
+import threading
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,6 +53,9 @@ class ArtifactResolutionTest(unittest.TestCase):
         )
         (self.wiki / "raw/pipeline-runs/pipe-1/nodes/wiki-build/plan.json").write_text(
             json.dumps({"status": "done", "max_pages": 40}), encoding="utf-8"
+        )
+        (self.wiki / "raw/pipeline-runs/pipe-1/run.json").write_text(
+            json.dumps({"pipeline_id": "pipe-1", "status": "done"}), encoding="utf-8"
         )
         self.sop = {
             "wiki_local_path": str(self.wiki),
@@ -139,6 +145,8 @@ class ArtifactResolutionTest(unittest.TestCase):
         formatted = bridge.format_sse_event(events[0]).decode()
         self.assertIn("id: 2", formatted)
         self.assertIn("event: node.completed", formatted)
+        self.assertLessEqual(bridge.SSE_HEARTBEAT_SECONDS, 15)
+        self.assertGreater(bridge.SSE_STREAM_WINDOW_SECONDS, 0)
 
     def test_static_config_returns_manifest_executor(self):
         plugin = self.wiki / "plugin"
@@ -155,6 +163,29 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(config["executor"]["type"], "agent-skill")
         self.assertEqual(config["executor"]["agent"], "hermes")
         self.assertTrue(config["manifest"]["capabilities"]["git"]["enabled"])
+
+    def test_sse_http_response_closes_and_honors_last_event_id(self):
+        events_file = self.wiki / "raw/pipeline-runs/pipe-1/events.jsonl"
+        events_file.write_text(
+            '{"sequence":1,"event":"node.started"}\n{"sequence":2,"event":"node.completed"}\n',
+            encoding="utf-8",
+        )
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/runs/pipe-1/events/stream",
+                headers={"Last-Event-ID": "1"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                body = response.read().decode()
+                self.assertEqual(response.headers["Content-Type"], "text/event-stream; charset=utf-8")
+                self.assertIn("retry: 1000", body)
+                self.assertNotIn("id: 1\n", body)
+                self.assertIn("id: 2\n", body)
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":
