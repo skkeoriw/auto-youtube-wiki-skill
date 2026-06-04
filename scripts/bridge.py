@@ -151,6 +151,8 @@ def normalized_contract(value, direction):
             result[name] = dict(spec)
         elif direction == "input":
             result[name] = {"from": spec, "required": True}
+        elif str(spec).startswith("context."):
+            result[name] = {"from": spec, "type": "string"}
         else:
             result[name] = {"path": spec, "type": "files" if "*" in str(spec) else "file"}
     return result
@@ -201,6 +203,13 @@ def resolve_output_artifacts(sop, pipeline_id, node_id, output_name, spec, conte
     return artifacts
 
 
+def resolve_context_value(context, source):
+    value = context
+    for key in str(source).split(".")[1:]:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
 def node_runtime_detail(sop, pipeline_id, node_id):
     wiki = Path(sop["wiki_local_path"])
     node_file = wiki / "raw" / "pipeline-runs" / pipeline_id / "nodes" / f"{node_id}.json"
@@ -226,6 +235,9 @@ def node_runtime_detail(sop, pipeline_id, node_id):
                         artifacts.append(record)
     else:
         for name, spec in declared_outputs.items():
+            if spec.get("from", "").startswith("context."):
+                actual_outputs[name] = resolve_context_value(context, spec["from"])
+                continue
             records = resolve_output_artifacts(
                 sop, pipeline_id, node_id, name, spec, context, state.get("run_id", "")
             )
@@ -237,10 +249,7 @@ def node_runtime_detail(sop, pipeline_id, node_id):
     for name, spec in all_inputs.items():
         source = str(spec.get("from", ""))
         if source.startswith("context."):
-            value = context
-            for key in source.split(".")[1:]:
-                value = value.get(key) if isinstance(value, dict) else None
-            resolved_inputs[name] = value
+            resolved_inputs[name] = resolve_context_value(context, source)
             continue
         parts = source.split(".outputs.", 1)
         if len(parts) == 2:
@@ -249,7 +258,10 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         else:
             resolved_inputs[name] = None
 
-    missing = [name for name, paths in actual_outputs.items() if not paths]
+    missing = [
+        name for name in declared_outputs
+        if actual_outputs.get(name) is None or actual_outputs.get(name) == "" or actual_outputs.get(name) == []
+    ]
     recorded_validation = state.get("validation") if isinstance(state.get("validation"), dict) else {}
     validation_status = recorded_validation.get("status") or ("passed" if not missing else "warning")
     return {

@@ -46,6 +46,9 @@ class ArtifactResolutionTest(unittest.TestCase):
                     "inputs": {"source_url": "context.source_url"},
                     "outputs": {"reports": "raw/notebooklm-analysis/*.md"},
                 },
+                "youtube-fetch": {
+                    "outputs": {"source_url": "context.source_url"},
+                },
                 "wiki-build": {
                     "inputs": {"reports": "notebooklm-research.outputs.reports"},
                     "outputs": {"index": "index.md", "pages": "wiki/**"},
@@ -88,6 +91,11 @@ class ArtifactResolutionTest(unittest.TestCase):
         }), encoding="utf-8")
         detail = bridge.node_runtime_detail(self.sop, "pipe-1", "wiki-build")
         self.assertTrue(all(artifact["resolution"] == "recorded" for artifact in detail["artifacts"]))
+        self.assertEqual(detail["validation"]["status"], "passed")
+
+    def test_resolves_scalar_context_output(self):
+        detail = bridge.node_runtime_detail(self.sop, "pipe-1", "youtube-fetch")
+        self.assertEqual(detail["actual_outputs"]["source_url"], "https://example.com/video")
         self.assertEqual(detail["validation"]["status"], "passed")
 
     def test_path_traversal_is_rejected(self):
