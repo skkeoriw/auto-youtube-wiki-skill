@@ -78,6 +78,18 @@ class ArtifactResolutionTest(unittest.TestCase):
         detail = bridge.node_runtime_detail(self.sop, "pipe-1", "wiki-build")
         self.assertEqual(detail["actual_outputs"]["pages"], ["wiki/entities/Agent.md"])
 
+    def test_recorded_outputs_take_precedence(self):
+        node_file = self.wiki / "raw/pipeline-runs/pipe-1/nodes/wiki-build.json"
+        node_file.write_text(json.dumps({
+            "status": "done",
+            "run_id": "run-c",
+            "actual_outputs": {"pages": ["wiki/entities/Agent.md"], "index": ["index.md"]},
+            "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+        }), encoding="utf-8")
+        detail = bridge.node_runtime_detail(self.sop, "pipe-1", "wiki-build")
+        self.assertTrue(all(artifact["resolution"] == "recorded" for artifact in detail["artifacts"]))
+        self.assertEqual(detail["validation"]["status"], "passed")
+
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
 

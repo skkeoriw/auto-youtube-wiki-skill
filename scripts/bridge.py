@@ -214,14 +214,23 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         spec["required"] = False
     declared_outputs = normalized_contract(config.get("outputs", state.get("outputs", {})), "output")
 
-    actual_outputs = {}
+    actual_outputs = state.get("actual_outputs") if isinstance(state.get("actual_outputs"), dict) else {}
     artifacts = []
-    for name, spec in declared_outputs.items():
-        records = resolve_output_artifacts(
-            sop, pipeline_id, node_id, name, spec, context, state.get("run_id", "")
-        )
-        actual_outputs[name] = [record["path"] for record in records]
-        artifacts.extend(records)
+    if actual_outputs:
+        for name, paths in actual_outputs.items():
+            for relative in paths if isinstance(paths, list) else []:
+                path = safe_artifact_path(sop["wiki_local_path"], relative)
+                if path and path.is_file():
+                    record = artifact_record(sop, node_id, name, path, "recorded")
+                    if record:
+                        artifacts.append(record)
+    else:
+        for name, spec in declared_outputs.items():
+            records = resolve_output_artifacts(
+                sop, pipeline_id, node_id, name, spec, context, state.get("run_id", "")
+            )
+            actual_outputs[name] = [record["path"] for record in records]
+            artifacts.extend(records)
 
     resolved_inputs = {}
     all_inputs = {**declared_inputs, **optional_inputs}
@@ -241,7 +250,8 @@ def node_runtime_detail(sop, pipeline_id, node_id):
             resolved_inputs[name] = None
 
     missing = [name for name, paths in actual_outputs.items() if not paths]
-    validation_status = "passed" if not missing else "warning"
+    recorded_validation = state.get("validation") if isinstance(state.get("validation"), dict) else {}
+    validation_status = recorded_validation.get("status") or ("passed" if not missing else "warning")
     return {
         **state,
         "pipeline_id": state.get("pipeline_id", pipeline_id),
@@ -259,8 +269,8 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         "artifacts": artifacts,
         "validation": {
             "status": validation_status,
-            "missing_outputs": missing,
-            "unexpected_outputs": [],
+            "missing_outputs": recorded_validation.get("missing_outputs", missing),
+            "unexpected_outputs": recorded_validation.get("unexpected_outputs", []),
         },
     }
 
