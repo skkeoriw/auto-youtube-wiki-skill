@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from pathlib import Path
@@ -184,6 +185,40 @@ class ArtifactResolutionTest(unittest.TestCase):
                 self.assertIn("retry: 1000", body)
                 self.assertNotIn("id: 1\n", body)
                 self.assertIn("id: 2\n", body)
+        server.shutdown()
+        server.server_close()
+
+    def test_running_sse_heartbeats_and_does_not_block_spi(self):
+        run_file = self.wiki / "raw/pipeline-runs/pipe-1/run.json"
+        run_file.write_text(json.dumps({"pipeline_id": "pipe-1", "status": "running"}), encoding="utf-8")
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        url = f"http://127.0.0.1:{server.server_port}"
+        with (
+            patch.object(bridge, "find_sop", return_value=self.sop),
+            patch.object(bridge, "sop_manifest", return_value={"runtime": "test"}),
+            patch.object(bridge, "SSE_STREAM_WINDOW_SECONDS", 0.2),
+            patch.object(bridge, "SSE_HEARTBEAT_SECONDS", 0.05),
+        ):
+            thread.start()
+            stream_result = {}
+
+            def read_stream():
+                with urllib.request.urlopen(
+                    f"{url}/api/sop/test/runs/pipe-1/events/stream", timeout=3
+                ) as response:
+                    stream_result["body"] = response.read().decode()
+
+            stream_thread = threading.Thread(target=read_stream)
+            stream_thread.start()
+            time.sleep(0.05)
+            started = time.monotonic()
+            with urllib.request.urlopen(f"{url}/api/sop", timeout=1) as response:
+                self.assertEqual(json.loads(response.read()), {"runtime": "test"})
+            self.assertLess(time.monotonic() - started, 0.2)
+            stream_thread.join(timeout=2)
+            self.assertFalse(stream_thread.is_alive())
+            self.assertIn(": heartbeat", stream_result["body"])
         server.shutdown()
         server.server_close()
 
