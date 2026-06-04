@@ -4,6 +4,8 @@ import json
 import mimetypes
 import os
 import subprocess
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -521,6 +523,176 @@ def trigger_sop(sop, body):
     return 200, data
 
 
+def _now_iso_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _append_run_event(run_dir, event_type, **kwargs):
+    events_file = run_dir / "events.jsonl"
+    event = {"event": event_type, "ts": _now_iso_utc(), **kwargs}
+    try:
+        with open(events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def cancel_run(sop, pipeline_id, reason="用户取消"):
+    wiki = Path(sop["wiki_local_path"])
+    run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+    now = _now_iso_utc()
+
+    # Legacy cancel flag read by stage_runner.py forward_next
+    ctx_file = wiki / "raw" / "pipeline-context.json"
+    ctx = read_json(ctx_file) or {}
+    ctx["cancelled"] = True
+    ctx["cancel_reason"] = reason
+    ctx_file.parent.mkdir(parents=True, exist_ok=True)
+    ctx_file.write_text(json.dumps(ctx, ensure_ascii=False, indent=2))
+
+    # Update run.json
+    run_file = run_dir / "run.json"
+    run_data = read_json(run_file) or {}
+    if run_data.get("status") not in {"done"}:
+        run_data["status"] = "cancelled"
+        run_data["cancel_reason"] = reason
+        run_data["updated_at"] = now
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2))
+
+    _append_run_event(run_dir, "pipeline_cancelled", reason=reason)
+    return {"status": "cancelled", "pipeline_id": pipeline_id, "reason": reason}
+
+
+def cancel_node(sop, pipeline_id, node_id, reason="用户取消节点"):
+    wiki = Path(sop["wiki_local_path"])
+    run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+    now = _now_iso_utc()
+
+    node_file = run_dir / "nodes" / f"{node_id}.json"
+    node_data = read_json(node_file) or {}
+    node_data["status"] = "cancelled"
+    node_data["cancel_reason"] = reason
+    node_data["updated_at"] = now
+    node_file.parent.mkdir(parents=True, exist_ok=True)
+    node_file.write_text(json.dumps(node_data, ensure_ascii=False, indent=2))
+
+    run_file = run_dir / "run.json"
+    run_data = read_json(run_file) or {}
+    if isinstance(run_data.get("nodes"), dict):
+        run_data["nodes"][node_id] = "cancelled"
+        run_data["updated_at"] = now
+        run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2))
+
+    _append_run_event(run_dir, "node_cancelled", node_id=node_id, reason=reason)
+    return {"status": "cancelled", "pipeline_id": pipeline_id, "node_id": node_id}
+
+
+def retry_node(sop, pipeline_id, node_id):
+    wiki = Path(sop["wiki_local_path"])
+    run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+    now = _now_iso_utc()
+
+    node_file = run_dir / "nodes" / f"{node_id}.json"
+    node_data = read_json(node_file) or {}
+    if node_data.get("status") == "running":
+        return 409, {"status": "error", "message": "节点正在运行中，无法重试"}
+
+    plugin_dir = Path(os.environ.get(
+        "YOUTUBE_WIKI_PLUGIN_DIR",
+        str(Path.home() / "agent-brain-plugins" / "youtube-wiki"),
+    )).expanduser()
+    skills_dir = plugin_dir / "skills"
+
+    run_id = f"retry-{int(time.time())}"
+    node_data["status"] = "running"
+    node_data["run_id"] = run_id
+    node_data["started_at"] = now
+    node_data["updated_at"] = now
+    node_data["error"] = None
+    node_data["finished_at"] = None
+    node_file.parent.mkdir(parents=True, exist_ok=True)
+    node_file.write_text(json.dumps(node_data, ensure_ascii=False, indent=2))
+
+    run_file = run_dir / "run.json"
+    run_data = read_json(run_file) or {}
+    if isinstance(run_data.get("nodes"), dict):
+        run_data["nodes"][node_id] = "running"
+        if run_data.get("status") not in {"running"}:
+            run_data["status"] = "running"
+        run_data["updated_at"] = now
+        run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2))
+
+    _append_run_event(run_dir, "node_retry", node_id=node_id, run_id=run_id)
+
+    # Stage script lookup — mirrors stage_runner.py forward_next
+    script_map = {
+        "notebooklm-research": skills_dir / "sop-notebooklm-research" / "scripts" / "run_notebooklm_research.sh",
+        "youtube-deep-research": skills_dir / "sop-youtube-deep-research" / "scripts" / "run_youtube_deep_research.sh",
+        "wiki-build": skills_dir / "sop-wiki-build" / "scripts" / "run_wiki_build.sh",
+    }
+
+    env = {**os.environ}
+    log_path = Path("/tmp") / f"retry-{node_id}-{run_id}.log"
+    launched = False
+
+    script = script_map.get(node_id)
+    if script and script.exists():
+        try:
+            with open(log_path, "ab") as log:
+                subprocess.Popen(
+                    ["bash", str(script), str(wiki), run_id],
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            launched = True
+        except Exception:
+            pass
+
+    if not launched:
+        # Fallback: Hermes webhook
+        sop_yaml = read_yaml(wiki / "sop.yaml")
+        node_cfg = (sop_yaml.get("nodes") or {}).get(node_id, {})
+        route = node_cfg.get("webhook_route", "") or node_cfg.get("route", "")
+        if route:
+            import urllib.request as _req
+            port = os.environ.get("HERMES_WEBHOOK_PORT", "8644")
+            token = os.environ.get("HERMES_WEBHOOK_TOKEN", "")
+            payload = json.dumps({
+                "stage": node_id,
+                "wiki_local_path": str(wiki),
+                "run_id": run_id,
+                "pipeline_id": pipeline_id,
+            }).encode()
+            try:
+                req = _req.Request(
+                    f"http://localhost:{port}/webhooks/{route}",
+                    data=payload,
+                    headers={"Content-Type": "application/json", "X-GitLab-Token": token},
+                )
+                _req.urlopen(req, timeout=15)
+                launched = True
+            except Exception:
+                pass
+
+    if not launched:
+        node_data["status"] = "failed"
+        node_data["error"] = "无法启动节点：找不到执行脚本"
+        node_data["updated_at"] = _now_iso_utc()
+        node_file.write_text(json.dumps(node_data, ensure_ascii=False, indent=2))
+        return 500, {"status": "error", "message": "无法启动节点，请检查脚本是否存在"}
+
+    return 200, {
+        "status": "retrying",
+        "pipeline_id": pipeline_id,
+        "node_id": node_id,
+        "run_id": run_id,
+        "log": str(log_path),
+    }
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
@@ -619,12 +791,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = {}
 
         path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+
+        # POST /api/sop/{instance}/runs  → trigger
         if len(path) == 4 and path[:2] == ["api", "sop"] and path[3] == "runs":
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             status, result = trigger_sop(sop, data)
             return json_response(self, status, result)
+
+        # POST /api/sop/{instance}/runs/{pipeline_id}/cancel
+        if (len(path) == 6 and path[:2] == ["api", "sop"]
+                and path[3] == "runs" and path[5] == "cancel"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = cancel_run(sop, path[4], data.get("reason", "用户取消"))
+            return json_response(self, 200, result)
+
+        # POST /api/sop/{instance}/runs/{pipeline_id}/nodes/{node_id}/retry
+        if (len(path) == 8 and path[:2] == ["api", "sop"]
+                and path[3] == "runs" and path[5] == "nodes" and path[7] == "retry"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            status, result = retry_node(sop, path[4], path[6])
+            return json_response(self, status, result)
+
+        # POST /api/sop/{instance}/runs/{pipeline_id}/nodes/{node_id}/cancel
+        if (len(path) == 8 and path[:2] == ["api", "sop"]
+                and path[3] == "runs" and path[5] == "nodes" and path[7] == "cancel"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = cancel_node(sop, path[4], path[6], data.get("reason", "用户取消节点"))
+            return json_response(self, 200, result)
 
         env = {**os.environ}
         for k, v in data.items():
