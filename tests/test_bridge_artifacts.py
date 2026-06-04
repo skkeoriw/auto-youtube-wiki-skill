@@ -2,9 +2,11 @@
 
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -39,6 +41,16 @@ class ArtifactResolutionTest(unittest.TestCase):
             }),
             encoding="utf-8",
         )
+        (self.wiki / "raw/pipeline-runs/pipe-1/nodes/wiki-build").mkdir()
+        (self.wiki / "raw/pipeline-runs/pipe-1/nodes/wiki-build/input.json").write_text(
+            json.dumps({"resolved_inputs": {"reports": ["frozen-report.md"]}}), encoding="utf-8"
+        )
+        (self.wiki / "raw/pipeline-runs/pipe-1/nodes/wiki-build/capabilities.json").write_text(
+            json.dumps({"git": {"status": "done", "commit": "abc123"}}), encoding="utf-8"
+        )
+        (self.wiki / "raw/pipeline-runs/pipe-1/nodes/wiki-build/plan.json").write_text(
+            json.dumps({"status": "done", "max_pages": 40}), encoding="utf-8"
+        )
         self.sop = {
             "wiki_local_path": str(self.wiki),
             "nodes": {
@@ -61,11 +73,13 @@ class ArtifactResolutionTest(unittest.TestCase):
 
     def test_resolves_context_and_upstream_artifacts(self):
         detail = bridge.node_runtime_detail(self.sop, "pipe-1", "wiki-build")
-        self.assertEqual(detail["resolved_inputs"]["reports"], ["raw/notebooklm-analysis/report.md"])
+        self.assertEqual(detail["resolved_inputs"]["reports"], ["frozen-report.md"])
         self.assertEqual(detail["actual_outputs"]["pages"], ["wiki/entities/Agent.md"])
         self.assertEqual(detail["validation"]["status"], "passed")
         self.assertEqual(detail["artifacts"][0]["producer"], "wiki-build")
         self.assertIn("preview", detail["artifacts"][0])
+        self.assertEqual(detail["capabilities"]["git"]["commit"], "abc123")
+        self.assertEqual(detail["plan"]["max_pages"], 40)
 
     def test_missing_outputs_are_reported(self):
         (self.wiki / "index.md").unlink()
@@ -113,6 +127,34 @@ class ArtifactResolutionTest(unittest.TestCase):
 
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
+
+    def test_sse_event_replay_and_format(self):
+        events_file = self.wiki / "raw/pipeline-runs/pipe-1/events.jsonl"
+        events_file.write_text(
+            '{"sequence":1,"event":"node.started"}\n{"sequence":2,"event":"node.completed"}\n',
+            encoding="utf-8",
+        )
+        events = bridge.read_run_events(events_file, after_sequence=1)
+        self.assertEqual([event["sequence"] for event in events], [2])
+        formatted = bridge.format_sse_event(events[0]).decode()
+        self.assertIn("id: 2", formatted)
+        self.assertIn("event: node.completed", formatted)
+
+    def test_static_config_returns_manifest_executor(self):
+        plugin = self.wiki / "plugin"
+        skill = plugin / "skills/sop-wiki-build"
+        skill.mkdir(parents=True)
+        (skill / "node.yaml").write_text(
+            "id: wiki-build\nexecutor:\n  type: agent-skill\n  agent: hermes\n"
+            "capabilities:\n  git: {enabled: true, required: false}\n",
+            encoding="utf-8",
+        )
+        sop = {"nodes": {"wiki-build": {"title": "Build", "skill": "sop-wiki-build"}}}
+        with patch.dict(os.environ, {"YOUTUBE_WIKI_PLUGIN_DIR": str(plugin)}):
+            config = bridge.node_static_config(sop, "wiki-build")
+        self.assertEqual(config["executor"]["type"], "agent-skill")
+        self.assertEqual(config["executor"]["agent"], "hermes")
+        self.assertTrue(config["manifest"]["capabilities"]["git"]["enabled"])
 
 
 if __name__ == "__main__":

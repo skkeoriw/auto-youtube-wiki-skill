@@ -56,6 +56,33 @@ def read_yaml(path):
         return {}
 
 
+def run_workspace(sop, pipeline_id):
+    return Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / pipeline_id
+
+
+def read_run_events(events_file, after_sequence=0):
+    events = []
+    if not events_file.exists():
+        return events
+    for index, line in enumerate(events_file.read_text(encoding="utf-8").splitlines(), start=1):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        sequence = int(event.get("sequence") or index)
+        event["sequence"] = sequence
+        if sequence > after_sequence:
+            events.append(event)
+    return events
+
+
+def format_sse_event(event):
+    sequence = int(event.get("sequence") or 0)
+    event_type = str(event.get("event") or "message")
+    payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    return f"id: {sequence}\nevent: {event_type}\ndata: {payload}\n\n".encode("utf-8")
+
+
 TEXT_FORMATS = {
     ".md": "markdown",
     ".txt": "text",
@@ -211,7 +238,8 @@ def resolve_context_value(context, source):
 
 def node_runtime_detail(sop, pipeline_id, node_id):
     wiki = Path(sop["wiki_local_path"])
-    node_file = wiki / "raw" / "pipeline-runs" / pipeline_id / "nodes" / f"{node_id}.json"
+    workspace = run_workspace(sop, pipeline_id)
+    node_file = workspace / "nodes" / f"{node_id}.json"
     state = read_json(node_file) or {}
     config = (sop.get("nodes") or {}).get(node_id) or {}
     context = run_context(sop, pipeline_id)
@@ -265,19 +293,23 @@ def node_runtime_detail(sop, pipeline_id, node_id):
                     if len(discovered_candidates) >= _CANDIDATE_LIMIT:
                         break
 
-    resolved_inputs = {}
-    all_inputs = {**declared_inputs, **optional_inputs}
-    for name, spec in all_inputs.items():
-        source = str(spec.get("from", ""))
-        if source.startswith("context."):
-            resolved_inputs[name] = resolve_context_value(context, source)
-            continue
-        parts = source.split(".outputs.", 1)
-        if len(parts) == 2:
-            upstream = node_runtime_detail(sop, pipeline_id, parts[0])
-            resolved_inputs[name] = upstream.get("actual_outputs", {}).get(parts[1], [])
-        else:
-            resolved_inputs[name] = None
+    input_snapshot = read_json(workspace / "nodes" / node_id / "input.json") or {}
+    if isinstance(input_snapshot.get("resolved_inputs"), dict):
+        resolved_inputs = input_snapshot["resolved_inputs"]
+    else:
+        resolved_inputs = {}
+        all_inputs = {**declared_inputs, **optional_inputs}
+        for name, spec in all_inputs.items():
+            source = str(spec.get("from", ""))
+            if source.startswith("context."):
+                resolved_inputs[name] = resolve_context_value(context, source)
+                continue
+            parts = source.split(".outputs.", 1)
+            if len(parts) == 2:
+                upstream = node_runtime_detail(sop, pipeline_id, parts[0])
+                resolved_inputs[name] = upstream.get("actual_outputs", {}).get(parts[1], [])
+            else:
+                resolved_inputs[name] = None
 
     missing = [
         name for name in declared_outputs
@@ -301,6 +333,8 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         "actual_outputs": actual_outputs,
         "artifacts": artifacts,
         "discovered_candidates": discovered_candidates,
+        "capabilities": read_json(workspace / "nodes" / node_id / "capabilities.json") or {},
+        "plan": read_json(workspace / "nodes" / node_id / "plan.json"),
         "validation": {
             "status": validation_status,
             "missing_outputs": recorded_validation.get("missing_outputs", missing),
@@ -343,6 +377,9 @@ def node_static_config(sop, node_id):
             except OSError:
                 pass
             break
+    manifest = read_yaml(skill_dir / "node.yaml") if (skill_dir / "node.yaml").exists() else {}
+    manifest_executor = manifest.get("executor") if isinstance(manifest.get("executor"), dict) else {}
+    configured_executor = config.get("executor") if isinstance(config.get("executor"), dict) else {}
 
     return {
         "node_id": node_id,
@@ -350,8 +387,10 @@ def node_static_config(sop, node_id):
         "mode": config.get("mode", "blocking"),
         "needs": config.get("needs") or [],
         "executor": {
-            "type": config.get("executor", {}).get("type", "skill") if isinstance(config.get("executor"), dict) else "skill",
-            "skill": config.get("skill", ""),
+            **manifest_executor,
+            **configured_executor,
+            "type": configured_executor.get("type") or manifest_executor.get("type") or "skill",
+            "skill": config.get("skill") or manifest_executor.get("skill", ""),
             "webhook_route": config.get("webhook_route", ""),
         },
         "inputs": config.get("inputs", {}),
@@ -361,6 +400,7 @@ def node_static_config(sop, node_id):
         "params": config.get("params") or {},
         "skill_script": skill_script,
         "skill_readme": skill_readme,
+        "manifest": manifest,
     }
 
 
@@ -838,14 +878,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         })
                     if section == "events":
                         event_file = run_dir / "events.jsonl"
-                        events = []
-                        if event_file.exists():
-                            for line in event_file.read_text(encoding="utf-8").splitlines():
-                                try:
-                                    events.append(json.loads(line))
-                                except json.JSONDecodeError:
-                                    continue
+                        events = read_run_events(event_file)
                         return json_response(self, 200, {"pipeline_id": path[4], "events": events})
+                if len(path) == 7 and path[3] == "runs" and path[5] == "events" and path[6] == "stream":
+                    return self.stream_run_events(sop, path[4])
                 if len(path) == 7 and path[3] == "runs" and path[5] == "nodes":
                     data = node_runtime_detail(sop, path[4], path[6])
                     return json_response(self, 200, data)
@@ -874,6 +910,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "pipeline_id": path[4],
                             "node_id": path[6],
                             "discovered_candidates": data["discovered_candidates"],
+                        })
+                    if section == "capabilities":
+                        return json_response(self, 200, {
+                            "pipeline_id": path[4],
+                            "node_id": path[6],
+                            "capabilities": data["capabilities"],
+                        })
+                    if section == "plan":
+                        plan = data.get("plan")
+                        return json_response(self, 200 if plan is not None else 404, plan or {
+                            "detail": "Node plan not found"
                         })
                 if len(path) == 7 and path[3] == "runs" and path[5] == "logs":
                     node_id_log = path[6]
@@ -905,6 +952,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return text_response(self, 200, "ok")
         except Exception as exc:
             return json_response(self, 500, {"detail": str(exc)})
+
+    def stream_run_events(self, sop, pipeline_id):
+        run_dir = run_workspace(sop, pipeline_id)
+        if not run_dir.exists():
+            return json_response(self, 404, {"detail": "Run not found"})
+        try:
+            last_sequence = int(self.headers.get("Last-Event-ID", "0") or 0)
+        except ValueError:
+            last_sequence = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        events_file = run_dir / "events.jsonl"
+        heartbeat_at = time.monotonic()
+        terminal_seen_at = None
+        while True:
+            try:
+                events = read_run_events(events_file, last_sequence)
+                for event in events:
+                    self.wfile.write(format_sse_event(event))
+                    self.wfile.flush()
+                    last_sequence = event["sequence"]
+                run = read_json(run_dir / "run.json") or {}
+                if run.get("status") in {"done", "failed", "cancelled"}:
+                    terminal_seen_at = terminal_seen_at or time.monotonic()
+                    if time.monotonic() - terminal_seen_at >= 2:
+                        break
+                if time.monotonic() - heartbeat_at >= 15:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    heartbeat_at = time.monotonic()
+                time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError):
+                break
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -971,7 +1056,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     print(f"[bridge] 127.0.0.1:{PORT}", flush=True)
-    http.server.HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
