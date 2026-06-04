@@ -127,15 +127,10 @@ def artifact_record(sop, node_id, output_name, path, resolution):
 
 def run_context(sop, pipeline_id):
     wiki = Path(sop["wiki_local_path"])
-    candidates = [
-        wiki / "raw" / "pipeline-runs" / pipeline_id / "context.json",
-        wiki / "raw" / "pipeline-context.json",
-    ]
+    candidates = [wiki / "raw" / "pipeline-runs" / pipeline_id / "context.json"]
     for path in candidates:
         data = read_json(path)
         if not isinstance(data, dict):
-            continue
-        if path.name == "pipeline-context.json" and data.get("pipeline_id") not in {"", None, pipeline_id}:
             continue
         return data
     run_file = wiki / "raw" / "pipeline-runs" / pipeline_id / "run.json"
@@ -173,17 +168,19 @@ def context_output_paths(node_id, output_name, context):
     return []
 
 
-def resolve_output_artifacts(sop, pipeline_id, node_id, output_name, spec, context, run_id=""):
+def resolve_output_artifacts(sop, pipeline_id, node_id, output_name, spec, context, run_id="",
+                             include_context=True, include_pattern=True):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     paths = []
-    for relative in context_output_paths(node_id, output_name, context):
-        path = safe_artifact_path(wiki, relative)
-        if path and path.is_file():
-            paths.append((path, "context"))
+    if include_context:
+        for relative in context_output_paths(node_id, output_name, context):
+            path = safe_artifact_path(wiki, relative)
+            if path and path.is_file():
+                paths.append((path, "context"))
 
     pattern = spec.get("path", "") if isinstance(spec, dict) else str(spec)
     pattern = pattern.replace("{pipeline_id}", pipeline_id).replace("{run_id}", run_id or "*")
-    if pattern and not paths and not Path(pattern).is_absolute() and ".." not in Path(pattern).parts:
+    if include_pattern and pattern and not Path(pattern).is_absolute() and ".." not in Path(pattern).parts:
         if pattern.endswith("/**"):
             pattern += "/*"
         for path in wiki.glob(pattern):
@@ -223,9 +220,10 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         spec["required"] = False
     declared_outputs = normalized_contract(config.get("outputs", state.get("outputs", {})), "output")
 
-    actual_outputs = state.get("actual_outputs") if isinstance(state.get("actual_outputs"), dict) else {}
+    has_recorded_outputs = isinstance(state.get("actual_outputs"), dict)
+    actual_outputs = dict(state.get("actual_outputs")) if has_recorded_outputs else {}
     artifacts = []
-    if actual_outputs:
+    if has_recorded_outputs:
         for name, paths in actual_outputs.items():
             for relative in paths if isinstance(paths, list) else []:
                 path = safe_artifact_path(sop["wiki_local_path"], relative)
@@ -239,10 +237,22 @@ def node_runtime_detail(sop, pipeline_id, node_id):
                 actual_outputs[name] = resolve_context_value(context, spec["from"])
                 continue
             records = resolve_output_artifacts(
-                sop, pipeline_id, node_id, name, spec, context, state.get("run_id", "")
+                sop, pipeline_id, node_id, name, spec, context, state.get("run_id", ""),
+                include_pattern=False,
             )
             actual_outputs[name] = [record["path"] for record in records]
             artifacts.extend(records)
+
+    actual_paths = {artifact["path"] for artifact in artifacts}
+    discovered_candidates = []
+    for name, spec in declared_outputs.items():
+        for candidate in resolve_output_artifacts(
+            sop, pipeline_id, node_id, name, spec, context, state.get("run_id", ""),
+            include_context=False,
+        ):
+            if candidate["path"] not in actual_paths:
+                candidate["ownership"] = "unconfirmed"
+                discovered_candidates.append(candidate)
 
     resolved_inputs = {}
     all_inputs = {**declared_inputs, **optional_inputs}
@@ -279,6 +289,7 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         "declared_outputs": declared_outputs,
         "actual_outputs": actual_outputs,
         "artifacts": artifacts,
+        "discovered_candidates": discovered_candidates,
         "validation": {
             "status": validation_status,
             "missing_outputs": recorded_validation.get("missing_outputs", missing),
@@ -543,6 +554,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     run_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "run.json"
                     data = read_json(run_file)
                     return json_response(self, 200 if data else 404, data or {"detail": "Run not found"})
+                if len(path) == 6 and path[3] == "runs":
+                    run_dir = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4]
+                    section = path[5]
+                    if section in {"dag", "context", "artifacts"}:
+                        data = read_json(run_dir / f"{section}.json")
+                        return json_response(self, 200 if data is not None else 404, data if data is not None else {
+                            "detail": f"Run {section} not found"
+                        })
+                    if section == "events":
+                        event_file = run_dir / "events.jsonl"
+                        events = []
+                        if event_file.exists():
+                            for line in event_file.read_text(encoding="utf-8").splitlines():
+                                try:
+                                    events.append(json.loads(line))
+                                except json.JSONDecodeError:
+                                    continue
+                        return json_response(self, 200, {"pipeline_id": path[4], "events": events})
                 if len(path) == 7 and path[3] == "runs" and path[5] == "nodes":
                     data = node_runtime_detail(sop, path[4], path[6])
                     return json_response(self, 200, data)
@@ -565,6 +594,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "pipeline_id": path[4],
                             "node_id": path[6],
                             "artifacts": data["artifacts"],
+                        })
+                    if section == "discovered-candidates":
+                        return json_response(self, 200, {
+                            "pipeline_id": path[4],
+                            "node_id": path[6],
+                            "discovered_candidates": data["discovered_candidates"],
                         })
                 if len(path) == 7 and path[3] == "runs" and path[5] == "logs":
                     node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "nodes" / f"{path[6]}.json"

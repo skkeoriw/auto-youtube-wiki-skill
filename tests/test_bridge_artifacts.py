@@ -73,13 +73,26 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["validation"]["status"], "warning")
         self.assertEqual(detail["validation"]["missing_outputs"], ["index"])
 
-    def test_recursive_directory_contract_finds_files(self):
+    def test_pattern_scan_is_only_a_discovered_candidate(self):
         context_file = self.wiki / "raw/pipeline-runs/pipe-1/context.json"
         context = json.loads(context_file.read_text(encoding="utf-8"))
         context["stage_c"]["file_paths"] = []
         context_file.write_text(json.dumps(context), encoding="utf-8")
         detail = bridge.node_runtime_detail(self.sop, "pipe-1", "wiki-build")
-        self.assertEqual(detail["actual_outputs"]["pages"], ["wiki/entities/Agent.md"])
+        self.assertEqual(detail["actual_outputs"]["pages"], [])
+        self.assertEqual(detail["discovered_candidates"][0]["path"], "wiki/entities/Agent.md")
+        self.assertEqual(detail["discovered_candidates"][0]["ownership"], "unconfirmed")
+
+    def test_historical_pattern_scan_never_becomes_actual_output(self):
+        context_file = self.wiki / "raw/pipeline-runs/pipe-1/context.json"
+        context_file.unlink()
+        detail = bridge.node_runtime_detail(self.sop, "pipe-1", "notebooklm-research")
+        self.assertEqual(detail["actual_outputs"]["reports"], [])
+        self.assertEqual(detail["artifacts"], [])
+        self.assertEqual(
+            [candidate["path"] for candidate in detail["discovered_candidates"]],
+            ["raw/notebooklm-analysis/report.md"],
+        )
 
     def test_recorded_outputs_take_precedence(self):
         node_file = self.wiki / "raw/pipeline-runs/pipe-1/nodes/wiki-build.json"
