@@ -70,6 +70,14 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["validation"]["status"], "warning")
         self.assertEqual(detail["validation"]["missing_outputs"], ["index"])
 
+    def test_recursive_directory_contract_finds_files(self):
+        context_file = self.wiki / "raw/pipeline-runs/pipe-1/context.json"
+        context = json.loads(context_file.read_text(encoding="utf-8"))
+        context["stage_c"]["file_paths"] = []
+        context_file.write_text(json.dumps(context), encoding="utf-8")
+        detail = bridge.node_runtime_detail(self.sop, "pipe-1", "wiki-build")
+        self.assertEqual(detail["actual_outputs"]["pages"], ["wiki/entities/Agent.md"])
+
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
 

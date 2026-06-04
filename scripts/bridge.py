@@ -182,6 +182,8 @@ def resolve_output_artifacts(sop, pipeline_id, node_id, output_name, spec, conte
     pattern = spec.get("path", "") if isinstance(spec, dict) else str(spec)
     pattern = pattern.replace("{pipeline_id}", pipeline_id).replace("{run_id}", run_id or "*")
     if pattern and not paths and not Path(pattern).is_absolute() and ".." not in Path(pattern).parts:
+        if pattern.endswith("/**"):
+            pattern += "/*"
         for path in wiki.glob(pattern):
             if path.is_file() and safe_artifact_path(wiki, path.relative_to(wiki)):
                 paths.append((path, "pattern"))
