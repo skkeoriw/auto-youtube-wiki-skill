@@ -4,10 +4,12 @@ import importlib.util
 import http.server
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest.mock import patch
@@ -59,6 +61,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             json.dumps({"pipeline_id": "pipe-1", "status": "done"}), encoding="utf-8"
         )
         self.sop = {
+            "id": "test",
             "wiki_local_path": str(self.wiki),
             "nodes": {
                 "notebooklm-research": {
@@ -69,6 +72,9 @@ class ArtifactResolutionTest(unittest.TestCase):
                     "outputs": {"source_url": "context.source_url"},
                 },
                 "wiki-build": {
+                    "title": "Wiki Build",
+                    "skill": "sop-wiki-build",
+                    "webhook_route": "sop-wiki-build",
                     "inputs": {"reports": "notebooklm-research.outputs.reports"},
                     "outputs": {"index": "index.md", "pages": "wiki/**"},
                 },
@@ -164,6 +170,103 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(config["executor"]["type"], "agent-skill")
         self.assertEqual(config["executor"]["agent"], "hermes")
         self.assertTrue(config["manifest"]["capabilities"]["git"]["enabled"])
+
+    def test_node_registry_and_actions_routes(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}/api/sop/test"
+            with urllib.request.urlopen(f"{base}/nodes", timeout=3) as response:
+                nodes = json.loads(response.read())
+            self.assertEqual(nodes["nodes"][0]["actions"]["retry"]["method"], "POST")
+            self.assertIn("--action=inspect", nodes["nodes"][0]["cli"]["inspect"])
+            with urllib.request.urlopen(f"{base}/nodes/wiki-build/actions", timeout=3) as response:
+                actions = json.loads(response.read())
+            self.assertFalse(actions["actions"]["trigger"]["enabled"])
+        server.shutdown()
+        server.server_close()
+
+    def test_node_draft_route_does_not_change_sop_yaml(self):
+        (self.wiki / "sop.yaml").write_text("nodes: {}\n", encoding="utf-8")
+        before = (self.wiki / "sop.yaml").read_text(encoding="utf-8")
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
+                method="POST",
+                data=json.dumps({
+                    "skill_install_command": "bash <(curl -fsSL https://skill.vyibc.com/install-demo.sh)",
+                    "skill_id": "demo-skill",
+                    "node_id": "youtube-cover-image",
+                    "upstream": "youtube-deep-research",
+                    "upstream_output": "analysis_file",
+                    "input_name": "research_report",
+                    "output_name": "cover_image",
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                self.assertEqual(response.status, 201)
+                draft = json.loads(response.read())
+            self.assertFalse(draft["validation"]["production_dag_changed"])
+            self.assertTrue((Path(draft["draft_path"]) / "node.yaml").exists())
+        self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
+        server.shutdown()
+        server.server_close()
+
+    def test_trigger_action_is_disabled(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/nodes/wiki-build/actions/trigger",
+                method="POST",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(request, timeout=3)
+            self.assertEqual(ctx.exception.code, 409)
+        server.shutdown()
+        server.server_close()
+
+    def test_sop_node_cli_is_http_client_and_requires_confirm_for_destructive_actions(self):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "sop-node.sh"
+        dry_run = subprocess.run(
+            [
+                "bash", str(script),
+                "--endpoint=https://runtime.example",
+                "--instance=test",
+                "--node=wiki-build",
+                "--pipeline-id=pipe-1",
+                "--action=retry",
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        payload = json.loads(dry_run.stdout)
+        self.assertEqual(payload["method"], "POST")
+        self.assertIn("/actions/retry", payload["url"])
+        blocked = subprocess.run(
+            [
+                "bash", str(script),
+                "--endpoint=https://runtime.example",
+                "--instance=test",
+                "--node=wiki-build",
+                "--pipeline-id=pipe-1",
+                "--action=retry",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("without --confirm", blocked.stderr)
 
     def test_sse_http_response_closes_and_honors_last_event_id(self):
         events_file = self.wiki / "raw/pipeline-runs/pipe-1/events.jsonl"

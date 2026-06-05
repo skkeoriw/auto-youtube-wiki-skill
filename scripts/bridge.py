@@ -16,6 +16,7 @@ SCRIPT = os.environ.get("BRIDGE_SCRIPT", "")
 REGISTRY_PATH = Path(os.environ.get("SOP_REGISTRY_PATH", str(Path.home() / ".sop" / "registry.json"))).expanduser()
 SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5"))
 SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
+GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
 
 
 def json_response(handler, status, data):
@@ -28,6 +29,16 @@ def json_response(handler, status, data):
     handler.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization")
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def request_endpoint(handler):
+    host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host") or ""
+    if not host:
+        return ""
+    proto = handler.headers.get("X-Forwarded-Proto")
+    if not proto:
+        proto = "http" if host.startswith(("127.0.0.1", "localhost")) else "https"
+    return f"{proto}://{host}".rstrip("/")
 
 
 def text_response(handler, status, text):
@@ -404,6 +415,229 @@ def node_static_config(sop, node_id):
         "skill_readme": skill_readme,
         "manifest": manifest,
     }
+
+
+def classify_node(node_id, config, static):
+    executor = static.get("executor") or {}
+    if config.get("mode") == "manual" or node_id == "retry":
+        return "manual-action"
+    if node_id == "tg-notify" or executor.get("skill") == "sop-tg-notify":
+        return "notification-capability"
+    if executor.get("type") in {"http", "public-api"}:
+        return "public-api"
+    if executor.get("type") == "agent-skill" and executor.get("webhook_route"):
+        return "hermes-agent-skill"
+    if config.get("skill") and config.get("webhook_route"):
+        return "repo-skill-script"
+    return "custom"
+
+
+def node_actions(instance_id, node_id):
+    return {
+        "inspect": {
+            "method": "GET",
+            "path": f"/api/sop/{instance_id}/nodes/{node_id}",
+            "requires_pipeline": False,
+            "destructive": False,
+        },
+        "actions": {
+            "method": "GET",
+            "path": f"/api/sop/{instance_id}/nodes/{node_id}/actions",
+            "requires_pipeline": False,
+            "destructive": False,
+        },
+        "status": {
+            "method": "GET",
+            "path": f"/api/sop/{instance_id}/runs/{{pipeline_id}}/nodes/{node_id}",
+            "requires_pipeline": True,
+            "destructive": False,
+        },
+        "retry": {
+            "method": "POST",
+            "path": f"/api/sop/{instance_id}/runs/{{pipeline_id}}/nodes/{node_id}/actions/retry",
+            "requires_pipeline": True,
+            "destructive": True,
+        },
+        "cancel": {
+            "method": "POST",
+            "path": f"/api/sop/{instance_id}/runs/{{pipeline_id}}/nodes/{node_id}/actions/cancel",
+            "requires_pipeline": True,
+            "destructive": True,
+        },
+        "trigger": {
+            "method": "POST",
+            "path": f"/api/sop/{instance_id}/nodes/{node_id}/actions/trigger",
+            "requires_pipeline": False,
+            "destructive": True,
+            "enabled": False,
+        },
+    }
+
+
+def node_cli_examples(endpoint, instance_id, node_id, pipeline_id="<pipeline_id>"):
+    base = (
+        f"bash <(curl -fsSL {GENERIC_NODE_CLI_URL}) --endpoint={endpoint} "
+        f"--instance={instance_id} --node={node_id}"
+    )
+    return {
+        "inspect": f"{base} --action=inspect",
+        "actions": f"{base} --action=actions",
+        "status": f"{base} --pipeline-id={pipeline_id} --action=status",
+        "retry_dry_run": f"{base} --pipeline-id={pipeline_id} --action=retry --dry-run",
+        "cancel_dry_run": f"{base} --pipeline-id={pipeline_id} --action=cancel --dry-run",
+    }
+
+
+def normalize_contract(value, direction):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for name, spec in value.items():
+        if isinstance(spec, dict):
+            result[name] = dict(spec)
+        elif direction == "input":
+            result[name] = {"type": "auto", "required": True, "from": spec}
+        elif str(spec).startswith("context."):
+            result[name] = {"type": "string", "from": spec}
+        else:
+            result[name] = {"type": "files" if "*" in str(spec) else "file", "path": spec}
+    return result
+
+
+def validate_node_definition(node_id, config, static):
+    missing = []
+    executor = static.get("executor") or {}
+    if not node_id:
+        missing.append("node_id")
+    if not static.get("title"):
+        missing.append("title")
+    if not executor.get("type"):
+        missing.append("executor.type")
+    if executor.get("type") in {"agent-skill", "skill"} and not executor.get("skill"):
+        missing.append("executor.skill")
+    if config.get("mode") != "manual" and not config.get("outputs"):
+        missing.append("outputs")
+    return missing
+
+
+def node_registry_item(sop, node_id, endpoint=""):
+    config = (sop.get("nodes") or {}).get(node_id)
+    if config is None:
+        return None
+    static = node_static_config(sop, node_id)
+    if static is None:
+        return None
+    instance_id = sop.get("id") or sop.get("name") or ""
+    manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
+    manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
+    return {
+        **static,
+        "description": manifest.get("description", ""),
+        "case": classify_node(node_id, config, static),
+        "skill": {
+            "id": (static.get("executor") or {}).get("skill", ""),
+            "source": "repository",
+            "install_command": (manifest.get("skill") or {}).get("install_command", "") if isinstance(manifest.get("skill"), dict) else "",
+            "readme_path": static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else "",
+            "summary": static.get("skill_readme", ""),
+        },
+        "inputs": normalize_contract(static.get("inputs", {}), "input"),
+        "optional_inputs": normalize_contract(static.get("optional_inputs", {}), "input"),
+        "outputs": normalize_contract(static.get("outputs", {}), "output"),
+        "capabilities": {
+            "git": manifest_caps.get("git", {"enabled": True, "required": False}),
+            "telegram": manifest_caps.get("telegram", {"enabled": (static.get("infra") or {}).get("tg_notify", True), "required": False}),
+            "sse": {"enabled": True, "required": True},
+        },
+        "actions": node_actions(instance_id, node_id),
+        "cli": node_cli_examples(endpoint or "{endpoint}", instance_id, node_id),
+        "editable": True,
+        "publish_enabled": False,
+        "missing_fields": validate_node_definition(node_id, config, static),
+    }
+
+
+def node_registry(sop, endpoint=""):
+    nodes = []
+    for node_id in (sop.get("nodes") or {}):
+        item = node_registry_item(sop, node_id, endpoint)
+        if item is not None:
+            nodes.append(item)
+    return {
+        "sop_id": sop.get("id", ""),
+        "nodes": nodes,
+    }
+
+
+def slugify(value):
+    import re
+    value = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value).strip().lower())
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value or f"node-{int(time.time())}"
+
+
+def draft_from_skill(spec):
+    node_id = slugify(spec.get("node_id") or spec.get("title") or "new-node")
+    skill_id = str(spec.get("skill_id") or node_id)
+    upstream = str(spec.get("upstream") or "")
+    upstream_output = str(spec.get("upstream_output") or "output")
+    input_name = str(spec.get("input_name") or "input")
+    output_name = str(spec.get("output_name") or "artifact")
+    return {
+        "id": node_id,
+        "title": spec.get("title") or node_id,
+        "description": spec.get("description") or "",
+        "version": "0.1-draft",
+        "skill": {
+            "id": skill_id,
+            "install_command": spec.get("skill_install_command") or "",
+            "source": "install-command" if spec.get("skill_install_command") else "repository",
+        },
+        "executor": {
+            "type": spec.get("executor_type") or "agent-skill",
+            "agent": spec.get("agent") or "hermes",
+            "skill": skill_id,
+            "entry": spec.get("entry") or f"scripts/run_{node_id.replace('-', '_')}.sh",
+        },
+        "mode": spec.get("mode") or "blocking",
+        "needs": [upstream] if upstream else [],
+        "inputs": {
+            input_name: {
+                "type": spec.get("input_type") or "auto",
+                "required": True,
+                "from": f"{upstream}.outputs.{upstream_output}" if upstream else "",
+            }
+        },
+        "outputs": {
+            output_name: {
+                "type": spec.get("output_type") or "file",
+                "path": spec.get("output_path") or f"raw/{node_id}/{{pipeline_id}}/{output_name}",
+            }
+        },
+        "capabilities": {
+            "git": {"enabled": True, "required": False},
+            "telegram": {"enabled": True, "required": False},
+            "sse": {"enabled": True, "required": True},
+        },
+        "ui": {"category": spec.get("category") or "custom"},
+    }
+
+
+def create_node_draft(sop, spec):
+    wiki = Path(sop["wiki_local_path"])
+    draft = draft_from_skill(spec)
+    draft_id = f"{draft['id']}-{int(time.time())}"
+    draft_dir = wiki / "raw" / "node-drafts" / draft_id
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    (draft_dir / "node.yaml").write_text(yaml.safe_dump(draft, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    missing = validate_node_definition(draft["id"], draft, draft)
+    validation = {
+        "status": "passed" if not missing else "warning",
+        "missing_fields": missing,
+        "production_dag_changed": False,
+    }
+    (draft_dir / "validation.json").write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"draft_id": draft_id, "draft_path": str(draft_dir), "node": draft, "validation": validation}
 
 
 def read_registry():
@@ -945,12 +1179,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "log": log_text,
                         "events": events,
                     })
+                # GET /api/sop/{instance}/nodes — Node Registry
+                if len(path) == 4 and path[3] == "nodes":
+                    endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
+                    return json_response(self, 200, node_registry(sop, endpoint))
+                # GET /api/sop/{instance}/node-drafts — list drafts
+                if len(path) == 4 and path[3] == "node-drafts":
+                    drafts_dir = Path(sop["wiki_local_path"]) / "raw" / "node-drafts"
+                    drafts = []
+                    if drafts_dir.exists():
+                        for draft_dir in sorted(drafts_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                            if draft_dir.is_dir():
+                                drafts.append({
+                                    "draft_id": draft_dir.name,
+                                    "node": read_yaml(draft_dir / "node.yaml"),
+                                    "validation": read_json(draft_dir / "validation.json") or {},
+                                })
+                    return json_response(self, 200, {"sop_id": sop.get("id", ""), "drafts": drafts})
                 # GET /api/sop/{instance}/nodes/{node_id} — static node config
                 if len(path) == 5 and path[3] == "nodes":
-                    cfg = node_static_config(sop, path[4])
+                    endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
+                    cfg = node_registry_item(sop, path[4], endpoint)
                     if cfg is None:
                         return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
                     return json_response(self, 200, cfg)
+                # GET /api/sop/{instance}/nodes/{node_id}/actions
+                if len(path) == 6 and path[3] == "nodes" and path[5] == "actions":
+                    if node_registry_item(sop, path[4]) is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "node_id": path[4],
+                        "actions": node_actions(sop.get("id", ""), path[4]),
+                    })
             return text_response(self, 200, "ok")
         except Exception as exc:
             return json_response(self, 500, {"detail": str(exc)})
@@ -1032,6 +1293,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             http_code, result = retry_node(sop, path[4], path[6])
             return json_response(self, http_code, result)
 
+        # POST /api/sop/{instance}/runs/{pipeline_id}/nodes/{node_id}/actions/retry
+        if (len(path) == 9 and path[:2] == ["api", "sop"]
+                and path[3] == "runs" and path[5] == "nodes" and path[7] == "actions" and path[8] == "retry"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = retry_node(sop, path[4], path[6])
+            return json_response(self, http_code, result)
+
         # POST /api/sop/{instance}/runs/{pipeline_id}/nodes/{node_id}/cancel
         if (len(path) == 8 and path[:2] == ["api", "sop"]
                 and path[3] == "runs" and path[5] == "nodes" and path[7] == "cancel"):
@@ -1041,6 +1311,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _status, result = cancel_node(sop, path[4], path[6], data.get("reason", "用户取消节点"))
             http_code = 404 if _status is None else 200
             return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/runs/{pipeline_id}/nodes/{node_id}/actions/cancel
+        if (len(path) == 9 and path[:2] == ["api", "sop"]
+                and path[3] == "runs" and path[5] == "nodes" and path[7] == "actions" and path[8] == "cancel"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            _status, result = cancel_node(sop, path[4], path[6], data.get("reason", "用户取消节点"))
+            http_code = 404 if _status is None else 200
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/nodes/{node_id}/actions/trigger
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "nodes" and path[5] == "actions" and path[6] == "trigger"):
+            return json_response(self, 409, {
+                "status": "disabled",
+                "node_id": path[4],
+                "message": "Node trigger action is draft-only in this version",
+            })
+
+        # POST /api/sop/{instance}/node-drafts
+        if len(path) == 4 and path[:2] == ["api", "sop"] and path[3] == "node-drafts":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            return json_response(self, 201, create_node_draft(sop, data))
 
         env = {**os.environ}
         for k, v in data.items():
