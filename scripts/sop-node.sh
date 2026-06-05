@@ -9,6 +9,7 @@ ACTION="inspect"
 PAYLOAD_JSON="{}"
 DRY_RUN=0
 CONFIRM=0
+CURL_BIN="${CURL_BIN:-}"
 
 usage() {
   cat <<'EOF'
@@ -43,6 +44,20 @@ if [[ -z "$ENDPOINT" || -z "$INSTANCE" || -z "$NODE_ID" ]]; then
   echo "--endpoint, --instance and --node are required" >&2
   usage >&2
   exit 2
+fi
+
+if [[ -z "$CURL_BIN" ]]; then
+  if [[ -x /usr/bin/curl ]]; then
+    CURL_BIN="/usr/bin/curl"
+  elif [[ -x /bin/curl ]]; then
+    CURL_BIN="/bin/curl"
+  else
+    CURL_BIN="$(command -v curl || true)"
+  fi
+fi
+if [[ -z "$CURL_BIN" ]]; then
+  echo "curl is required. Set CURL_BIN=/path/to/curl if it is installed outside PATH." >&2
+  exit 4
 fi
 
 METHOD="GET"
@@ -81,8 +96,8 @@ if [[ "$ACTION" =~ ^(retry|cancel)$ && "$CONFIRM" != "1" ]]; then
 fi
 
 if [[ "$METHOD" == "GET" ]]; then
-  curl -fsSL "$URL"
+  "$CURL_BIN" -fsSL "$URL"
 else
-  curl -fsSL -X POST -H "Content-Type: application/json" --data "$PAYLOAD_JSON" "$URL"
+  "$CURL_BIN" -fsSL -X POST -H "Content-Type: application/json" --data "$PAYLOAD_JSON" "$URL"
 fi
 echo
