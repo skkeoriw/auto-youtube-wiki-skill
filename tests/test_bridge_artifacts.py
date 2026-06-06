@@ -58,7 +58,21 @@ class ArtifactResolutionTest(unittest.TestCase):
             json.dumps({"status": "done", "max_pages": 40}), encoding="utf-8"
         )
         (self.wiki / "raw/pipeline-runs/pipe-1/run.json").write_text(
-            json.dumps({"pipeline_id": "pipe-1", "status": "done"}), encoding="utf-8"
+            json.dumps({
+                "pipeline_id": "pipe-1",
+                "status": "done",
+                "nodes": {"notebooklm-research": "done", "wiki-build": "done"},
+                "started_at": "2026-06-05T00:00:00Z",
+                "updated_at": "2026-06-05T00:02:00Z",
+            }), encoding="utf-8"
+        )
+        (self.wiki / "raw/pipeline-runs/pipe-1/artifacts.json").write_text(
+            json.dumps([{"id": "artifact-1", "path": "wiki/entities/Agent.md"}]), encoding="utf-8"
+        )
+        (self.wiki / "raw/pipeline-runs/pipe-1/events.jsonl").write_text(
+            '{"sequence":1,"event":"git.committed"}\n'
+            '{"sequence":2,"event":"telegram.sent"}\n',
+            encoding="utf-8",
         )
         self.sop = {
             "id": "test",
@@ -80,6 +94,14 @@ class ArtifactResolutionTest(unittest.TestCase):
                 },
             },
         }
+        (self.wiki / "raw/pipeline-runs/pipe-1/dag.json").write_text(
+            json.dumps({
+                "pipeline_id": "pipe-1",
+                "nodes": {"wiki-build": self.sop["nodes"]["wiki-build"]},
+                "edges": [{"source": "notebooklm-research", "target": "wiki-build"}],
+            }),
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -161,7 +183,8 @@ class ArtifactResolutionTest(unittest.TestCase):
         skill.mkdir(parents=True)
         (skill / "node.yaml").write_text(
             "id: wiki-build\nexecutor:\n  type: agent-skill\n  agent: hermes\n"
-            "capabilities:\n  git: {enabled: true, required: false}\n",
+            "capabilities:\n  git: {enabled: true, required: false}\n"
+            "ui:\n  category: build\n  icon: network\n  stage_letter: C\n  order: 40\n",
             encoding="utf-8",
         )
         sop = {"nodes": {"wiki-build": {"title": "Build", "skill": "sop-wiki-build"}}}
@@ -170,6 +193,26 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(config["executor"]["type"], "agent-skill")
         self.assertEqual(config["executor"]["agent"], "hermes")
         self.assertTrue(config["manifest"]["capabilities"]["git"]["enabled"])
+        self.assertEqual(config["ui"]["category"], "build")
+
+    def test_run_summary_exposes_control_console_metrics(self):
+        summary = bridge.run_summary(
+            self.sop,
+            json.loads((self.wiki / "raw/pipeline-runs/pipe-1/run.json").read_text()),
+        )
+        self.assertEqual(summary["node_count"], 2)
+        self.assertEqual(summary["done_count"], 2)
+        self.assertEqual(summary["progress"], 100)
+        self.assertEqual(summary["artifact_count"], 1)
+        self.assertEqual(summary["git_event_count"], 1)
+        self.assertEqual(summary["telegram_event_count"], 1)
+        self.assertEqual(summary["page_count"], 1)
+        self.assertEqual(summary["duration_s"], 120)
+
+    def test_run_dag_snapshot_is_normalized_to_node_list(self):
+        snapshot = bridge.normalized_run_dag(self.sop, "pipe-1")
+        self.assertEqual(snapshot["nodes"][0]["id"], "wiki-build")
+        self.assertEqual(snapshot["edges"][0]["target"], "wiki-build")
 
     def test_node_registry_and_actions_routes(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
@@ -184,6 +227,28 @@ class ArtifactResolutionTest(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/nodes/wiki-build/actions", timeout=3) as response:
                 actions = json.loads(response.read())
             self.assertFalse(actions["actions"]["trigger"]["enabled"])
+        server.shutdown()
+        server.server_close()
+
+    def test_run_productization_routes(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}/api/sop/test/runs/pipe-1"
+            with urllib.request.urlopen(base, timeout=3) as response:
+                run = json.loads(response.read())
+            self.assertEqual(run["progress"], 100)
+            self.assertIn("node_states", run)
+            with urllib.request.urlopen(f"{base}/dag", timeout=3) as response:
+                dag = json.loads(response.read())
+            self.assertIsInstance(dag["nodes"], list)
+            with urllib.request.urlopen(f"{base}/artifacts", timeout=3) as response:
+                artifacts = json.loads(response.read())
+            self.assertEqual(artifacts[0]["id"], "artifact-1")
+            with urllib.request.urlopen(f"{base}/artifact-candidates", timeout=3) as response:
+                candidates = json.loads(response.read())
+            self.assertEqual(candidates["pipeline_id"], "pipe-1")
         server.shutdown()
         server.server_close()
 

@@ -414,6 +414,7 @@ def node_static_config(sop, node_id):
         "skill_script": skill_script,
         "skill_readme": skill_readme,
         "manifest": manifest,
+        "ui": manifest.get("ui") if isinstance(manifest.get("ui"), dict) else {},
     }
 
 
@@ -551,6 +552,7 @@ def node_registry_item(sop, node_id, endpoint=""):
         },
         "actions": node_actions(instance_id, node_id),
         "cli": node_cli_examples(endpoint or "{endpoint}", instance_id, node_id),
+        "ui": static.get("ui") or {},
         "editable": True,
         "publish_enabled": False,
         "missing_fields": validate_node_definition(node_id, config, static),
@@ -801,14 +803,28 @@ def sop_dag(sop):
     nodes = []
     edges = []
     for node_id, node in (sop.get("nodes") or {}).items():
+        static = node_static_config(sop, node_id) or {}
+        manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
+        manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
         nodes.append({
             "id": node_id,
             "title": node.get("title", node_id),
             "mode": node.get("mode", "blocking"),
             "webhook_route": node.get("webhook_route", node.get("route", "")),
+            "needs": node.get("needs") or [],
+            "executor": static.get("executor") or {},
             "inputs": node.get("inputs", {}),
             "outputs": node.get("outputs", {}),
             "optional_inputs": node.get("optional_inputs", {}),
+            "capabilities": {
+                "git": manifest_caps.get("git", {"enabled": True, "required": False}),
+                "telegram": manifest_caps.get("telegram", {
+                    "enabled": (static.get("infra") or {}).get("tg_notify", True),
+                    "required": False,
+                }),
+                "sse": {"enabled": True, "required": True},
+            },
+            "ui": static.get("ui") or {},
         })
         for need in node.get("needs") or []:
             edges.append({"source": need, "target": node_id})
@@ -838,10 +854,122 @@ def sop_runs(sop, query=None):
         if not data.get("pipeline_id"):
             data["pipeline_id"] = run_file.parent.name
         if not status_filter or data.get("status") == status_filter:
-            runs.append(data)
+            runs.append(run_summary(sop, data))
         if len(runs) >= limit:
             break
     return {"sop_id": sop["id"], "runs": runs}
+
+
+def _iso_duration_seconds(started_at, finished_at):
+    if not started_at or not finished_at:
+        return 0
+    try:
+        start = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        finish = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+        return max(0, int((finish - start).total_seconds()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def run_summary(sop, run):
+    """Add stable UI aggregates without removing legacy Run fields."""
+    data = dict(run or {})
+    pipeline_id = str(data.get("pipeline_id") or "")
+    run_dir = run_workspace(sop, pipeline_id)
+    node_states = data.get("nodes") if isinstance(data.get("nodes"), dict) else {}
+    node_count = len(node_states)
+    done_count = sum(status in {"done", "skipped"} for status in node_states.values())
+    failed_count = sum(status == "failed" for status in node_states.values())
+    running_node = next((node_id for node_id, status in node_states.items() if status == "running"), "")
+    progress = round(done_count * 100 / node_count) if node_count else 0
+
+    artifacts = read_json(run_dir / "artifacts.json") or []
+    if not isinstance(artifacts, list):
+        artifacts = []
+    events = read_run_events(run_dir / "events.jsonl")
+    git_events = [event for event in events if str(event.get("event", "")).startswith("git.")]
+    telegram_events = [event for event in events if str(event.get("event", "")).startswith("telegram.")]
+
+    node_details = []
+    node_state_summaries = {}
+    for node_id in node_states:
+        state = read_json(run_dir / "nodes" / f"{node_id}.json") or {}
+        if state:
+            node_details.append(state)
+        node_state_summaries[node_id] = {
+            "status": state.get("status", node_states.get(node_id, "waiting")),
+            "started_at": state.get("started_at", ""),
+            "finished_at": state.get("finished_at", ""),
+            "duration_s": int(state.get("duration_s") or 0),
+            "attempt": int(state.get("attempt") or 0),
+            "progress": int(state.get("progress") or (100 if state.get("status") in {"done", "skipped"} else 0)),
+            "artifact_count": len(state.get("artifacts") or []),
+            "error": state.get("error") or "",
+        }
+    duration_s = sum(int(state.get("duration_s") or 0) for state in node_details)
+    if not duration_s:
+        duration_s = _iso_duration_seconds(data.get("started_at"), data.get("updated_at"))
+
+    wiki_state = next((state for state in node_details if state.get("node_id") == "wiki-build"), {})
+    wiki_outputs = wiki_state.get("actual_outputs") if isinstance(wiki_state.get("actual_outputs"), dict) else {}
+    pages = wiki_outputs.get("pages") if isinstance(wiki_outputs.get("pages"), list) else []
+    page_count = len(pages)
+    if not page_count:
+        context = read_json(run_dir / "context.json") or {}
+        stage_c = context.get("stage_c") if isinstance(context.get("stage_c"), dict) else {}
+        context_pages = stage_c.get("file_paths") if isinstance(stage_c.get("file_paths"), list) else []
+        page_count = int(
+            stage_c.get("pages_new_this_run")
+            or stage_c.get("page_count")
+            or len(context_pages)
+        )
+
+    data.update({
+        "node_count": node_count,
+        "done_count": done_count,
+        "failed_count": failed_count,
+        "running_node": running_node,
+        "progress": progress,
+        "artifact_count": len(artifacts),
+        "git_event_count": len(git_events),
+        "telegram_event_count": len(telegram_events),
+        "page_count": page_count,
+        "duration_s": duration_s,
+        "node_states": node_state_summaries,
+    })
+    return data
+
+
+def normalized_run_dag(sop, pipeline_id):
+    snapshot = read_json(run_workspace(sop, pipeline_id) / "dag.json")
+    if not snapshot:
+        return None
+    raw_nodes = snapshot.get("nodes") or []
+    if isinstance(raw_nodes, dict):
+        nodes = []
+        for node_id, node in raw_nodes.items():
+            item = dict(node or {})
+            item["id"] = node_id
+            static = node_static_config(sop, node_id) or {}
+            item.setdefault("title", static.get("title", node_id))
+            item.setdefault("executor", static.get("executor") or {})
+            item.setdefault("ui", static.get("ui") or {})
+            nodes.append(item)
+    else:
+        nodes = list(raw_nodes)
+    return {**snapshot, "nodes": nodes, "edges": snapshot.get("edges") or []}
+
+
+def run_artifact_candidates(sop, pipeline_id):
+    candidates = []
+    seen = set()
+    for node_id in (sop.get("nodes") or {}):
+        for artifact in node_runtime_detail(sop, pipeline_id, node_id).get("discovered_candidates", []):
+            key = artifact.get("id") or artifact.get("path")
+            if key and key not in seen:
+                seen.add(key)
+                candidates.append(artifact)
+    return candidates
 
 
 def trigger_sop(sop, body):
@@ -1103,14 +1231,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     data = read_json(run_file)
                     if data and not data.get("pipeline_id"):
                         data["pipeline_id"] = path[4]
-                    return json_response(self, 200 if data else 404, data or {"detail": "Run not found"})
+                    return json_response(
+                        self,
+                        200 if data else 404,
+                        run_summary(sop, data) if data else {"detail": "Run not found"},
+                    )
                 if len(path) == 6 and path[3] == "runs":
                     run_dir = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4]
                     section = path[5]
                     if section in {"dag", "context", "artifacts"}:
-                        data = read_json(run_dir / f"{section}.json")
+                        data = (
+                            normalized_run_dag(sop, path[4])
+                            if section == "dag"
+                            else read_json(run_dir / f"{section}.json")
+                        )
                         return json_response(self, 200 if data is not None else 404, data if data is not None else {
                             "detail": f"Run {section} not found"
+                        })
+                    if section == "artifact-candidates":
+                        return json_response(self, 200, {
+                            "pipeline_id": path[4],
+                            "artifacts": run_artifact_candidates(sop, path[4]),
                         })
                     if section == "events":
                         event_file = run_dir / "events.jsonl"
