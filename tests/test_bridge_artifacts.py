@@ -92,13 +92,29 @@ class ArtifactResolutionTest(unittest.TestCase):
                     "inputs": {"reports": "notebooklm-research.outputs.reports"},
                     "outputs": {"index": "index.md", "pages": "wiki/**"},
                 },
+                "retry": {
+                    "title": "Retry",
+                    "mode": "manual",
+                    "outputs": {},
+                },
             },
         }
+        run_file = self.wiki / "raw/pipeline-runs/pipe-1/run.json"
+        run = json.loads(run_file.read_text(encoding="utf-8"))
+        run["nodes"]["retry"] = "done"
+        run_file.write_text(json.dumps(run), encoding="utf-8")
         (self.wiki / "raw/pipeline-runs/pipe-1/dag.json").write_text(
             json.dumps({
                 "pipeline_id": "pipe-1",
-                "nodes": {"wiki-build": self.sop["nodes"]["wiki-build"]},
-                "edges": [{"source": "notebooklm-research", "target": "wiki-build"}],
+                "nodes": {
+                    "notebooklm-research": self.sop["nodes"]["notebooklm-research"],
+                    "wiki-build": self.sop["nodes"]["wiki-build"],
+                    "retry": self.sop["nodes"]["retry"],
+                },
+                "edges": [
+                    {"source": "notebooklm-research", "target": "wiki-build"},
+                    {"source": "wiki-build", "target": "retry"},
+                ],
             }),
             encoding="utf-8",
         )
@@ -211,8 +227,16 @@ class ArtifactResolutionTest(unittest.TestCase):
 
     def test_run_dag_snapshot_is_normalized_to_node_list(self):
         snapshot = bridge.normalized_run_dag(self.sop, "pipe-1")
-        self.assertEqual(snapshot["nodes"][0]["id"], "wiki-build")
+        self.assertEqual(
+            [node["id"] for node in snapshot["nodes"]],
+            ["notebooklm-research", "wiki-build"],
+        )
         self.assertEqual(snapshot["edges"][0]["target"], "wiki-build")
+
+    def test_business_dag_excludes_manual_action_nodes(self):
+        dag = bridge.sop_dag(self.sop)
+        self.assertNotIn("retry", [node["id"] for node in dag["nodes"]])
+        self.assertFalse(any(edge["target"] == "retry" for edge in dag["edges"]))
 
     def test_node_registry_and_actions_routes(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)

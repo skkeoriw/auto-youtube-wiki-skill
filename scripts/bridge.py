@@ -803,6 +803,8 @@ def sop_dag(sop):
     nodes = []
     edges = []
     for node_id, node in (sop.get("nodes") or {}).items():
+        if node.get("mode") == "manual" or node_id == "retry":
+            continue
         static = node_static_config(sop, node_id) or {}
         manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
         manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
@@ -876,7 +878,15 @@ def run_summary(sop, run):
     data = dict(run or {})
     pipeline_id = str(data.get("pipeline_id") or "")
     run_dir = run_workspace(sop, pipeline_id)
-    node_states = data.get("nodes") if isinstance(data.get("nodes"), dict) else {}
+    raw_node_states = data.get("nodes") if isinstance(data.get("nodes"), dict) else {}
+    business_node_ids = {
+        node_id for node_id, config in (sop.get("nodes") or {}).items()
+        if node_id != "retry" and (config or {}).get("mode") != "manual"
+    }
+    node_states = {
+        node_id: status for node_id, status in raw_node_states.items()
+        if not business_node_ids or node_id in business_node_ids
+    }
     node_count = len(node_states)
     done_count = sum(status in {"done", "skipped"} for status in node_states.values())
     failed_count = sum(status == "failed" for status in node_states.values())
@@ -949,6 +959,8 @@ def normalized_run_dag(sop, pipeline_id):
         nodes = []
         for node_id, node in raw_nodes.items():
             item = dict(node or {})
+            if item.get("mode") == "manual" or node_id == "retry":
+                continue
             item["id"] = node_id
             static = node_static_config(sop, node_id) or {}
             item.setdefault("title", static.get("title", node_id))
@@ -956,8 +968,10 @@ def normalized_run_dag(sop, pipeline_id):
             item.setdefault("ui", static.get("ui") or {})
             nodes.append(item)
     else:
-        nodes = list(raw_nodes)
-    return {**snapshot, "nodes": nodes, "edges": snapshot.get("edges") or []}
+        nodes = [node for node in raw_nodes if node.get("mode") != "manual" and node.get("id") != "retry"]
+    node_ids = {node.get("id") for node in nodes}
+    edges = [edge for edge in (snapshot.get("edges") or []) if edge.get("source") in node_ids and edge.get("target") in node_ids]
+    return {**snapshot, "nodes": nodes, "edges": edges}
 
 
 def run_artifact_candidates(sop, pipeline_id):
