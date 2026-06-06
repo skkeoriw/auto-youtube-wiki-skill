@@ -248,9 +248,38 @@ class ArtifactResolutionTest(unittest.TestCase):
                 nodes = json.loads(response.read())
             self.assertEqual(nodes["nodes"][0]["actions"]["retry"]["method"], "POST")
             self.assertIn("--action=inspect", nodes["nodes"][0]["cli"]["inspect"])
+            self.assertIn("modules", nodes["nodes"][0])
+            self.assertIn("executor", [module["id"] for module in nodes["nodes"][0]["modules"]])
             with urllib.request.urlopen(f"{base}/nodes/wiki-build/actions", timeout=3) as response:
                 actions = json.loads(response.read())
             self.assertFalse(actions["actions"]["trigger"]["enabled"])
+        server.shutdown()
+        server.server_close()
+
+    def test_node_module_routes_expose_static_and_run_scoped_data(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}/api/sop/test"
+            with urllib.request.urlopen(f"{base}/nodes/wiki-build/modules", timeout=3) as response:
+                modules = json.loads(response.read())
+            self.assertEqual(modules["node_id"], "wiki-build")
+            self.assertIn("skill", [module["id"] for module in modules["modules"]])
+            with urllib.request.urlopen(f"{base}/nodes/wiki-build/modules/skill", timeout=3) as response:
+                skill = json.loads(response.read())
+            self.assertEqual(skill["module"]["id"], "skill")
+            self.assertEqual(skill["detail"]["skill"]["id"], "sop-wiki-build")
+            with urllib.request.urlopen(f"{base}/runs/pipe-1/nodes/wiki-build/modules/inputs", timeout=3) as response:
+                inputs = json.loads(response.read())
+            self.assertEqual(inputs["pipeline_id"], "pipe-1")
+            self.assertEqual(inputs["detail"]["resolved_inputs"]["reports"], ["frozen-report.md"])
+            with urllib.request.urlopen(f"{base}/runs/pipe-1/nodes/wiki-build/modules/outputs", timeout=3) as response:
+                outputs = json.loads(response.read())
+            self.assertEqual(outputs["detail"]["actual_outputs"]["pages"], ["wiki/entities/Agent.md"])
+            with urllib.request.urlopen(f"{base}/runs/pipe-1/nodes/wiki-build/modules/capabilities", timeout=3) as response:
+                caps = json.loads(response.read())
+            self.assertEqual(caps["detail"]["run_capabilities"]["git"]["commit"], "abc123")
         server.shutdown()
         server.server_close()
 

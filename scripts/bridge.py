@@ -553,10 +553,169 @@ def node_registry_item(sop, node_id, endpoint=""):
         "actions": node_actions(instance_id, node_id),
         "cli": node_cli_examples(endpoint or "{endpoint}", instance_id, node_id),
         "ui": static.get("ui") or {},
+        "modules": node_modules(sop, node_id, endpoint),
         "editable": True,
         "publish_enabled": False,
         "missing_fields": validate_node_definition(node_id, config, static),
     }
+
+
+NODE_MODULE_DEFINITIONS = [
+    ("basic", "Basic", "节点身份、分类和发布状态"),
+    ("executor", "Executor", "执行器、Agent、Webhook 和操作入口"),
+    ("skill", "Skill", "节点背后的 Skill 安装、说明和来源"),
+    ("inputs", "Inputs", "输入契约和当前 Run 的 resolved inputs"),
+    ("outputs", "Outputs", "输出契约、实际输出和校验结果"),
+    ("artifacts", "Artifacts", "当前 Run 的记录产物和候选产物"),
+    ("capabilities", "Capabilities", "Git、TG、SSE 和日志等附属能力"),
+    ("runtime", "Runtime State", "节点运行状态、进度、耗时和错误"),
+    ("actions", "Actions", "Inspect、Retry、Cancel、Validate 和 Publish"),
+    ("logs", "Logs / Events", "节点日志、事件和错误线索"),
+]
+
+
+def module_status(module_id, static, run_detail=None):
+    missing = validate_node_definition(static.get("node_id", ""), (static or {}), static or {})
+    if module_id in {"basic", "executor", "skill", "actions"}:
+        return "warning" if missing else "ready"
+    if module_id == "inputs":
+        return "ready" if static.get("inputs") or static.get("optional_inputs") else "warning"
+    if module_id == "outputs":
+        return "ready" if static.get("outputs") else "warning"
+    if module_id == "capabilities":
+        return "ready"
+    if run_detail:
+        if module_id == "runtime":
+            return run_detail.get("status", "waiting")
+        if module_id == "artifacts":
+            return "ready" if run_detail.get("artifacts") else "warning"
+        if module_id == "logs":
+            return run_detail.get("status", "waiting")
+    return "waiting"
+
+
+def module_summary(module_id, static, run_detail=None):
+    executor = static.get("executor") or {}
+    skill = executor.get("skill") or ""
+    if module_id == "basic":
+        return f"{static.get('title', static.get('node_id'))} · {static.get('mode', 'blocking')}"
+    if module_id == "executor":
+        return f"{executor.get('type', 'skill')} · {executor.get('agent') or executor.get('webhook_route') or skill or 'local'}"
+    if module_id == "skill":
+        return skill or "未配置 skill"
+    if module_id == "inputs":
+        total = len(static.get("inputs") or {}) + len(static.get("optional_inputs") or {})
+        resolved = len((run_detail or {}).get("resolved_inputs") or {})
+        return f"{resolved}/{total} resolved" if run_detail else f"{total} inputs"
+    if module_id == "outputs":
+        total = len(static.get("outputs") or {})
+        actual = len((run_detail or {}).get("actual_outputs") or {})
+        return f"{actual}/{total} actual outputs" if run_detail else f"{total} outputs"
+    if module_id == "artifacts":
+        return f"{len((run_detail or {}).get('artifacts') or [])} recorded artifacts" if run_detail else "run-scoped artifacts"
+    if module_id == "capabilities":
+        return "git / telegram / sse"
+    if module_id == "runtime":
+        return f"{(run_detail or {}).get('status', 'waiting')} · {(run_detail or {}).get('duration_s', 0)}s"
+    if module_id == "actions":
+        return "inspect / retry / cancel / validate / publish"
+    if module_id == "logs":
+        return "node events and latest log"
+    return ""
+
+
+def node_modules(sop, node_id, endpoint="", pipeline_id=None):
+    static = node_static_config(sop, node_id)
+    if static is None:
+        return []
+    run_detail = node_runtime_detail(sop, pipeline_id, node_id) if pipeline_id else None
+    modules = []
+    for module_id, title, description in NODE_MODULE_DEFINITIONS:
+        modules.append({
+            "id": module_id,
+            "title": title,
+            "description": description,
+            "status": module_status(module_id, static, run_detail),
+            "summary": module_summary(module_id, static, run_detail),
+            "detail_url": (
+                f"/api/sop/{sop.get('id', '')}/runs/{pipeline_id}/nodes/{node_id}/modules/{module_id}"
+                if pipeline_id
+                else f"/api/sop/{sop.get('id', '')}/nodes/{node_id}/modules/{module_id}"
+            ),
+            "run_scoped": bool(pipeline_id),
+        })
+    return modules
+
+
+def node_module_detail(sop, node_id, module_id, endpoint="", pipeline_id=None):
+    item = node_registry_item(sop, node_id, endpoint)
+    if item is None:
+        return None
+    modules = {module["id"]: module for module in node_modules(sop, node_id, endpoint, pipeline_id)}
+    if module_id not in modules:
+        return None
+    run_detail = node_runtime_detail(sop, pipeline_id, node_id) if pipeline_id else {}
+    base = {
+        "sop_id": sop.get("id", ""),
+        "node_id": node_id,
+        "pipeline_id": pipeline_id or "",
+        "module": modules[module_id],
+    }
+    if module_id == "basic":
+        detail = {
+            "node_id": item.get("node_id"),
+            "title": item.get("title"),
+            "description": item.get("description"),
+            "mode": item.get("mode"),
+            "needs": item.get("needs"),
+            "ui": item.get("ui"),
+            "editable": item.get("editable"),
+            "publish_enabled": item.get("publish_enabled"),
+            "missing_fields": item.get("missing_fields"),
+        }
+    elif module_id == "executor":
+        detail = {"executor": item.get("executor"), "case": item.get("case"), "actions": item.get("actions"), "cli": item.get("cli")}
+    elif module_id == "skill":
+        detail = {"skill": item.get("skill"), "skill_script": item.get("skill_script"), "skill_readme": item.get("skill_readme")}
+    elif module_id == "inputs":
+        detail = {"declared_inputs": item.get("inputs"), "optional_inputs": item.get("optional_inputs"), "resolved_inputs": run_detail.get("resolved_inputs", {})}
+    elif module_id == "outputs":
+        detail = {"declared_outputs": item.get("outputs"), "actual_outputs": run_detail.get("actual_outputs", {}), "validation": run_detail.get("validation", {})}
+    elif module_id == "artifacts":
+        detail = {"artifacts": run_detail.get("artifacts", []), "discovered_candidates": run_detail.get("discovered_candidates", [])}
+    elif module_id == "capabilities":
+        detail = {"declared_capabilities": item.get("capabilities"), "run_capabilities": run_detail.get("capabilities", {})}
+    elif module_id == "runtime":
+        detail = {
+            "status": run_detail.get("status", "waiting"),
+            "run_id": run_detail.get("run_id", ""),
+            "started_at": run_detail.get("started_at", ""),
+            "finished_at": run_detail.get("finished_at", ""),
+            "updated_at": run_detail.get("updated_at", ""),
+            "attempt": run_detail.get("attempt"),
+            "progress": run_detail.get("progress"),
+            "duration_s": run_detail.get("duration_s"),
+            "error": run_detail.get("error", ""),
+        }
+    elif module_id == "actions":
+        detail = {"actions": item.get("actions"), "cli": item.get("cli"), "publish_enabled": item.get("publish_enabled")}
+    else:
+        events = []
+        log_text = ""
+        if pipeline_id:
+            node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / pipeline_id / "nodes" / f"{node_id}.json"
+            node = read_json(node_file) or {}
+            log_file = Path(sop["wiki_local_path"]) / "logs" / "stage-events" / f"{node.get('run_id', '')}.jsonl"
+            log_text = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+            for line in log_text.splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("stage", node_id) == node_id:
+                    events.append(event)
+        detail = {"log": log_text, "events": events}
+    return {**base, "detail": detail}
 
 
 def node_registry(sop, endpoint=""):
@@ -1279,6 +1438,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(path) == 8 and path[3] == "runs" and path[5] == "nodes":
                     data = node_runtime_detail(sop, path[4], path[6])
                     section = path[7]
+                    if section == "modules":
+                        endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
+                        return json_response(self, 200, {
+                            "sop_id": sop.get("id", ""),
+                            "pipeline_id": path[4],
+                            "node_id": path[6],
+                            "modules": node_modules(sop, path[6], endpoint, path[4]),
+                        })
                     if section == "inputs":
                         return json_response(self, 200, {
                             "declared_inputs": data["declared_inputs"],
@@ -1313,6 +1480,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return json_response(self, 200 if plan is not None else 404, plan or {
                             "detail": "Node plan not found"
                         })
+                if len(path) == 9 and path[3] == "runs" and path[5] == "nodes" and path[7] == "modules":
+                    endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
+                    data = node_module_detail(sop, path[6], path[8], endpoint, path[4])
+                    return json_response(self, 200 if data else 404, data or {
+                        "detail": f"Node module {path[8]!r} not found"
+                    })
                 if len(path) == 7 and path[3] == "runs" and path[5] == "logs":
                     node_id_log = path[6]
                     node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "nodes" / f"{node_id_log}.json"
@@ -1358,6 +1531,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if cfg is None:
                         return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
                     return json_response(self, 200, cfg)
+                # GET /api/sop/{instance}/nodes/{node_id}/modules
+                if len(path) == 6 and path[3] == "nodes" and path[5] == "modules":
+                    endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
+                    if node_registry_item(sop, path[4], endpoint) is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "node_id": path[4],
+                        "modules": node_modules(sop, path[4], endpoint),
+                    })
+                # GET /api/sop/{instance}/nodes/{node_id}/modules/{module_id}
+                if len(path) == 7 and path[3] == "nodes" and path[5] == "modules":
+                    endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
+                    data = node_module_detail(sop, path[4], path[6], endpoint)
+                    return json_response(self, 200 if data else 404, data or {
+                        "detail": f"Node module {path[6]!r} not found"
+                    })
                 # GET /api/sop/{instance}/nodes/{node_id}/actions
                 if len(path) == 6 and path[3] == "nodes" and path[5] == "actions":
                     if node_registry_item(sop, path[4]) is None:
