@@ -1,5 +1,6 @@
 import http.server
 import hashlib
+import importlib.util
 import json
 import mimetypes
 import os
@@ -17,6 +18,7 @@ REGISTRY_PATH = Path(os.environ.get("SOP_REGISTRY_PATH", str(Path.home() / ".sop
 SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5"))
 SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
+_RUN_INDEX_CLASS = None
 
 
 def json_response(handler, status, data):
@@ -71,6 +73,59 @@ def read_yaml(path):
 
 def run_workspace(sop, pipeline_id):
     return Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / pipeline_id
+
+
+def run_index_class():
+    global _RUN_INDEX_CLASS
+    if _RUN_INDEX_CLASS is not None:
+        return _RUN_INDEX_CLASS
+    plugin_root = Path(os.environ.get(
+        "AGENT_BRAIN_PLUGINS_PATH",
+        str(Path.home() / "agent-brain-plugins"),
+    )).expanduser()
+    candidates = [
+        Path(os.environ.get("SOP_RUN_INDEX_MODULE", "")).expanduser() if os.environ.get("SOP_RUN_INDEX_MODULE") else None,
+        plugin_root / "youtube-wiki" / "infrastructure" / "run_index.py",
+        Path(os.environ.get(
+            "YOUTUBE_WIKI_PLUGIN_DIR",
+            str(Path.home() / "agent-brain-plugins" / "youtube-wiki"),
+        )).expanduser() / "infrastructure" / "run_index.py",
+    ]
+    module_path = next((path for path in candidates if path and path.exists()), None)
+    if not module_path:
+        return None
+    spec = importlib.util.spec_from_file_location("sop_run_index", module_path)
+    if not spec or not spec.loader:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _RUN_INDEX_CLASS = module.RunIndexStore
+    return _RUN_INDEX_CLASS
+
+
+def run_index_store(sop, create=False):
+    cls = run_index_class()
+    if cls is None:
+        return None
+    store = cls(sop["wiki_local_path"])
+    if create or store.db_path.exists():
+        return store
+    return None
+
+
+def indexed_run(sop, pipeline_id, rebuild=True):
+    store = run_index_store(sop, create=rebuild)
+    if not store:
+        return None
+    try:
+        data = store.get_run(pipeline_id)
+        if data:
+            return data
+        if rebuild and store.rebuild_from_workspace(pipeline_id, sop):
+            return store.get_run(pipeline_id)
+    except Exception:
+        return None
+    return None
 
 
 def read_run_events(events_file, after_sequence=0):
@@ -330,7 +385,7 @@ def node_runtime_detail(sop, pipeline_id, node_id):
     ]
     recorded_validation = state.get("validation") if isinstance(state.get("validation"), dict) else {}
     validation_status = recorded_validation.get("status") or ("passed" if not missing else "warning")
-    return {
+    detail = {
         **state,
         "pipeline_id": state.get("pipeline_id", pipeline_id),
         "node_id": state.get("node_id", node_id),
@@ -354,6 +409,22 @@ def node_runtime_detail(sop, pipeline_id, node_id):
             "unexpected_outputs": recorded_validation.get("unexpected_outputs", []),
         },
     }
+    store = run_index_store(sop)
+    if store:
+        try:
+            indexed = store.get_node_state(pipeline_id, node_id)
+            if indexed:
+                indexed_artifacts = store.get_artifacts(pipeline_id, node_id)
+                detail.update({
+                    **indexed,
+                    "artifacts": indexed_artifacts,
+                    "discovered_candidates": discovered_candidates,
+                    "plan": detail.get("plan"),
+                    "index_resolution": "indexed",
+                })
+        except Exception:
+            pass
+    return detail
 
 
 def node_static_config(sop, node_id):
@@ -1007,6 +1078,18 @@ def sop_runs(sop, query=None):
         limit = 80
     status_filter = (query.get("status") or [""])[0]
     runs = []
+    seen = set()
+    store = run_index_store(sop)
+    if store:
+        try:
+            for data in store.list_runs(limit=limit, status=status_filter):
+                runs.append(data)
+                seen.add(data.get("pipeline_id"))
+                if len(runs) >= limit:
+                    return {"sop_id": sop["id"], "runs": runs}
+        except Exception:
+            runs = []
+            seen = set()
     for run_file in run_files(sop):
         data = read_json(run_file)
         if not data:
@@ -1014,6 +1097,8 @@ def sop_runs(sop, query=None):
         # Guarantee pipeline_id is always present; derive from directory name if missing.
         if not data.get("pipeline_id"):
             data["pipeline_id"] = run_file.parent.name
+        if data.get("pipeline_id") in seen:
+            continue
         if not status_filter or data.get("status") == status_filter:
             runs.append(run_summary(sop, data))
         if len(runs) >= limit:
@@ -1404,20 +1489,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     data = read_json(run_file)
                     if data and not data.get("pipeline_id"):
                         data["pipeline_id"] = path[4]
+                    indexed = indexed_run(sop, path[4], rebuild=bool(data))
                     return json_response(
                         self,
-                        200 if data else 404,
-                        run_summary(sop, data) if data else {"detail": "Run not found"},
+                        200 if indexed or data else 404,
+                        indexed or (run_summary(sop, data) if data else {"detail": "Run not found"}),
                     )
                 if len(path) == 6 and path[3] == "runs":
                     run_dir = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4]
                     section = path[5]
                     if section in {"dag", "context", "artifacts"}:
-                        data = (
-                            normalized_run_dag(sop, path[4])
-                            if section == "dag"
-                            else read_json(run_dir / f"{section}.json")
-                        )
+                        if section == "artifacts":
+                            store = run_index_store(sop)
+                            indexed_artifacts = None
+                            if store:
+                                try:
+                                    indexed_artifacts = store.get_artifacts(path[4]) if store.get_run(path[4]) else None
+                                except Exception:
+                                    indexed_artifacts = None
+                            data = indexed_artifacts if indexed_artifacts is not None else read_json(run_dir / "artifacts.json")
+                        else:
+                            data = (
+                                normalized_run_dag(sop, path[4])
+                                if section == "dag"
+                                else read_json(run_dir / f"{section}.json")
+                            )
                         return json_response(self, 200 if data is not None else 404, data if data is not None else {
                             "detail": f"Run {section} not found"
                         })
@@ -1427,8 +1523,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "artifacts": run_artifact_candidates(sop, path[4]),
                         })
                     if section == "events":
-                        event_file = run_dir / "events.jsonl"
-                        events = read_run_events(event_file)
+                        store = run_index_store(sop)
+                        events = []
+                        if store:
+                            try:
+                                events = store.get_events(path[4])
+                            except Exception:
+                                events = []
+                        if not events:
+                            event_file = run_dir / "events.jsonl"
+                            events = read_run_events(event_file)
                         return json_response(self, 200, {"pipeline_id": path[4], "events": events})
                 if len(path) == 7 and path[3] == "runs" and path[5] == "events" and path[6] == "stream":
                     return self.stream_run_events(sop, path[4])
@@ -1563,7 +1667,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def stream_run_events(self, sop, pipeline_id):
         run_dir = run_workspace(sop, pipeline_id)
-        if not run_dir.exists():
+        store = run_index_store(sop)
+        indexed = indexed_run(sop, pipeline_id, rebuild=run_dir.exists())
+        if not run_dir.exists() and not indexed:
             return json_response(self, 404, {"detail": "Run not found"})
         try:
             last_sequence = int(self.headers.get("Last-Event-ID", "0") or 0)
@@ -1583,12 +1689,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         stream_deadline = time.monotonic() + SSE_STREAM_WINDOW_SECONDS
         while True:
             try:
-                events = read_run_events(events_file, last_sequence)
+                events = []
+                if store:
+                    try:
+                        events = store.get_events(pipeline_id, last_sequence)
+                    except Exception:
+                        events = []
+                if not events:
+                    events = read_run_events(events_file, last_sequence)
                 for event in events:
                     self.wfile.write(format_sse_event(event))
                     self.wfile.flush()
                     last_sequence = event["sequence"]
-                run = read_json(run_dir / "run.json") or {}
+                run = indexed_run(sop, pipeline_id, rebuild=False) or read_json(run_dir / "run.json") or {}
                 if run.get("status") in {"done", "failed", "cancelled"}:
                     break
                 if time.monotonic() - heartbeat_at >= SSE_HEARTBEAT_SECONDS:

@@ -305,6 +305,51 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
+    def test_run_routes_prefer_runtime_index(self):
+        cls = bridge.run_index_class()
+        self.assertIsNotNone(cls)
+        store = cls(self.wiki)
+        store.upsert_execution({
+            "pipeline_id": "pipe-1",
+            "sop_id": "test",
+            "status": "running",
+            "nodes": {"wiki-build": "running"},
+            "updated_at": "2026-06-05T00:03:00Z",
+        })
+        store.upsert_node_state({
+            "pipeline_id": "pipe-1",
+            "node_id": "wiki-build",
+            "attempt": 2,
+            "status": "running",
+            "progress": 40,
+            "resolved_inputs": {"reports": ["indexed-report.md"]},
+            "actual_outputs": {"pages": ["indexed-page.md"]},
+        }, {"telegram": {"status": "done", "message_preview": "indexed tg"}})
+        store.append_event({"pipeline_id": "pipe-1", "event": "node.progress", "node_id": "wiki-build", "data": {"completed": 2}})
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}/api/sop/test/runs/pipe-1"
+            with urllib.request.urlopen(base, timeout=3) as response:
+                run = json.loads(response.read())
+            self.assertEqual(run["index_resolution"], "indexed")
+            self.assertEqual(run["node_states"]["wiki-build"]["attempt"], 2)
+            with urllib.request.urlopen(f"{base}/events", timeout=3) as response:
+                events = json.loads(response.read())
+            self.assertEqual(events["events"][0]["event"], "node.progress")
+            with urllib.request.urlopen(f"{base}/artifacts", timeout=3) as response:
+                artifacts = json.loads(response.read())
+            self.assertEqual(artifacts, [])
+            with urllib.request.urlopen(f"{base}/nodes/wiki-build", timeout=3) as response:
+                node = json.loads(response.read())
+            self.assertEqual(node["index_resolution"], "indexed")
+            self.assertEqual(node["resolved_inputs"]["reports"], ["indexed-report.md"])
+            self.assertEqual(node["capabilities"]["telegram"]["message_preview"], "indexed tg")
+        server.shutdown()
+        server.server_close()
+
     def test_node_draft_route_does_not_change_sop_yaml(self):
         (self.wiki / "sop.yaml").write_text("nodes: {}\n", encoding="utf-8")
         before = (self.wiki / "sop.yaml").read_text(encoding="utf-8")
