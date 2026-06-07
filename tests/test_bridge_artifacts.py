@@ -476,6 +476,23 @@ class ArtifactResolutionTest(unittest.TestCase):
             self.assertEqual(invalid["draft_id"], "")
             self.assertIn("skill_install_command", invalid["validation"]["missing_fields"])
             self.assertIn("node_id", invalid["validation"]["missing_fields"])
+            conflict_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
+                method="POST",
+                data=json.dumps({
+                    "skill_install_command": "bash <(curl -fsSL https://skill.vyibc.com/install-demo.sh)",
+                    "skill_id": "demo-skill",
+                    "node_id": "wiki-build",
+                    "title": "Wiki Build Override",
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as conflict_ctx:
+                urllib.request.urlopen(conflict_request, timeout=3)
+            self.assertEqual(conflict_ctx.exception.code, 422)
+            conflict = json.loads(conflict_ctx.exception.read())
+            self.assertEqual(conflict["validation"]["status"], "failed")
+            self.assertIn("node_exists", [error["code"] for error in conflict["validation"]["errors"]])
         self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
         server.shutdown()
         server.server_close()

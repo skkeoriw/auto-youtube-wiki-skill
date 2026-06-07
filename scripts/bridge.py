@@ -1076,8 +1076,9 @@ def node_draft_schema():
     }
 
 
-def validate_node_draft_input(spec):
+def validate_node_draft_input(spec, existing_nodes=None):
     errors = []
+    existing_nodes = existing_nodes or set()
     for field in node_draft_schema()["fields"]:
         name = str(field["name"])
         value = spec.get(name)
@@ -1095,6 +1096,13 @@ def validate_node_draft_input(spec):
                 "code": "slug",
                 "message": f"{name} must contain only letters, numbers, dash or underscore",
             })
+    node_id = str(spec.get("node_id") or "").strip()
+    if node_id and node_id in existing_nodes:
+        errors.append({
+            "field": "node_id",
+            "code": "node_exists",
+            "message": f"node_id {node_id} already exists in production DAG",
+        })
     return {
         "schema_id": NODE_DRAFT_SCHEMA_VERSION,
         "status": "passed" if not errors else "failed",
@@ -1104,7 +1112,8 @@ def validate_node_draft_input(spec):
 
 
 def create_node_draft(sop, spec):
-    input_validation = validate_node_draft_input(spec)
+    existing_nodes = set((sop.get("nodes") or {}).keys()) if isinstance(sop.get("nodes"), dict) else set()
+    input_validation = validate_node_draft_input(spec, existing_nodes)
     if input_validation["errors"]:
         return {
             "draft_id": "",
