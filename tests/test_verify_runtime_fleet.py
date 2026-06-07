@@ -42,6 +42,18 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
         verifier.chmod(0o755)
         return verifier
 
+    def _fake_inventory_verifier(self, tmp_path: Path) -> Path:
+        verifier = tmp_path / "verify-runtime-inventory.sh"
+        verifier.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'INVENTORY\\n' >> \"$ARG_FILE\"\n"
+            "printf '%s\\n' \"$@\" >> \"$ARG_FILE\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        verifier.chmod(0o755)
+        return verifier
+
     def _fake_sop_ui_verifier(self, tmp_path: Path) -> Path:
         verifier = tmp_path / "verify-sop-ui-runtime-discovery.sh"
         verifier.write_text(
@@ -68,12 +80,14 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
 
     def _run(self, verifier: Path, args_file: Path, *args: str, fail_name: str = ""):
         control_plane_verifier = self._fake_control_plane_verifier(args_file.parent)
+        inventory_verifier = self._fake_inventory_verifier(args_file.parent)
         sop_ui_verifier = self._fake_sop_ui_verifier(args_file.parent)
         repo_verifier = self._fake_repo_verifier(args_file.parent)
         env = os.environ.copy()
         env.update({
             "VERIFY_RUNTIME_CHANNEL_SCRIPT": str(verifier),
             "VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT": str(control_plane_verifier),
+            "VERIFY_RUNTIME_INVENTORY_SCRIPT": str(inventory_verifier),
             "VERIFY_SOP_UI_DISCOVERY_SCRIPT": str(sop_ui_verifier),
             "VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT": str(repo_verifier),
             "ARG_FILE": str(args_file),
@@ -96,6 +110,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             text = args_file.read_text(encoding="utf-8")
             self.assertEqual(text.count("CALL\n"), 3)
             self.assertEqual(text.count("CONTROL\n"), 1)
+            self.assertEqual(text.count("INVENTORY\n"), 1)
             self.assertEqual(text.count("SOPUI\n"), 1)
             self.assertNotIn("REPOS\n", text)
             self.assertIn("--tunnel-api=https://tunnel-api.chxyka.ccwu.cc\n", text)
@@ -108,7 +123,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertIn("--expect-runtime=youtube-wiki-222|youtube-wiki-222|https://youtube-wiki-222.chxyka.ccwu.cc\n", text)
             self.assertIn("--expect-auto-domain-source-mode=managed\n", text)
             self.assertIn("--expect-auto-domain-source-commit=testcommit\n", text)
-            self.assertEqual(text.count("--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc\n"), 3)
+            self.assertEqual(text.count("--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc\n"), 4)
             self.assertIn("--expect-sop-type=runtime-provisioning\n", text)
             self.assertIn("--expect-sop-type=youtube-research-wiki\n", text)
             self.assertIn("--no-options\n", text)
@@ -123,6 +138,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             text = args_file.read_text(encoding="utf-8")
             self.assertEqual(text.count("CALL\n"), 1)
             self.assertEqual(text.count("CONTROL\n"), 1)
+            self.assertEqual(text.count("INVENTORY\n"), 1)
             self.assertEqual(text.count("SOPUI\n"), 1)
             self.assertIn("--name=youtube-wiki-222\n", text)
             self.assertNotIn("--name=youtube-wiki\n", text)
@@ -139,6 +155,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertIn("failed runtimes: youtube-wiki-168", result.stderr)
             text = args_file.read_text(encoding="utf-8")
             self.assertNotIn("SOPUI\n", text)
+            self.assertIn("INVENTORY\n", text)
 
     def test_no_control_plane_skips_control_plane_verifier(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,8 +165,27 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             text = args_file.read_text(encoding="utf-8")
             self.assertNotIn("CONTROL\n", text)
+            self.assertIn("INVENTORY\n", text)
             self.assertEqual(text.count("CALL\n"), 1)
             self.assertEqual(text.count("SOPUI\n"), 1)
+
+    def test_no_inventory_skips_inventory_verifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier, args_file = self._fake_verifier(Path(tmp))
+            result = self._run(verifier, args_file, "--only=youtube-wiki-222", "--no-inventory")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = args_file.read_text(encoding="utf-8")
+            self.assertNotIn("INVENTORY\n", text)
+
+    def test_strict_inventory_forwards_strict_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier, args_file = self._fake_verifier(Path(tmp))
+            result = self._run(verifier, args_file, "--only=youtube-wiki-222", "--strict-inventory")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = args_file.read_text(encoding="utf-8")
+            self.assertIn("--strict\n", text)
 
     def test_no_sop_type_check_skips_sop_type_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

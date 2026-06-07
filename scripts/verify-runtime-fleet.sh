@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TUNNEL_API="${TUNNEL_API:-https://tunnel-api.chxyka.ccwu.cc}"
 VERIFY_RUNTIME_CHANNEL_SCRIPT="${VERIFY_RUNTIME_CHANNEL_SCRIPT:-$SCRIPT_DIR/verify-runtime-channel.sh}"
+VERIFY_RUNTIME_INVENTORY_SCRIPT="${VERIFY_RUNTIME_INVENTORY_SCRIPT:-$SCRIPT_DIR/verify-runtime-inventory.sh}"
 VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT="${VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT:-$SCRIPT_DIR/verify-tunnel-control-plane.sh}"
 VERIFY_SOP_UI_DISCOVERY_SCRIPT="${VERIFY_SOP_UI_DISCOVERY_SCRIPT:-$SCRIPT_DIR/verify-sop-ui-runtime-discovery.sh}"
 VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT="${VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT:-$SCRIPT_DIR/verify-runtime-repo-versions.sh}"
@@ -14,6 +15,8 @@ EXPECT_SOURCE_REPO="${EXPECT_AUTO_DOMAIN_SOURCE_REPO:-https://github.com/skkeori
 EXPECT_SOURCE_COMMIT="${EXPECT_AUTO_DOMAIN_SOURCE_COMMIT:-8738556}"
 EXPECT_SOP_TYPES="${EXPECT_SOP_TYPES:-runtime-provisioning,youtube-research-wiki}"
 CHECK_OPTIONS=1
+CHECK_INVENTORY=1
+STRICT_INVENTORY=0
 CHECK_CONTROL_PLANE=1
 CHECK_SOP_UI=1
 CHECK_REPO_VERSIONS=0
@@ -43,6 +46,8 @@ Options:
   --repo-version-check                check remote Runtime repo versions through SSH
   --repo-target=name|user|host|key    runtime repo SSH target; can be repeated
   --repair-control-plane              call /admin/health?repair=1 before runtime checks
+  --strict-inventory                  fail if tunnel-admin exposes extra SOP Runtime channels
+  --no-inventory                      skip tunnel-admin Runtime inventory check
   --no-control-plane                  skip tunnel-admin/Cloudflare health check
   --no-sop-ui                         skip sop-ui-prototype Runtime discovery check
   --source-mode=managed               expected auto-domain source mode
@@ -68,6 +73,8 @@ while [ "$#" -gt 0 ]; do
     --repo-version-check) CHECK_REPO_VERSIONS=1; shift ;;
     --repo-target=*) REPO_TARGETS+=("${1#--repo-target=}"); shift ;;
     --repair-control-plane) REPAIR_CONTROL_PLANE=1; shift ;;
+    --strict-inventory) STRICT_INVENTORY=1; shift ;;
+    --no-inventory) CHECK_INVENTORY=0; shift ;;
     --no-control-plane) CHECK_CONTROL_PLANE=0; shift ;;
     --no-sop-ui) CHECK_SOP_UI=0; shift ;;
     --source-mode=*) EXPECT_SOURCE_MODE="${1#--source-mode=}"; shift ;;
@@ -94,6 +101,13 @@ done
 if [ "$CHECK_CONTROL_PLANE" = "1" ]; then
   [ -x "$VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT" ] || {
     echo "[runtime-fleet] control-plane verifier not found or not executable: $VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT" >&2
+    exit 1
+  }
+fi
+
+if [ "$CHECK_INVENTORY" = "1" ]; then
+  [ -x "$VERIFY_RUNTIME_INVENTORY_SCRIPT" ] || {
+    echo "[runtime-fleet] inventory verifier not found or not executable: $VERIFY_RUNTIME_INVENTORY_SCRIPT" >&2
     exit 1
   }
 fi
@@ -140,6 +154,7 @@ passed=0
 failed=0
 failures=()
 ui_expected_runtimes=()
+inventory_expected_runtimes=()
 
 if [ "$CHECK_CONTROL_PLANE" = "1" ]; then
   echo "[runtime-fleet] verifying tunnel control plane -> $TUNNEL_API"
@@ -148,6 +163,23 @@ if [ "$CHECK_CONTROL_PLANE" = "1" ]; then
     control_plane_args+=(--repair)
   fi
   "$VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT" "${control_plane_args[@]}"
+fi
+
+if [ "$CHECK_INVENTORY" = "1" ]; then
+  inventory_args=(--tunnel-api="$TUNNEL_API" --expect-ui-url="$SOP_UI_URL")
+  if [ "$STRICT_INVENTORY" = "1" ]; then
+    inventory_args+=(--strict)
+  fi
+  while IFS='|' read -r name endpoint runtime_id repo port; do
+    [ -n "${name:-}" ] || continue
+    should_verify "$name" || continue
+    inventory_expected_runtimes+=("$name|$runtime_id|$endpoint")
+  done < <(load_specs)
+  for item in "${inventory_expected_runtimes[@]}"; do
+    inventory_args+=(--expect-runtime="$item")
+  done
+  echo "[runtime-fleet] verifying runtime inventory -> $TUNNEL_API"
+  "$VERIFY_RUNTIME_INVENTORY_SCRIPT" "${inventory_args[@]}"
 fi
 
 while IFS='|' read -r name endpoint runtime_id repo port; do
