@@ -104,18 +104,22 @@ if not old:
   raise SystemExit(0)
 
 replacement = '''async function buildWsUrl() {
-  let tunnelUrl;
+  let host = SERVER.trim();
+  let normalized = host;
+
   try {
-    const parsed = new URL(SERVER.includes('://') ? SERVER : `https://${SERVER}`);
-    parsed.protocol = 'wss:';
-    parsed.pathname = '/websocket';
-    parsed.search = '';
-    tunnelUrl = parsed.toString();
+    const parsed = new URL(host.includes('://') ? host : `https://${host}`);
+    normalized = parsed.hostname;
+    if (!normalized) throw new Error('invalid-host');
   } catch {
-    tunnelUrl = 'wss://tunnel-api.chxyka.ccwu.cc/websocket';
+    normalized = host.replace(/^wss?:\/\/+/, '').replace(/^https?:\/\/+/, '');
+    normalized = normalized.split(/[\/?#]/, 1)[0];
+    if (!normalized) {
+      normalized = 'tunnel-api.chxyka.ccwu.cc';
+    }
   }
 
-  const u = new URL(tunnelUrl);
+  const u = new URL(`wss://${normalized}/websocket`);
   if (TOKEN) u.searchParams.set('token', TOKEN);
   u.searchParams.set('port', String(PORT));
   if (NAME) u.searchParams.set('name', NAME);
