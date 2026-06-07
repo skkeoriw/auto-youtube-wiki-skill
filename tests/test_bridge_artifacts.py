@@ -281,6 +281,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             executor_module = next(module for module in modules["modules"] if module["id"] == "executor")
             self.assertEqual(executor_module["lane"], "execution")
             self.assertIsInstance(executor_module["order"], int)
+            self.assertEqual(executor_module["contract_version"], "node-module-contract/v1")
             self.assertIn("executor.type", executor_module["schema"])
             self.assertIn("action_count", executor_module["metrics"])
             with urllib.request.urlopen(f"{base}/nodes/wiki-build/modules/skill", timeout=3) as response:

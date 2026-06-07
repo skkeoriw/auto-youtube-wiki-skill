@@ -662,6 +662,8 @@ def node_registry_item(sop, node_id, endpoint=""):
     }
 
 
+NODE_MODULE_CONTRACT_VERSION = "node-module-contract/v1"
+
 NODE_MODULE_DEFINITIONS = [
     {
         "id": "basic",
@@ -873,6 +875,7 @@ def node_modules(sop, node_id, endpoint="", pipeline_id=None):
             "summary": module_summary(module_id, static, run_detail),
             "schema": definition["schema"],
             "metrics": module_metrics(module_id, static, run_detail),
+            "contract_version": NODE_MODULE_CONTRACT_VERSION,
             "detail_url": (
                 f"/api/sop/{sop.get('id', '')}/runs/{pipeline_id}/nodes/{node_id}/modules/{module_id}"
                 if pipeline_id
