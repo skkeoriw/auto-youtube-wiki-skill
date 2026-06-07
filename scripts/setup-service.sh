@@ -104,7 +104,7 @@ if not old:
   raise SystemExit(0)
 
 replacement = '''async function buildWsUrl() {
-  const base = SERVER.replace(/^wss?:/, 'ws').replace(/\/$/, '') + '/websocket';
+  const base = SERVER.replace(/^wss?:\/\//, 'ws://').replace(/\/$/, '') + '/websocket';
   const u = new URL(base);
   if (TOKEN) u.searchParams.set('token', TOKEN);
   u.searchParams.set('port', String(PORT));
