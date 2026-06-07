@@ -1424,7 +1424,8 @@ def run_artifact_candidates(sop, pipeline_id):
 
 def trigger_sop(sop, body):
     repo = body.get("repo") or sop.get("repo")
-    url = (body.get("input") or {}).get("url") or body.get("url")
+    input_data = body.get("input") if isinstance(body.get("input"), dict) else {}
+    url = input_data.get("url") or body.get("url")
     if not repo or not url:
         return 400, {"status": "error", "message": "repo and input.url are required"}
     env = {**os.environ, "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"}
@@ -1443,7 +1444,35 @@ def trigger_sop(sop, body):
         data = {"status": "triggered", "raw": result.stdout}
     if data.get("pipeline_id"):
         data["status_url"] = f"/api/sop/{sop['id']}/runs/{data['pipeline_id']}"
+        if input_data.get("force_notebooklm_fallback") is True:
+            data["test_overrides"] = patch_run_test_overrides(
+                sop,
+                data["pipeline_id"],
+                {"force_notebooklm_fallback": True},
+            )
     return 200, data
+
+
+def patch_run_test_overrides(sop, pipeline_id, overrides):
+    """Persist explicit test-only run controls after the normal trigger created context."""
+    wiki = Path(sop["wiki_local_path"])
+    targets = [
+        wiki / "raw" / "pipeline-context.json",
+        wiki / "raw" / "pipeline-runs" / pipeline_id / "context.json",
+    ]
+    patched = []
+    for path in targets:
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        current = data.get("test_overrides") if isinstance(data.get("test_overrides"), dict) else {}
+        data["test_overrides"] = {**current, **overrides}
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            patched.append(str(path.relative_to(wiki)))
+        except OSError:
+            continue
+    return {"patched": patched, **overrides}
 
 
 def _now_iso_utc():

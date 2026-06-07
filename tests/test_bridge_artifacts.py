@@ -341,6 +341,36 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
+    def test_trigger_persists_explicit_notebooklm_fallback_override(self):
+        run_dir = self.wiki / "raw/pipeline-runs/pipe-forced"
+        run_dir.mkdir(parents=True)
+        (self.wiki / "raw/pipeline-context.json").write_text(
+            json.dumps({"pipeline_id": "pipe-forced", "source_url": "https://example.com"}),
+            encoding="utf-8",
+        )
+        (run_dir / "context.json").write_text(
+            json.dumps({"pipeline_id": "pipe-forced", "source_url": "https://example.com"}),
+            encoding="utf-8",
+        )
+        with patch.object(bridge.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = json.dumps({"pipeline_id": "pipe-forced"})
+            run.return_value.stderr = ""
+            status, result = bridge.trigger_sop(self.sop, {
+                "repo": "skkeoriw/test",
+                "input": {
+                    "url": "https://example.com",
+                    "force_notebooklm_fallback": True,
+                },
+            })
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["test_overrides"]["force_notebooklm_fallback"], True)
+        root_ctx = json.loads((self.wiki / "raw/pipeline-context.json").read_text(encoding="utf-8"))
+        run_ctx = json.loads((run_dir / "context.json").read_text(encoding="utf-8"))
+        self.assertTrue(root_ctx["test_overrides"]["force_notebooklm_fallback"])
+        self.assertTrue(run_ctx["test_overrides"]["force_notebooklm_fallback"])
+
     def test_run_routes_prefer_runtime_index(self):
         cls = bridge.run_index_class()
         self.assertIsNotNone(cls)
