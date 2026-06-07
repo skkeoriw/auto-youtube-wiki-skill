@@ -12,6 +12,7 @@ RUNTIME_ID="${YOUTUBE_WIKI_RUNTIME_ID:-youtube-wiki}"
 UI_URL="${SOP_UI_URL:-https://sop-ui.chxyka.ccwu.cc}"
 AUTO_DOMAIN_SERVER="${AUTO_DOMAIN_SERVER:-wss://tunnel-api.chxyka.ccwu.cc}"
 AGENT_URL="${AGENT_URL:-https://skill.vyibc.com/agent.js}"
+AUTO_DOMAIN_SCRIPT="${AUTO_DOMAIN_SCRIPT:-$HOME/auto-domain-cli/skills/auto-domain/scripts/run.sh}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -50,31 +51,9 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; 
 
 bash "$SCRIPT_DIR/start-local-service.sh" --stop >/dev/null 2>&1 || true
 bash "$SCRIPT_DIR/start-local-service.sh" --port="$PORT" --daemon
-curl -sf "http://127.0.0.1:$PORT" >/dev/null || {
+if ! curl -sf "http://127.0.0.1:$PORT" >/dev/null; then
   echo "bridge did not start on port $PORT" >&2
   exit 1
-}
-
-CHANNEL_DIR="$HOME/.auto-domain-$NAME"
-mkdir -p "$CHANNEL_DIR"
-curl -fsSL "$AGENT_URL" -o "$CHANNEL_DIR/agent.js"
-python3 - "$CHANNEL_DIR/agent.js" <<'PY'
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-old = "body: (method !== 'GET' && method !== 'HEAD') ? Buffer.from(body, 'base64') : undefined,"
-new = "body: (method !== 'GET' && method !== 'HEAD' && body) ? Buffer.from(body, 'base64') : undefined,"
-if old in text:
-    path.write_text(text.replace(old, new), encoding="utf-8")
-PY
-printf '%s\n' '{"name":"auto-domain-youtube-wiki","private":true,"dependencies":{"ws":"^8.18.0"}}' > "$CHANNEL_DIR/package.json"
-(cd "$CHANNEL_DIR" && npm install --silent --prefer-offline)
-
-if [ -f "$CHANNEL_DIR/agent.pid" ] && kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 2>/dev/null; then
-  kill "$(cat "$CHANNEL_DIR/agent.pid")" || true
-  sleep 1
 fi
 
 METADATA="$(
@@ -101,7 +80,71 @@ print(json.dumps({
 PY
 )"
 
-: > "$CHANNEL_DIR/agent.log"
+cleanup_auto_domain() {
+  local pattern="$1"
+  if pgrep -af "$pattern" >/dev/null 2>&1; then
+    pkill -f "$pattern" || true
+  fi
+}
+
+cleanup_auto_domain "--name=$NAME"
+cleanup_auto_domain "agent.js .*--name=$NAME"
+
+if [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
+  echo "[setup-service] using local auto-domain-cli runner: $AUTO_DOMAIN_SCRIPT"
+  bash "$AUTO_DOMAIN_SCRIPT" --stop >/dev/null 2>&1 || true
+  bash "$AUTO_DOMAIN_SCRIPT" \
+    --port="$PORT" \
+    --name="$NAME" \
+    --replace \
+    --daemon \
+    --metadata="$METADATA" \
+    --server="$AUTO_DOMAIN_SERVER"
+  for _ in $(seq 1 40); do
+    if [ -f "$HOME/.auto-domain/agent.log" ] && grep -q "Public URL" "$HOME/.auto-domain/agent.log" 2>/dev/null; then
+      echo "Public URL : https://$NAME.chxyka.ccwu.cc"
+      echo "Logs: $HOME/.auto-domain/agent.log"
+      exit 0
+    fi
+    if [ -f "$HOME/.auto-domain/agent.pid" ] && ! kill -0 "$(cat "$HOME/.auto-domain/agent.pid")" 2>/dev/null; then
+      echo "auto-domain daemon exited before ready" >&2
+      tail -n 80 "$HOME/.auto-domain/agent.log" >&2 || true
+      exit 1
+    fi
+    if [ -f "$HOME/.auto-domain/agent.log" ] && grep -q "WebSocket error" "$HOME/.auto-domain/agent.log" 2>/dev/null; then
+      # keep retrying, but surface logs when not recoverable
+      sleep 1
+      continue
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for public channel (auto-domain-cli)" >&2
+  tail -n 120 "$HOME/.auto-domain/agent.log" >&2 || true
+  exit 1
+fi
+
+CHANNEL_DIR="$HOME/.auto-domain-$NAME"
+mkdir -p "$CHANNEL_DIR"
+curl -fsSL "$AGENT_URL" -o "$CHANNEL_DIR/agent.js"
+python3 - "$CHANNEL_DIR/agent.js" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "body: (method !== 'GET' && method !== 'HEAD') ? Buffer.from(body, 'base64') : undefined,"
+new = "body: (method !== 'GET' && method !== 'HEAD' && body) ? Buffer.from(body, 'base64') : undefined,"
+if old in text:
+    path.write_text(text.replace(old, new), encoding="utf-8")
+PY
+printf '%s\n' '{"name":"auto-domain-youtube-wiki","private":true,"dependencies":{"ws":"^8.18.0"}}' > "$CHANNEL_DIR/package.json"
+(cd "$CHANNEL_DIR" && npm install --silent --prefer-offline)
+
+if [ -f "$CHANNEL_DIR/agent.pid" ] && kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 2>/dev/null; then
+  kill "$(cat "$CHANNEL_DIR/agent.pid")" || true
+  sleep 1
+fi
+
 (
   cd "$CHANNEL_DIR"
   setsid node agent.js \
