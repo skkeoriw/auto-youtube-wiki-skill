@@ -1076,7 +1076,45 @@ def node_draft_schema():
     }
 
 
+def validate_node_draft_input(spec):
+    errors = []
+    for field in node_draft_schema()["fields"]:
+        name = str(field["name"])
+        value = spec.get(name)
+        if field.get("required") and (value is None or str(value).strip() == ""):
+            errors.append({
+                "field": name,
+                "code": "required",
+                "message": f"{field.get('label', name)} is required",
+            })
+    for name in ("skill_id", "node_id", "input_name", "output_name"):
+        value = spec.get(name)
+        if value and slugify(str(value)) != str(value).strip().lower():
+            errors.append({
+                "field": name,
+                "code": "slug",
+                "message": f"{name} must contain only letters, numbers, dash or underscore",
+            })
+    return {
+        "schema_id": NODE_DRAFT_SCHEMA_VERSION,
+        "status": "passed" if not errors else "failed",
+        "errors": errors,
+        "missing_fields": [error["field"] for error in errors if error["code"] == "required"],
+    }
+
+
 def create_node_draft(sop, spec):
+    input_validation = validate_node_draft_input(spec)
+    if input_validation["errors"]:
+        return {
+            "draft_id": "",
+            "draft_path": "",
+            "node": {},
+            "validation": {
+                **input_validation,
+                "production_dag_changed": False,
+            },
+        }
     wiki = Path(sop["wiki_local_path"])
     draft = draft_from_skill(spec)
     draft_id = f"{draft['id']}-{int(time.time())}"
@@ -2247,7 +2285,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
-            return json_response(self, 201, create_node_draft(sop, data))
+            draft = create_node_draft(sop, data)
+            status = 422 if (draft.get("validation") or {}).get("status") == "failed" else 201
+            return json_response(self, status, draft)
 
         env = {**os.environ}
         for k, v in data.items():

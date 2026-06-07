@@ -449,6 +449,7 @@ class ArtifactResolutionTest(unittest.TestCase):
                     "skill_install_command": "bash <(curl -fsSL https://skill.vyibc.com/install-demo.sh)",
                     "skill_id": "demo-skill",
                     "node_id": "youtube-cover-image",
+                    "title": "YouTube 封面图生成",
                     "upstream": "youtube-deep-research",
                     "upstream_output": "analysis_file",
                     "input_name": "research_report",
@@ -461,6 +462,20 @@ class ArtifactResolutionTest(unittest.TestCase):
                 draft = json.loads(response.read())
             self.assertFalse(draft["validation"]["production_dag_changed"])
             self.assertTrue((Path(draft["draft_path"]) / "node.yaml").exists())
+            invalid_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
+                method="POST",
+                data=json.dumps({"skill_id": "bad id"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(invalid_request, timeout=3)
+            self.assertEqual(ctx.exception.code, 422)
+            invalid = json.loads(ctx.exception.read())
+            self.assertEqual(invalid["validation"]["status"], "failed")
+            self.assertEqual(invalid["draft_id"], "")
+            self.assertIn("skill_install_command", invalid["validation"]["missing_fields"])
+            self.assertIn("node_id", invalid["validation"]["missing_fields"])
         self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
         server.shutdown()
         server.server_close()
