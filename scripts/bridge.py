@@ -1132,6 +1132,7 @@ def create_node_draft(sop, spec):
     (draft_dir / "node.yaml").write_text(yaml.safe_dump(draft, allow_unicode=True, sort_keys=False), encoding="utf-8")
     missing = validate_node_definition(draft["id"], draft, draft)
     validation = {
+        "schema_id": NODE_DRAFT_SCHEMA_VERSION,
         "status": "passed" if not missing else "warning",
         "missing_fields": missing,
         "production_dag_changed": False,

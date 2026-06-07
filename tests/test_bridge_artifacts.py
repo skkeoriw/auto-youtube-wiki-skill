@@ -460,6 +460,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=3) as response:
                 self.assertEqual(response.status, 201)
                 draft = json.loads(response.read())
+            self.assertEqual(draft["validation"]["schema_id"], "node-draft-schema/v1")
             self.assertFalse(draft["validation"]["production_dag_changed"])
             self.assertTrue((Path(draft["draft_path"]) / "node.yaml").exists())
             invalid_request = urllib.request.Request(
