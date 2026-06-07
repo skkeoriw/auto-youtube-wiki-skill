@@ -278,6 +278,11 @@ class ArtifactResolutionTest(unittest.TestCase):
                 modules = json.loads(response.read())
             self.assertEqual(modules["node_id"], "wiki-build")
             self.assertIn("skill", [module["id"] for module in modules["modules"]])
+            executor_module = next(module for module in modules["modules"] if module["id"] == "executor")
+            self.assertEqual(executor_module["lane"], "execution")
+            self.assertIsInstance(executor_module["order"], int)
+            self.assertIn("executor.type", executor_module["schema"])
+            self.assertIn("action_count", executor_module["metrics"])
             with urllib.request.urlopen(f"{base}/nodes/wiki-build/modules/skill", timeout=3) as response:
                 skill = json.loads(response.read())
             self.assertEqual(skill["module"]["id"], "skill")
@@ -289,6 +294,8 @@ class ArtifactResolutionTest(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/runs/pipe-1/nodes/wiki-build/modules/outputs", timeout=3) as response:
                 outputs = json.loads(response.read())
             self.assertEqual(outputs["detail"]["actual_outputs"]["pages"], ["wiki/entities/Agent.md"])
+            self.assertEqual(outputs["module"]["lane"], "contract")
+            self.assertEqual(outputs["module"]["metrics"]["actual"], 2)
             with urllib.request.urlopen(f"{base}/runs/pipe-1/nodes/wiki-build/modules/capabilities", timeout=3) as response:
                 caps = json.loads(response.read())
             self.assertEqual(caps["detail"]["run_capabilities"]["git"]["commit"], "abc123")

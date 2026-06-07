@@ -663,16 +663,86 @@ def node_registry_item(sop, node_id, endpoint=""):
 
 
 NODE_MODULE_DEFINITIONS = [
-    ("basic", "Basic", "节点身份、分类和发布状态"),
-    ("executor", "Executor", "执行器、Agent、Webhook 和操作入口"),
-    ("skill", "Skill", "节点背后的 Skill 安装、说明和来源"),
-    ("inputs", "Inputs", "输入契约和当前 Run 的 resolved inputs"),
-    ("outputs", "Outputs", "输出契约、实际输出和校验结果"),
-    ("artifacts", "Artifacts", "当前 Run 的记录产物和候选产物"),
-    ("capabilities", "Capabilities", "Git、TG、SSE 和日志等附属能力"),
-    ("runtime", "Runtime State", "节点运行状态、进度、耗时和错误"),
-    ("actions", "Actions", "Inspect、Retry、Cancel、Validate 和 Publish"),
-    ("logs", "Logs / Events", "节点日志、事件和错误线索"),
+    {
+        "id": "basic",
+        "title": "Basic",
+        "lane": "definition",
+        "order": 10,
+        "description": "节点身份、分类和发布状态",
+        "schema": ["node_id", "title", "description", "mode", "needs", "ui"],
+    },
+    {
+        "id": "executor",
+        "title": "Executor",
+        "lane": "execution",
+        "order": 20,
+        "description": "执行器、Agent、Webhook 和操作入口",
+        "schema": ["executor.type", "executor.skill", "executor.agent", "executor.entry", "actions", "cli"],
+    },
+    {
+        "id": "skill",
+        "title": "Skill",
+        "lane": "execution",
+        "order": 30,
+        "description": "节点背后的 Skill 安装、说明和来源",
+        "schema": ["skill.id", "skill.source", "skill.install_command", "skill.readme_path"],
+    },
+    {
+        "id": "inputs",
+        "title": "Inputs",
+        "lane": "contract",
+        "order": 40,
+        "description": "输入契约和当前 Run 的 resolved inputs",
+        "schema": ["declared_inputs", "optional_inputs", "resolved_inputs"],
+    },
+    {
+        "id": "outputs",
+        "title": "Outputs",
+        "lane": "contract",
+        "order": 50,
+        "description": "输出契约、实际输出和校验结果",
+        "schema": ["declared_outputs", "actual_outputs", "validation"],
+    },
+    {
+        "id": "artifacts",
+        "title": "Artifacts",
+        "lane": "artifact",
+        "order": 60,
+        "description": "当前 Run 的记录产物和候选产物",
+        "schema": ["artifacts", "discovered_candidates"],
+    },
+    {
+        "id": "capabilities",
+        "title": "Capabilities",
+        "lane": "capability",
+        "order": 70,
+        "description": "Git、TG、SSE 和日志等附属能力",
+        "schema": ["declared_capabilities", "run_capabilities"],
+    },
+    {
+        "id": "runtime",
+        "title": "Runtime State",
+        "lane": "execution",
+        "order": 80,
+        "description": "节点运行状态、进度、耗时和错误",
+        "schema": ["status", "run_id", "attempt", "progress", "duration_s", "error"],
+    },
+    {
+        "id": "actions",
+        "title": "Actions",
+        "lane": "operation",
+        "order": 90,
+        "description": "Inspect、Retry、Cancel、Validate 和 Publish",
+        "schema": ["actions", "cli", "publish_enabled"],
+    },
+    {
+        "id": "logs",
+        "title": "Logs / Events",
+        "lane": "observability",
+        "order": 100,
+        "description": "节点日志、事件和错误线索",
+        "schema": ["log", "events"],
+    },
 ]
 
 
@@ -726,19 +796,83 @@ def module_summary(module_id, static, run_detail=None):
     return ""
 
 
+def module_metrics(module_id, static, run_detail=None):
+    run_detail = run_detail or {}
+    if module_id == "basic":
+        return {
+            "needs": len(static.get("needs") or []),
+            "missing_fields": len(static.get("missing_fields") or []),
+            "editable": bool(static.get("editable", True)),
+        }
+    if module_id == "executor":
+        executor = static.get("executor") or {}
+        return {
+            "type": executor.get("type", "skill"),
+            "has_agent": bool(executor.get("agent")),
+            "has_entry": bool(executor.get("entry")),
+            "action_count": len(static.get("actions") or {}),
+        }
+    if module_id == "skill":
+        skill = static.get("skill") or {}
+        return {
+            "has_install_command": bool(skill.get("install_command")),
+            "has_readme": bool(skill.get("readme_path") or skill.get("summary")),
+        }
+    if module_id == "inputs":
+        declared = static.get("inputs") or {}
+        optional = static.get("optional_inputs") or {}
+        resolved = run_detail.get("resolved_inputs") or {}
+        return {"declared": len(declared), "optional": len(optional), "resolved": len(resolved)}
+    if module_id == "outputs":
+        declared = static.get("outputs") or {}
+        actual = run_detail.get("actual_outputs") or {}
+        validation = run_detail.get("validation") or {}
+        return {"declared": len(declared), "actual": len(actual), "validation": validation.get("status", "")}
+    if module_id == "artifacts":
+        return {
+            "recorded": len(run_detail.get("artifacts") or []),
+            "candidates": len(run_detail.get("discovered_candidates") or []),
+        }
+    if module_id == "capabilities":
+        declared = static.get("capabilities") or {}
+        current = run_detail.get("capabilities") or {}
+        return {"declared": len(declared), "runtime": len(current)}
+    if module_id == "runtime":
+        return {
+            "status": run_detail.get("status", "waiting"),
+            "attempt": run_detail.get("attempt") or 0,
+            "progress": run_detail.get("progress") or 0,
+            "duration_s": run_detail.get("duration_s") or 0,
+        }
+    if module_id == "actions":
+        actions = static.get("actions") or {}
+        return {
+            "total": len(actions),
+            "destructive": len([item for item in actions.values() if isinstance(item, dict) and item.get("destructive")]),
+        }
+    if module_id == "logs":
+        return {"event_count": len((run_detail.get("events") or []))}
+    return {}
+
+
 def node_modules(sop, node_id, endpoint="", pipeline_id=None):
     static = node_static_config(sop, node_id)
     if static is None:
         return []
     run_detail = node_runtime_detail(sop, pipeline_id, node_id) if pipeline_id else None
     modules = []
-    for module_id, title, description in NODE_MODULE_DEFINITIONS:
+    for definition in NODE_MODULE_DEFINITIONS:
+        module_id = definition["id"]
         modules.append({
             "id": module_id,
-            "title": title,
-            "description": description,
+            "title": definition["title"],
+            "lane": definition["lane"],
+            "order": definition["order"],
+            "description": definition["description"],
             "status": module_status(module_id, static, run_detail),
             "summary": module_summary(module_id, static, run_detail),
+            "schema": definition["schema"],
+            "metrics": module_metrics(module_id, static, run_detail),
             "detail_url": (
                 f"/api/sop/{sop.get('id', '')}/runs/{pipeline_id}/nodes/{node_id}/modules/{module_id}"
                 if pipeline_id
