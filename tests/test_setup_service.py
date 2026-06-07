@@ -2,6 +2,7 @@
 
 import os
 import re
+import json
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,11 @@ SETUP_SERVICE = ROOT / "scripts" / "setup-service.sh"
 
 def _extract_shell_function(name):
     text = SETUP_SERVICE.read_text(encoding="utf-8")
+    if name == "build_metadata":
+        match = re.search(r"^build_metadata\(\) \{\n.*?^PY\n^\}\n", text, flags=re.M | re.S)
+        if not match:
+            raise AssertionError(f"{name} function not found")
+        return match.group(0)
     match = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n", text, flags=re.M | re.S)
     if not match:
         raise AssertionError(f"{name} function not found")
@@ -31,6 +37,7 @@ def _run(cmd, cwd=None, env=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=True,
+        executable="/bin/bash",
     )
     return result
 
@@ -105,12 +112,40 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
         self.assertIn("AUTO_DOMAIN_REPO=", text)
         self.assertIn("AUTO_DOMAIN_SOURCE_DIR=", text)
         self.assertIn("AUTO_DOMAIN_ALLOW_LOCAL_RUNNER=", text)
+        self.assertIn("auto_domain_source", text)
         self.assertIn("prepare_auto_domain_source_agent", text)
         self.assertIn("verify_runtime_channel", text)
         self.assertIn('setsid node "$AUTO_DOMAIN_AGENT_JS"', text)
         self.assertIn("local auto-domain-cli runner ignored", text)
         self.assertIn("using managed latest source instead", text)
         self.assertNotIn("AGENT_URL=", text)
+
+    def test_build_metadata_includes_auto_domain_source_contract(self):
+        fn = _extract_shell_function("build_metadata")
+        cmd = "\n".join([
+            "NAME=youtube-wiki-test",
+            "ENDPOINT=https://youtube-wiki-test.example.com",
+            "REPO=skkeoriw/wiki-test",
+            "RUNTIME_ID=youtube-wiki-test",
+            "UI_URL=https://sop-ui-prototype.example.com",
+            "AUTO_DOMAIN_SOURCE_MODE=managed",
+            "AUTO_DOMAIN_SOURCE_REPO=https://github.com/skkeoriw/auto-domain-cli.git",
+            "AUTO_DOMAIN_SOURCE_REF=main",
+            "AUTO_DOMAIN_SOURCE_COMMIT=8738556",
+            fn,
+            "build_metadata",
+        ])
+        result = _run(cmd)
+        metadata = json.loads(result.stdout)
+
+        self.assertEqual(metadata["type"], "sop-runtime")
+        self.assertEqual(metadata["runtime_id"], "youtube-wiki-test")
+        self.assertEqual(metadata["auto_domain_source"], {
+            "mode": "managed",
+            "repo": "https://github.com/skkeoriw/auto-domain-cli.git",
+            "ref": "main",
+            "commit": "8738556",
+        })
 
     def test_verify_runtime_channel_invokes_public_verifier_with_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -137,6 +172,9 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
                 "RUNTIME_ID=youtube-wiki-test",
                 "REPO=skkeoriw/wiki-test",
                 "PORT=18121",
+                "AUTO_DOMAIN_SOURCE_MODE=managed",
+                "AUTO_DOMAIN_SOURCE_REPO=https://github.com/skkeoriw/auto-domain-cli.git",
+                "AUTO_DOMAIN_SOURCE_COMMIT=8738556",
                 fn,
                 "verify_runtime_channel",
             ])
@@ -150,6 +188,9 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
                 "--expect-runtime-id=youtube-wiki-test",
                 "--expect-repo=skkeoriw/wiki-test",
                 "--expect-port=18121",
+                "--expect-auto-domain-source-mode=managed",
+                "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
+                "--expect-auto-domain-source-commit=8738556",
             ])
 
 

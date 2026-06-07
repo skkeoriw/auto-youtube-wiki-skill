@@ -71,12 +71,29 @@ if ! curl -sf "http://127.0.0.1:$PORT" >/dev/null; then
   exit 1
 fi
 
-METADATA="$(
-  python3 - "$NAME" "$ENDPOINT" "$REPO" "$RUNTIME_ID" "$UI_URL" <<'PY'
+AUTO_DOMAIN_SOURCE_MODE=""
+AUTO_DOMAIN_SOURCE_REPO=""
+AUTO_DOMAIN_SOURCE_REF=""
+AUTO_DOMAIN_SOURCE_COMMIT=""
+METADATA=""
+
+build_metadata() {
+  python3 - "$NAME" "$ENDPOINT" "$REPO" "$RUNTIME_ID" "$UI_URL" \
+    "$AUTO_DOMAIN_SOURCE_MODE" "$AUTO_DOMAIN_SOURCE_REPO" "$AUTO_DOMAIN_SOURCE_REF" "$AUTO_DOMAIN_SOURCE_COMMIT" <<'PY'
 import json, sys
 
-name, endpoint, repo, runtime_id, ui_url = sys.argv[1:]
-print(json.dumps({
+(
+    name,
+    endpoint,
+    repo,
+    runtime_id,
+    ui_url,
+    source_mode,
+    source_repo,
+    source_ref,
+    source_commit,
+) = sys.argv[1:]
+metadata = {
     "title": name,
     "type": "sop-runtime",
     "runtime_id": runtime_id,
@@ -91,9 +108,17 @@ print(json.dumps({
     "trigger_command": f"bash <(curl -fsSL https://skill.vyibc.com/youtube-wiki.sh) --endpoint={endpoint} --mode=trigger --repo={repo} --url='https://www.youtube.com/watch?v=dQw4w9WgXcQ'",
     "status_command": f"bash <(curl -fsSL https://skill.vyibc.com/youtube-wiki.sh) --endpoint={endpoint} --mode=status --repo={repo} --pipeline-id='<pipeline_id>'",
     "list_command": f"bash <(curl -fsSL https://skill.vyibc.com/youtube-wiki.sh) --endpoint={endpoint} --mode=list",
-}, ensure_ascii=False))
+}
+if source_mode:
+    metadata["auto_domain_source"] = {
+        "mode": source_mode,
+        "repo": source_repo,
+        "ref": source_ref,
+        "commit": source_commit,
+    }
+print(json.dumps(metadata, ensure_ascii=False))
 PY
-)"
+}
 
 cleanup_auto_domain() {
   local pattern="$1"
@@ -161,12 +186,23 @@ verify_runtime_channel() {
 
   echo "[setup-service] verifying runtime channel metadata: $NAME"
   for _ in $(seq 1 10); do
-    if "$verifier" \
+    local args=(
       --name="$NAME" \
       --endpoint="$ENDPOINT" \
       --expect-runtime-id="$RUNTIME_ID" \
       --expect-repo="$REPO" \
-      --expect-port="$PORT"; then
+      --expect-port="$PORT"
+    )
+    if [ -n "$AUTO_DOMAIN_SOURCE_MODE" ]; then
+      args+=(--expect-auto-domain-source-mode="$AUTO_DOMAIN_SOURCE_MODE")
+    fi
+    if [ -n "$AUTO_DOMAIN_SOURCE_REPO" ]; then
+      args+=(--expect-auto-domain-source-repo="$AUTO_DOMAIN_SOURCE_REPO")
+    fi
+    if [ -n "$AUTO_DOMAIN_SOURCE_COMMIT" ]; then
+      args+=(--expect-auto-domain-source-commit="$AUTO_DOMAIN_SOURCE_COMMIT")
+    fi
+    if "$verifier" "${args[@]}"; then
       echo "[setup-service] runtime channel metadata verified: $NAME"
       return 0
     fi
@@ -235,6 +271,11 @@ cleanup_auto_domain "--name=$NAME"
 cleanup_auto_domain "agent.js .*--name=$NAME"
 
 if [ "$AUTO_DOMAIN_ALLOW_LOCAL_RUNNER" = "1" ] && [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$AUTO_DOMAIN_SCRIPT"; then
+  AUTO_DOMAIN_SOURCE_MODE="local-runner"
+  AUTO_DOMAIN_SOURCE_REPO="$AUTO_DOMAIN_SCRIPT"
+  AUTO_DOMAIN_SOURCE_REF=""
+  AUTO_DOMAIN_SOURCE_COMMIT="$(git -C "$(dirname "$AUTO_DOMAIN_SCRIPT")" rev-parse --short HEAD 2>/dev/null || true)"
+  METADATA="$(build_metadata)"
   echo "[setup-service] using local auto-domain-cli runner: $AUTO_DOMAIN_SCRIPT"
   bash "$AUTO_DOMAIN_SCRIPT" --stop >/dev/null 2>&1 || true
   bash "$AUTO_DOMAIN_SCRIPT" \
@@ -281,6 +322,11 @@ elif [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
 fi
 
 AUTO_DOMAIN_AGENT_JS="$(prepare_auto_domain_source_agent)"
+AUTO_DOMAIN_SOURCE_MODE="managed"
+AUTO_DOMAIN_SOURCE_REPO="$AUTO_DOMAIN_REPO"
+AUTO_DOMAIN_SOURCE_REF="$AUTO_DOMAIN_REF"
+AUTO_DOMAIN_SOURCE_COMMIT="$(git -C "$AUTO_DOMAIN_SOURCE_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+METADATA="$(build_metadata)"
 
 CHANNEL_DIR="$HOME/.auto-domain-$NAME"
 mkdir -p "$CHANNEL_DIR"

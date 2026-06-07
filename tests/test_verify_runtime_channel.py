@@ -22,6 +22,12 @@ class RuntimeChannelHandler(BaseHTTPRequestHandler):
         "channel_url": None,
         "spi_base_url": None,
         "wiki_repo": "skkeoriw/wiki-test",
+        "auto_domain_source": {
+            "mode": "managed",
+            "repo": "https://github.com/skkeoriw/auto-domain-cli.git",
+            "ref": "main",
+            "commit": "8738556",
+        },
     }
     metadata_override = None
 
@@ -109,6 +115,9 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
                 "--expect-runtime-id=youtube-wiki-test",
                 "--expect-repo=skkeoriw/wiki-test",
                 "--expect-port=18121",
+                "--expect-auto-domain-source-mode=managed",
+                "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
+                "--expect-auto-domain-source-commit=8738556",
             ],
             text=True,
             stdout=subprocess.PIPE,
@@ -118,6 +127,7 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
 
         self.assertIn("[runtime-channel] ok: youtube-wiki-test", result.stdout)
         self.assertIn("repo: skkeoriw/wiki-test", result.stdout)
+        self.assertIn("auto_domain_source: managed https://github.com/skkeoriw/auto-domain-cli.git@8738556", result.stdout)
 
     def test_verify_runtime_channel_rejects_truncated_metadata(self):
         server = self.run_server(metadata_override='{"title":')
@@ -139,6 +149,28 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("metadata is not valid JSON", result.stderr)
+
+    def test_verify_runtime_channel_rejects_auto_domain_source_mismatch(self):
+        server = self.run_server()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+
+        result = subprocess.run(
+            [
+                str(VERIFY_SCRIPT),
+                "--name=youtube-wiki-test",
+                f"--endpoint={endpoint}",
+                f"--tunnel-api={endpoint}",
+                "--expect-runtime-id=youtube-wiki-test",
+                "--expect-repo=skkeoriw/wiki-test",
+                "--expect-auto-domain-source-commit=oldcommit",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("metadata.auto_domain_source.commit", result.stderr)
 
 
 if __name__ == "__main__":

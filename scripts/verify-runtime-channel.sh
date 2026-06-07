@@ -7,6 +7,9 @@ TUNNEL_API="${TUNNEL_API:-https://tunnel-api.chxyka.ccwu.cc}"
 EXPECT_RUNTIME_ID=""
 EXPECT_REPO=""
 EXPECT_PORT=""
+EXPECT_AUTO_DOMAIN_SOURCE_MODE=""
+EXPECT_AUTO_DOMAIN_SOURCE_REPO=""
+EXPECT_AUTO_DOMAIN_SOURCE_COMMIT=""
 CHECK_OPTIONS=1
 
 while [ "$#" -gt 0 ]; do
@@ -17,6 +20,9 @@ while [ "$#" -gt 0 ]; do
     --expect-runtime-id=*) EXPECT_RUNTIME_ID="${1#--expect-runtime-id=}"; shift ;;
     --expect-repo=*) EXPECT_REPO="${1#--expect-repo=}"; shift ;;
     --expect-port=*) EXPECT_PORT="${1#--expect-port=}"; shift ;;
+    --expect-auto-domain-source-mode=*) EXPECT_AUTO_DOMAIN_SOURCE_MODE="${1#--expect-auto-domain-source-mode=}"; shift ;;
+    --expect-auto-domain-source-repo=*) EXPECT_AUTO_DOMAIN_SOURCE_REPO="${1#--expect-auto-domain-source-repo=}"; shift ;;
+    --expect-auto-domain-source-commit=*) EXPECT_AUTO_DOMAIN_SOURCE_COMMIT="${1#--expect-auto-domain-source-commit=}"; shift ;;
     --no-options) CHECK_OPTIONS=0; shift ;;
     -h|--help)
       cat <<'EOF'
@@ -26,7 +32,10 @@ Usage:
     --endpoint=https://youtube-wiki.chxyka.ccwu.cc \
     [--expect-runtime-id=youtube-wiki] \
     [--expect-repo=skkeoriw/wiki-sop-210-registry-smoke] \
-    [--expect-port=18121]
+    [--expect-port=18121] \
+    [--expect-auto-domain-source-mode=managed] \
+    [--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git] \
+    [--expect-auto-domain-source-commit=8738556]
 
 Checks tunnel-admin metadata, public /api/sop, and OPTIONS for a SOP Runtime.
 Does not require jq.
@@ -43,7 +52,9 @@ done
 [ -n "$ENDPOINT" ] || { echo "--endpoint is required" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 
-python3 - "$NAME" "$ENDPOINT" "$TUNNEL_API" "$EXPECT_RUNTIME_ID" "$EXPECT_REPO" "$EXPECT_PORT" "$CHECK_OPTIONS" <<'PY'
+python3 - "$NAME" "$ENDPOINT" "$TUNNEL_API" "$EXPECT_RUNTIME_ID" "$EXPECT_REPO" "$EXPECT_PORT" \
+  "$EXPECT_AUTO_DOMAIN_SOURCE_MODE" "$EXPECT_AUTO_DOMAIN_SOURCE_REPO" "$EXPECT_AUTO_DOMAIN_SOURCE_COMMIT" \
+  "$CHECK_OPTIONS" <<'PY'
 import json
 import sys
 import urllib.error
@@ -51,7 +62,18 @@ import urllib.parse
 import urllib.request
 
 
-name, endpoint, tunnel_api, expect_runtime_id, expect_repo, expect_port, check_options = sys.argv[1:]
+(
+    name,
+    endpoint,
+    tunnel_api,
+    expect_runtime_id,
+    expect_repo,
+    expect_port,
+    expect_source_mode,
+    expect_source_repo,
+    expect_source_commit,
+    check_options,
+) = sys.argv[1:]
 endpoint = endpoint.rstrip("/")
 tunnel_api = tunnel_api.rstrip("/")
 check_options = check_options == "1"
@@ -157,6 +179,17 @@ if str(metadata.get("channel_url") or "").rstrip("/") != endpoint:
 if expect_repo and metadata.get("wiki_repo") != expect_repo:
     fail(f"{name} metadata.wiki_repo={metadata.get('wiki_repo')!r}, expected {expect_repo}")
 
+source = metadata.get("auto_domain_source")
+if any((expect_source_mode, expect_source_repo, expect_source_commit)):
+    if not isinstance(source, dict):
+        fail(f"{name} metadata.auto_domain_source is missing")
+    if expect_source_mode and source.get("mode") != expect_source_mode:
+        fail(f"{name} metadata.auto_domain_source.mode={source.get('mode')!r}, expected {expect_source_mode}")
+    if expect_source_repo and source.get("repo") != expect_source_repo:
+        fail(f"{name} metadata.auto_domain_source.repo={source.get('repo')!r}, expected {expect_source_repo}")
+    if expect_source_commit and source.get("commit") != expect_source_commit:
+        fail(f"{name} metadata.auto_domain_source.commit={source.get('commit')!r}, expected {expect_source_commit}")
+
 sop_url = f"{endpoint}/api/sop"
 _, sop_body = request_json(sop_url)
 runtime_id = sop_body.get("runtime_id") or sop_body.get("runtime")
@@ -176,4 +209,9 @@ print(f"[runtime-channel] runtime_id: {expect_runtime_id}")
 print(f"[runtime-channel] repo: {expect_repo or '(not checked)'}")
 print(f"[runtime-channel] client_ip: {tunnel.get('client_ip')}")
 print(f"[runtime-channel] local_port: {tunnel.get('local_port')}")
+if isinstance(source, dict):
+    print(
+        "[runtime-channel] auto_domain_source: "
+        f"{source.get('mode', '')} {source.get('repo', '')}@{source.get('commit', '')}"
+    )
 PY
