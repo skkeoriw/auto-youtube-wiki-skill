@@ -1023,31 +1023,188 @@ def find_sop(sop_id):
     return None
 
 
+def runtime_info():
+    registry = read_registry()
+    sops = load_sops()
+    runtime_id = registry.get("runtime_id", "youtube-wiki")
+    channel_url = registry.get("channel_url", "")
+    spi_base_url = registry.get("spi_base_url", "")
+    return {
+        "runtime_id": runtime_id,
+        "id": runtime_id,
+        "display_name": registry.get("display_name") or runtime_id,
+        "channel_name": registry.get("channel_name", ""),
+        "channel_url": channel_url,
+        "spi_base_url": spi_base_url,
+        "status": "online",
+        "supported_sop_types": sorted({sop.get("sop_type", "") for sop in sops if sop.get("sop_type")}),
+        "instance_count": len(sops),
+        "registry_path": str(REGISTRY_PATH),
+        "created_at": registry.get("created_at", ""),
+        "updated_at": registry.get("updated_at", ""),
+        "health": {
+            "spi": "ok",
+            "registry": "ok" if REGISTRY_PATH.exists() else "missing",
+            "channel": "ok" if channel_url else "missing",
+            "instances": "ok" if sops else "empty",
+        },
+    }
+
+
+def workflow_binding(sop):
+    sop_id = sop.get("id") or sop.get("instance_id", "")
+    business_nodes = [
+        node_id for node_id, config in (sop.get("nodes") or {}).items()
+        if node_id != "retry" and (config or {}).get("mode") != "manual"
+    ]
+    return {
+        "workflow_id": sop.get("raw_id") or sop.get("sop_type") or sop_id,
+        "workflow_name": sop.get("title") or sop.get("name") or sop_id,
+        "workflow_version": sop.get("version", ""),
+        "definition_source": "sop.yaml",
+        "definition_path": "sop.yaml",
+        "node_count": len(business_nodes),
+        "enabled_node_count": len(business_nodes),
+        "binding_status": "ready" if business_nodes else "invalid",
+    }
+
+
+def instance_status(sop, latest_execution=None):
+    if not sop.get("enabled", True):
+        return "disabled"
+    workspace = Path(sop["wiki_local_path"])
+    if not workspace.exists() or not Path(sop.get("sop_file", "")).exists():
+        return "initializing"
+    if latest_execution and latest_execution.get("status") == "running":
+        return "running"
+    if latest_execution and latest_execution.get("status") == "failed":
+        return "failed"
+    return "ready"
+
+
+def instance_summary(sop, include_latest=True):
+    sop_id = sop.get("id") or sop.get("instance_id", "")
+    instance_id = sop.get("instance_id") or sop_id
+    store = run_index_store(sop)
+    runs = []
+    if include_latest:
+        try:
+            runs = (store.list_runs(limit=1) if store else []) or []
+        except Exception:
+            runs = []
+        if not runs:
+            run_files_found = run_files(sop)
+            if run_files_found:
+                run = read_json(run_files_found[0]) or {}
+                if run and not run.get("pipeline_id"):
+                    run["pipeline_id"] = run_files_found[0].parent.name
+                if run:
+                    runs = [run_summary(sop, run)]
+    latest = execution_summary(sop, runs[0]) if runs else None
+    artifact_count = int((latest or {}).get("artifact_count") or 0)
+    page_count = int((latest or {}).get("page_count") or 0)
+    run_index_path = ""
+    run_index_status = "missing"
+    if store:
+        run_index_path = str(store.db_path)
+        run_index_status = "ready" if store.db_path.exists() else "missing"
+    workspace = Path(sop["wiki_local_path"])
+    return {
+        "id": sop_id,
+        "instance_id": instance_id,
+        "runtime_id": sop.get("runtime_id", ""),
+        "title": sop.get("title") or instance_id,
+        "description": sop.get("description", ""),
+        "sop_type": sop.get("sop_type", ""),
+        "enabled": bool(sop.get("enabled", True)),
+        "repo": sop.get("repo", ""),
+        "repo_branch": sop.get("repo_branch", "main"),
+        "wiki_local_path": sop.get("wiki_local_path", ""),
+        "workspace_status": "ready" if workspace.exists() and Path(sop.get("sop_file", "")).exists() else "missing",
+        "run_index_path": run_index_path,
+        "run_index_status": run_index_status,
+        "workflow_binding": workflow_binding(sop),
+        "capabilities": instance_capabilities(sop),
+        "execution_count": count_executions(sop),
+        "latest_execution": latest,
+        "artifact_count": artifact_count,
+        "page_count": page_count,
+        "status": instance_status(sop, latest),
+        "channel_url": sop.get("channel_url", ""),
+        "spi_base_url": sop.get("spi_base_url", ""),
+        "created_at": sop.get("created_at", ""),
+        "updated_at": sop.get("updated_at", ""),
+        "dag_url": f"/api/sop/{sop_id}/dag",
+        "runs_url": f"/api/sop/{sop_id}/runs",
+        "executions_url": f"/api/sop/instances/{sop_id}/executions",
+    }
+
+
+def count_executions(sop):
+    store = run_index_store(sop)
+    if store:
+        try:
+            return len(store.list_runs(limit=200))
+        except Exception:
+            pass
+    return len(run_files(sop))
+
+
+def instance_capabilities(sop):
+    workspace = Path(sop["wiki_local_path"])
+    store = run_index_store(sop)
+    return {
+        "workspace": "ok" if workspace.exists() else "missing",
+        "sop_yaml": "ok" if Path(sop.get("sop_file", "")).exists() else "missing",
+        "run_index": "ok" if store and store.db_path.exists() else "missing",
+        "git": "configured" if sop.get("repo") else "missing",
+        "telegram": "configured" if os.environ.get("YOUTUBE_WIKI_TG_TOKEN") else "unknown",
+        "notebooklm": "configured" if os.environ.get("NOTEBOOKLM_BRIDGE_URL") else "unknown",
+        "vertex": "configured" if os.environ.get("GOOGLE_PROJECT_ID") or os.environ.get("GEMINI_API_KEY") else "unknown",
+        "tunnel": "ok" if sop.get("channel_url") else "unknown",
+    }
+
+
+def execution_summary(sop, run):
+    data = dict(run or {})
+    pipeline_id = str(data.get("pipeline_id") or data.get("execution_id") or "")
+    workflow = workflow_binding(sop)
+    data.update({
+        "execution_id": pipeline_id,
+        "pipeline_id": pipeline_id,
+        "runtime_id": sop.get("runtime_id", ""),
+        "instance_id": sop.get("instance_id", sop.get("id", "")),
+        "workflow_id": data.get("workflow_id") or workflow["workflow_id"],
+        "workflow_version": data.get("workflow_version") or workflow["workflow_version"],
+        "workflow_snapshot": data.get("workflow_snapshot") or {},
+        "input": data.get("input") if isinstance(data.get("input"), dict) else {
+            "url": data.get("source_url", "")
+        },
+        "failed_node": data.get("failed_node") or next(
+            (node_id for node_id, status in (data.get("nodes") or {}).items() if status == "failed"),
+            "",
+        ),
+        "event_count": data.get("event_count") or (
+            len(read_run_events(run_workspace(sop, pipeline_id) / "events.jsonl")) if pipeline_id else 0
+        ),
+    })
+    return data
+
+
 def sop_manifest():
     registry = read_registry()
+    runtime = runtime_info()
     return {
-        "runtime": registry.get("runtime_id", "youtube-wiki"),
-        "runtime_id": registry.get("runtime_id", "youtube-wiki"),
+        "runtime": runtime["runtime_id"],
+        "runtime_id": runtime["runtime_id"],
+        "runtime_info": runtime,
         "channel": {
             "name": registry.get("channel_name", ""),
             "url": registry.get("channel_url", ""),
             "spi_base_url": registry.get("spi_base_url", ""),
         },
         "registry_path": str(REGISTRY_PATH),
-        "sops": [
-            {
-                "id": sop["id"],
-                "instance_id": sop["instance_id"],
-                "sop_type": sop["sop_type"],
-                "title": sop["title"],
-                "version": sop["version"],
-                "repo": sop["repo"],
-                "wiki_local_path": sop["wiki_local_path"],
-                "dag_url": f"/api/sop/{sop['id']}/dag",
-                "runs_url": f"/api/sop/{sop['id']}/runs",
-            }
-            for sop in load_sops()
-        ],
+        "sops": [instance_summary(sop) for sop in load_sops()],
     }
 
 
@@ -1055,12 +1212,14 @@ def sop_instances():
     manifest = sop_manifest()
     return {
         "runtime_id": manifest["runtime_id"],
+        "runtime": manifest.get("runtime_info", {}),
         "channel": manifest["channel"],
         "instances": manifest["sops"],
     }
 
 
 def sop_dag(sop):
+    sop_id = sop.get("id") or sop.get("instance_id", "")
     nodes = []
     edges = []
     for node_id, node in (sop.get("nodes") or {}).items():
@@ -1091,7 +1250,7 @@ def sop_dag(sop):
         })
         for need in node.get("needs") or []:
             edges.append({"source": need, "target": node_id})
-    return {"sop_id": sop["id"], "nodes": nodes, "edges": edges}
+    return {"sop_id": sop_id, "nodes": nodes, "edges": edges}
 
 
 def run_files(sop):
@@ -1102,6 +1261,8 @@ def run_files(sop):
 
 
 def sop_runs(sop, query=None):
+    sop_id = sop.get("id") or sop.get("instance_id", "")
+    instance_id = sop.get("instance_id") or sop_id
     query = query or {}
     try:
         limit = max(1, min(200, int((query.get("limit") or ["80"])[0])))
@@ -1114,10 +1275,10 @@ def sop_runs(sop, query=None):
     if store:
         try:
             for data in store.list_runs(limit=limit, status=status_filter):
-                runs.append(data)
+                runs.append(execution_summary(sop, data))
                 seen.add(data.get("pipeline_id"))
                 if len(runs) >= limit:
-                    return {"sop_id": sop["id"], "runs": runs}
+                    return {"sop_id": sop_id, "instance_id": instance_id, "executions": runs, "runs": runs}
         except Exception:
             runs = []
             seen = set()
@@ -1131,10 +1292,10 @@ def sop_runs(sop, query=None):
         if data.get("pipeline_id") in seen:
             continue
         if not status_filter or data.get("status") == status_filter:
-            runs.append(run_summary(sop, data))
+            runs.append(execution_summary(sop, run_summary(sop, data)))
         if len(runs) >= limit:
             break
-    return {"sop_id": sop["id"], "runs": runs}
+    return {"sop_id": sop_id, "instance_id": instance_id, "executions": runs, "runs": runs}
 
 
 def _iso_duration_seconds(started_at, finished_at):
@@ -1501,8 +1662,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path == ["api", "sop"]:
                 return json_response(self, 200, sop_manifest())
+            if path == ["api", "sop", "runtime"]:
+                return json_response(self, 200, runtime_info())
             if path == ["api", "sop", "instances"]:
                 return json_response(self, 200, sop_instances())
+            if len(path) >= 4 and path[0] == "api" and path[1] == "sop" and path[2] == "instances":
+                sop = find_sop(path[3])
+                if not sop:
+                    return json_response(self, 404, {"detail": "Instance not found"})
+                if len(path) == 4:
+                    return json_response(self, 200, instance_summary(sop))
+                if len(path) == 5 and path[4] == "workflow":
+                    dag = sop_dag(sop)
+                    return json_response(self, 200, {
+                        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+                        "workflow_binding": workflow_binding(sop),
+                        "dag": dag,
+                    })
+                if len(path) == 5 and path[4] == "executions":
+                    return json_response(self, 200, sop_runs(sop, query))
+                if len(path) == 6 and path[4] == "executions":
+                    run_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[5] / "run.json"
+                    data = read_json(run_file)
+                    if data and not data.get("pipeline_id"):
+                        data["pipeline_id"] = path[5]
+                    indexed = indexed_run(sop, path[5], rebuild=bool(data))
+                    payload = indexed or (run_summary(sop, data) if data else None)
+                    return json_response(
+                        self,
+                        200 if payload else 404,
+                        execution_summary(sop, payload) if payload else {"detail": "Execution not found"},
+                    )
+                if len(path) == 8 and path[4] == "executions" and path[6] == "nodes":
+                    data = node_runtime_detail(sop, path[5], path[7])
+                    data["execution_id"] = data.get("pipeline_id", path[5])
+                    data["instance_id"] = sop.get("instance_id") or sop.get("id", "")
+                    return json_response(self, 200, data)
             if path == ["api", "sop", "debug", "scanned"]:
                 return json_response(self, 200, {"sops": scanned_sops()})
             if len(path) >= 3 and path[0] == "api" and path[1] == "sop":
@@ -1521,10 +1716,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if data and not data.get("pipeline_id"):
                         data["pipeline_id"] = path[4]
                     indexed = indexed_run(sop, path[4], rebuild=bool(data))
+                    payload = indexed or (run_summary(sop, data) if data else None)
                     return json_response(
                         self,
-                        200 if indexed or data else 404,
-                        indexed or (run_summary(sop, data) if data else {"detail": "Run not found"}),
+                        200 if payload else 404,
+                        execution_summary(sop, payload) if payload else {"detail": "Run not found"},
                     )
                 if len(path) == 6 and path[3] == "runs":
                     run_dir = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4]

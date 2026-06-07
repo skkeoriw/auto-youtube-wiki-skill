@@ -317,6 +317,30 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
+    def test_instance_execution_semantic_routes(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}/api/sop/instances/test"
+            with urllib.request.urlopen(base, timeout=3) as response:
+                instance = json.loads(response.read())
+            self.assertEqual(instance["instance_id"], "test")
+            self.assertIn("workflow_binding", instance)
+            with urllib.request.urlopen(f"{base}/workflow", timeout=3) as response:
+                workflow = json.loads(response.read())
+            self.assertEqual(workflow["workflow_binding"]["workflow_id"], "test")
+            self.assertIn("dag", workflow)
+            with urllib.request.urlopen(f"{base}/executions", timeout=3) as response:
+                executions = json.loads(response.read())
+            self.assertEqual(executions["executions"][0]["execution_id"], "pipe-1")
+            self.assertEqual(executions["executions"][0]["instance_id"], "test")
+            with urllib.request.urlopen(f"{base}/executions/pipe-1", timeout=3) as response:
+                execution = json.loads(response.read())
+            self.assertEqual(execution["execution_id"], "pipe-1")
+        server.shutdown()
+        server.server_close()
+
     def test_run_routes_prefer_runtime_index(self):
         cls = bridge.run_index_class()
         self.assertIsNotNone(cls)
