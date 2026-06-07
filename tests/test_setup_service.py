@@ -104,9 +104,11 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
 
         self.assertIn("AUTO_DOMAIN_REPO=", text)
         self.assertIn("AUTO_DOMAIN_SOURCE_DIR=", text)
+        self.assertIn("AUTO_DOMAIN_ALLOW_LOCAL_RUNNER=", text)
         self.assertIn("prepare_auto_domain_source_agent", text)
         self.assertIn("verify_runtime_channel", text)
         self.assertIn('setsid node "$AUTO_DOMAIN_AGENT_JS"', text)
+        self.assertIn("local auto-domain-cli runner ignored", text)
         self.assertIn("using managed latest source instead", text)
         self.assertNotIn("AGENT_URL=", text)
 

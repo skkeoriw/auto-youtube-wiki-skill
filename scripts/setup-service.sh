@@ -17,6 +17,7 @@ AUTO_DOMAIN_REPO="${AUTO_DOMAIN_REPO:-https://github.com/skkeoriw/auto-domain-cl
 AUTO_DOMAIN_REF="${AUTO_DOMAIN_REF:-main}"
 AUTO_DOMAIN_SOURCE_DIR="${AUTO_DOMAIN_SOURCE_DIR:-$HOME/.cache/youtube-wiki/auto-domain-cli}"
 AUTO_DOMAIN_SCRIPT="${AUTO_DOMAIN_SCRIPT:-}"
+AUTO_DOMAIN_ALLOW_LOCAL_RUNNER="${AUTO_DOMAIN_ALLOW_LOCAL_RUNNER:-0}"
 PUBLIC_VERIFY_PATH="${PUBLIC_VERIFY_PATH:-/api/sop}"
 
 while [ "$#" -gt 0 ]; do
@@ -233,7 +234,7 @@ PY
 cleanup_auto_domain "--name=$NAME"
 cleanup_auto_domain "agent.js .*--name=$NAME"
 
-if [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$AUTO_DOMAIN_SCRIPT"; then
+if [ "$AUTO_DOMAIN_ALLOW_LOCAL_RUNNER" = "1" ] && [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$AUTO_DOMAIN_SCRIPT"; then
   echo "[setup-service] using local auto-domain-cli runner: $AUTO_DOMAIN_SCRIPT"
   bash "$AUTO_DOMAIN_SCRIPT" --stop >/dev/null 2>&1 || true
   bash "$AUTO_DOMAIN_SCRIPT" \
@@ -272,7 +273,11 @@ if [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$A
   tail -n 120 "$HOME/.auto-domain/agent.log" >&2 || true
   exit 1
 elif [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
-  echo "[setup-service] local auto-domain-cli runner is too old for JSON metadata; using managed latest source instead: $AUTO_DOMAIN_SCRIPT"
+  if [ "$AUTO_DOMAIN_ALLOW_LOCAL_RUNNER" = "1" ]; then
+    echo "[setup-service] local auto-domain-cli runner is too old for JSON metadata; using managed latest source instead: $AUTO_DOMAIN_SCRIPT"
+  else
+    echo "[setup-service] local auto-domain-cli runner ignored; using managed latest source: $AUTO_DOMAIN_SCRIPT"
+  fi
 fi
 
 AUTO_DOMAIN_AGENT_JS="$(prepare_auto_domain_source_agent)"

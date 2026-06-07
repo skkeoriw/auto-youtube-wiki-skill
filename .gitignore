@@ -3,5 +3,7 @@ node_modules/
 worker/node_modules/
 .wrangler/
 .auto-domain/
+__pycache__/
+*.pyc
 *.log
 *.pid
