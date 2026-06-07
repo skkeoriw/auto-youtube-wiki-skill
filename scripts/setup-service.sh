@@ -87,6 +87,46 @@ cleanup_auto_domain() {
   fi
 }
 
+fix_agent_ws_host() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  python3 - "$file" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding='utf-8', errors='ignore')
+
+old = re.search(r"async function buildWsUrl\(\) \{.*?\n\}\n\n// ── Connect", text, flags=re.S)
+if not old:
+  print(f"[setup-service] WARN: buildWsUrl not found in {path}")
+  raise SystemExit(0)
+
+replacement = '''async function buildWsUrl() {
+  const base = SERVER.replace(/^wss?:\\/\\//, 'ws').replace(/\\/$/, '') + '/websocket';
+  const u = new URL(base);
+  if (TOKEN) u.searchParams.set('token', TOKEN);
+  u.searchParams.set('port', String(PORT));
+  if (NAME) u.searchParams.set('name', NAME);
+  if (AUTO_NAME) u.searchParams.set('auto', '1');
+  if (METADATA) u.searchParams.set('metadata', METADATA);
+  if (REPLACE) u.searchParams.set('replace', '1');
+
+  const ip = await getPublicIPv4();
+  if (ip) u.searchParams.set('client_ip', ip);
+
+  return u.toString();
+}
+
+// ── Connect'''
+
+text = re.sub(r"async function buildWsUrl\(\) \{.*?\n\}\n\n// ── Connect", replacement, text, flags=re.S)
+path.write_text(text, encoding='utf-8')
+print(f"[setup-service] fixed buildWsUrl host logic in {path}")
+PY
+}
+
 cleanup_auto_domain "--name=$NAME"
 cleanup_auto_domain "agent.js .*--name=$NAME"
 
@@ -101,6 +141,11 @@ if [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
     --metadata="$METADATA" \
     --server="$AUTO_DOMAIN_SERVER"
   for _ in $(seq 1 40); do
+    if [ -f "$HOME/.auto-domain/agent.js" ]; then
+      # 防御式修复：旧版本自动修正会把 websocket URL 指向子域名，导致 522
+      # 统一改回直连 tunnel-api 的逻辑，避免端到端注册链路失败。
+      fix_agent_ws_host "$HOME/.auto-domain/agent.js"
+    fi
     if [ -f "$HOME/.auto-domain/agent.log" ] && grep -q "Public URL" "$HOME/.auto-domain/agent.log" 2>/dev/null; then
       echo "Public URL : https://$NAME.chxyka.ccwu.cc"
       echo "Logs: $HOME/.auto-domain/agent.log"
@@ -144,6 +189,8 @@ if [ -f "$CHANNEL_DIR/agent.pid" ] && kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 
   kill "$(cat "$CHANNEL_DIR/agent.pid")" || true
   sleep 1
 fi
+
+fix_agent_ws_host "$CHANNEL_DIR/agent.js"
 
 (
   cd "$CHANNEL_DIR"
