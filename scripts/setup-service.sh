@@ -13,8 +13,10 @@ UI_URL="${SOP_UI_URL:-https://sop-ui.chxyka.ccwu.cc}"
 AUTO_DOMAIN_SERVER="${AUTO_DOMAIN_SERVER:-wss://tunnel-api.chxyka.ccwu.cc}"
 AUTO_DOMAIN_ZONE_NAME="${AUTO_DOMAIN_ZONE_NAME:-chxyka.ccwu.cc}"
 AUTO_DOMAIN_WORKER_SCRIPT="${AUTO_DOMAIN_WORKER_SCRIPT:-auto-domain-tunnel}"
-AGENT_URL="${AGENT_URL:-https://skill.vyibc.com/agent.js}"
-AUTO_DOMAIN_SCRIPT="${AUTO_DOMAIN_SCRIPT:-$HOME/auto-domain-cli/skills/auto-domain/scripts/run.sh}"
+AUTO_DOMAIN_REPO="${AUTO_DOMAIN_REPO:-https://github.com/skkeoriw/auto-domain-cli.git}"
+AUTO_DOMAIN_REF="${AUTO_DOMAIN_REF:-main}"
+AUTO_DOMAIN_SOURCE_DIR="${AUTO_DOMAIN_SOURCE_DIR:-$HOME/.cache/youtube-wiki/auto-domain-cli}"
+AUTO_DOMAIN_SCRIPT="${AUTO_DOMAIN_SCRIPT:-}"
 PUBLIC_VERIFY_PATH="${PUBLIC_VERIFY_PATH:-/api/sop}"
 
 while [ "$#" -gt 0 ]; do
@@ -48,6 +50,7 @@ if [ -z "$ENDPOINT" ]; then
 fi
 
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "node is required" >&2; exit 1; }
 command -v npm >/dev/null 2>&1 || { echo "npm is required" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
@@ -102,6 +105,34 @@ auto_domain_script_supports_safe_metadata() {
   local file="$1"
   [ -f "$file" ] || return 1
   grep -q 'ARGS=(' "$file" && grep -q '"${ARGS\[@\]}"' "$file"
+}
+
+prepare_auto_domain_source_agent() {
+  local source_dir="$AUTO_DOMAIN_SOURCE_DIR"
+  local tmp_dir="${source_dir}.tmp"
+  local agent_js="$source_dir/skills/auto-domain/agent/agent.js"
+
+  mkdir -p "$(dirname "$source_dir")"
+
+  if [ -d "$source_dir/.git" ]; then
+    git -C "$source_dir" fetch --quiet --depth 1 origin "$AUTO_DOMAIN_REF"
+    git -C "$source_dir" checkout --quiet -B "$AUTO_DOMAIN_REF" FETCH_HEAD
+  else
+    rm -rf "$tmp_dir"
+    git clone --quiet --depth 1 --branch "$AUTO_DOMAIN_REF" "$AUTO_DOMAIN_REPO" "$tmp_dir"
+    rm -rf "$source_dir"
+    mv "$tmp_dir" "$source_dir"
+  fi
+
+  [ -f "$agent_js" ] || {
+    echo "[setup-service] auto-domain agent source not found: $agent_js" >&2
+    return 1
+  }
+
+  local commit
+  commit="$(git -C "$source_dir" rev-parse --short HEAD 2>/dev/null || true)"
+  echo "[setup-service] using latest auto-domain source: $AUTO_DOMAIN_REPO@$commit" >&2
+  printf '%s\n' "$agent_js"
 }
 
 verify_public_channel() {
@@ -215,23 +246,13 @@ if [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$A
   tail -n 120 "$HOME/.auto-domain/agent.log" >&2 || true
   exit 1
 elif [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
-  echo "[setup-service] local auto-domain-cli runner is too old for JSON metadata; using fallback agent: $AUTO_DOMAIN_SCRIPT"
+  echo "[setup-service] local auto-domain-cli runner is too old for JSON metadata; using managed latest source instead: $AUTO_DOMAIN_SCRIPT"
 fi
+
+AUTO_DOMAIN_AGENT_JS="$(prepare_auto_domain_source_agent)"
 
 CHANNEL_DIR="$HOME/.auto-domain-$NAME"
 mkdir -p "$CHANNEL_DIR"
-curl -fsSL "$AGENT_URL" -o "$CHANNEL_DIR/agent.js"
-python3 - "$CHANNEL_DIR/agent.js" <<'PY'
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-old = "body: (method !== 'GET' && method !== 'HEAD') ? Buffer.from(body, 'base64') : undefined,"
-new = "body: (method !== 'GET' && method !== 'HEAD' && body) ? Buffer.from(body, 'base64') : undefined,"
-if old in text:
-    path.write_text(text.replace(old, new), encoding="utf-8")
-PY
 printf '%s\n' '{"name":"auto-domain-youtube-wiki","private":true,"dependencies":{"ws":"^8.18.0"}}' > "$CHANNEL_DIR/package.json"
 (cd "$CHANNEL_DIR" && npm install --silent --prefer-offline)
 
@@ -240,11 +261,9 @@ if [ -f "$CHANNEL_DIR/agent.pid" ] && kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 
   sleep 1
 fi
 
-fix_agent_ws_host "$CHANNEL_DIR/agent.js"
-
 (
   cd "$CHANNEL_DIR"
-  setsid node agent.js \
+  NODE_PATH="$CHANNEL_DIR/node_modules${NODE_PATH:+:$NODE_PATH}" setsid node "$AUTO_DOMAIN_AGENT_JS" \
     --port="$PORT" \
     --name="$NAME" \
     --replace \
