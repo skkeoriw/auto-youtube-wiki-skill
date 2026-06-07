@@ -431,6 +431,17 @@ class ArtifactResolutionTest(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         with patch.object(bridge, "find_sop", return_value=self.sop):
             thread.start()
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts/schema",
+                timeout=3,
+            ) as response:
+                schema_response = json.loads(response.read())
+            schema = schema_response["schema"]
+            fields = {field["name"]: field for field in schema["fields"]}
+            self.assertEqual(schema["schema_id"], "node-draft-schema/v1")
+            self.assertTrue(fields["skill_install_command"]["required"])
+            self.assertEqual(fields["output_path"]["type"], "path_pattern")
+            self.assertFalse(schema["safety"]["production_dag_changed"])
             request = urllib.request.Request(
                 f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
                 method="POST",

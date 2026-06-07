@@ -663,6 +663,7 @@ def node_registry_item(sop, node_id, endpoint=""):
 
 
 NODE_MODULE_CONTRACT_VERSION = "node-module-contract/v1"
+NODE_DRAFT_SCHEMA_VERSION = "node-draft-schema/v1"
 
 NODE_MODULE_DEFINITIONS = [
     {
@@ -1020,6 +1021,58 @@ def draft_from_skill(spec):
             "sse": {"enabled": True, "required": True},
         },
         "ui": {"category": spec.get("category") or "custom"},
+    }
+
+
+def node_draft_schema():
+    return {
+        "schema_id": NODE_DRAFT_SCHEMA_VERSION,
+        "title": "Node Draft from Skill",
+        "description": "把一个 Skill 安装命令转换成可验证的 SOP 节点草稿；不会修改生产 DAG。",
+        "fields": [
+            {
+                "name": "skill_install_command",
+                "label": "Skill install command",
+                "type": "string",
+                "required": True,
+                "placeholder": "bash <(curl -fsSL https://skill.vyibc.com/install-demo.sh)",
+                "maps_to": "skill.install_command",
+            },
+            {"name": "skill_id", "label": "Skill ID", "type": "slug", "required": True, "maps_to": "skill.id"},
+            {"name": "node_id", "label": "Node ID", "type": "slug", "required": True, "maps_to": "id"},
+            {"name": "title", "label": "Title", "type": "string", "required": True, "maps_to": "title"},
+            {"name": "description", "label": "Description", "type": "text", "required": False, "maps_to": "description"},
+            {"name": "upstream", "label": "Upstream node", "type": "node_id", "required": False, "maps_to": "needs[0]"},
+            {"name": "upstream_output", "label": "Upstream output", "type": "string", "required": False, "default": "output", "maps_to": "inputs.*.from"},
+            {"name": "input_name", "label": "Input name", "type": "slug", "required": False, "default": "input", "maps_to": "inputs"},
+            {"name": "output_name", "label": "Output name", "type": "slug", "required": False, "default": "artifact", "maps_to": "outputs"},
+            {
+                "name": "output_path",
+                "label": "Output path",
+                "type": "path_pattern",
+                "required": False,
+                "default": "raw/{node_id}/{pipeline_id}/{output_name}",
+                "maps_to": "outputs.*.path",
+            },
+        ],
+        "defaults": {
+            "executor_type": "agent-skill",
+            "agent": "hermes",
+            "mode": "blocking",
+            "input_type": "auto",
+            "output_type": "file",
+            "category": "custom",
+            "capabilities": {
+                "git": {"enabled": True, "required": False},
+                "telegram": {"enabled": True, "required": False},
+                "sse": {"enabled": True, "required": True},
+            },
+        },
+        "safety": {
+            "production_dag_changed": False,
+            "writes": ["raw/node-drafts/{draft_id}/node.yaml", "raw/node-drafts/{draft_id}/validation.json"],
+            "publish_enabled": False,
+        },
     }
 
 
@@ -2009,6 +2062,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(path) == 4 and path[3] == "nodes":
                     endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
                     return json_response(self, 200, node_registry(sop, endpoint))
+                # GET /api/sop/{instance}/node-drafts/schema — draft input schema
+                if len(path) == 5 and path[3] == "node-drafts" and path[4] == "schema":
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "schema": node_draft_schema(),
+                    })
                 # GET /api/sop/{instance}/node-drafts — list drafts
                 if len(path) == 4 and path[3] == "node-drafts":
                     drafts_dir = Path(sop["wiki_local_path"]) / "raw" / "node-drafts"
