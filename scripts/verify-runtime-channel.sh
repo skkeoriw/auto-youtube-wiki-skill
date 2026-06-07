@@ -7,6 +7,7 @@ TUNNEL_API="${TUNNEL_API:-https://tunnel-api.chxyka.ccwu.cc}"
 EXPECT_RUNTIME_ID=""
 EXPECT_REPO=""
 EXPECT_PORT=""
+EXPECT_UI_URL=""
 EXPECT_AUTO_DOMAIN_SOURCE_MODE=""
 EXPECT_AUTO_DOMAIN_SOURCE_REPO=""
 EXPECT_AUTO_DOMAIN_SOURCE_COMMIT=""
@@ -21,6 +22,7 @@ while [ "$#" -gt 0 ]; do
     --expect-runtime-id=*) EXPECT_RUNTIME_ID="${1#--expect-runtime-id=}"; shift ;;
     --expect-repo=*) EXPECT_REPO="${1#--expect-repo=}"; shift ;;
     --expect-port=*) EXPECT_PORT="${1#--expect-port=}"; shift ;;
+    --expect-ui-url=*) EXPECT_UI_URL="${1#--expect-ui-url=}"; shift ;;
     --expect-auto-domain-source-mode=*) EXPECT_AUTO_DOMAIN_SOURCE_MODE="${1#--expect-auto-domain-source-mode=}"; shift ;;
     --expect-auto-domain-source-repo=*) EXPECT_AUTO_DOMAIN_SOURCE_REPO="${1#--expect-auto-domain-source-repo=}"; shift ;;
     --expect-auto-domain-source-commit=*) EXPECT_AUTO_DOMAIN_SOURCE_COMMIT="${1#--expect-auto-domain-source-commit=}"; shift ;;
@@ -35,6 +37,7 @@ Usage:
     [--expect-runtime-id=youtube-wiki] \
     [--expect-repo=skkeoriw/wiki-sop-210-registry-smoke] \
     [--expect-port=18121] \
+    [--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc] \
     [--expect-auto-domain-source-mode=managed] \
     [--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git] \
     [--expect-auto-domain-source-commit=8738556] \
@@ -58,7 +61,7 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; 
 
 EXPECT_SOP_TYPES_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EXPECT_SOP_TYPES[@]}")"
 
-python3 - "$NAME" "$ENDPOINT" "$TUNNEL_API" "$EXPECT_RUNTIME_ID" "$EXPECT_REPO" "$EXPECT_PORT" \
+python3 - "$NAME" "$ENDPOINT" "$TUNNEL_API" "$EXPECT_RUNTIME_ID" "$EXPECT_REPO" "$EXPECT_PORT" "$EXPECT_UI_URL" \
   "$EXPECT_AUTO_DOMAIN_SOURCE_MODE" "$EXPECT_AUTO_DOMAIN_SOURCE_REPO" "$EXPECT_AUTO_DOMAIN_SOURCE_COMMIT" \
   "$CHECK_OPTIONS" "$EXPECT_SOP_TYPES_JSON" <<'PY'
 import json
@@ -75,6 +78,7 @@ import urllib.request
     expect_runtime_id,
     expect_repo,
     expect_port,
+    expect_ui_url,
     expect_source_mode,
     expect_source_repo,
     expect_source_commit,
@@ -189,6 +193,8 @@ if str(metadata.get("channel_url") or "").rstrip("/") != endpoint:
     fail(f"{name} metadata.channel_url={metadata.get('channel_url')!r}, expected {endpoint}")
 if expect_repo and metadata.get("wiki_repo") != expect_repo:
     fail(f"{name} metadata.wiki_repo={metadata.get('wiki_repo')!r}, expected {expect_repo}")
+if expect_ui_url and str(metadata.get("ui_url") or "").rstrip("/") != expect_ui_url.rstrip("/"):
+    fail(f"{name} metadata.ui_url={metadata.get('ui_url')!r}, expected {expect_ui_url.rstrip('/')}")
 
 if expect_sop_types:
     supported_sop_types = metadata.get("supported_sop_types")
@@ -229,6 +235,8 @@ print(f"[runtime-channel] runtime_id: {expect_runtime_id}")
 print(f"[runtime-channel] repo: {expect_repo or '(not checked)'}")
 print(f"[runtime-channel] client_ip: {tunnel.get('client_ip')}")
 print(f"[runtime-channel] local_port: {tunnel.get('local_port')}")
+if metadata.get("ui_url"):
+    print(f"[runtime-channel] ui_url: {metadata.get('ui_url')}")
 if isinstance(source, dict):
     print(
         "[runtime-channel] auto_domain_source: "

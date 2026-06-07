@@ -108,6 +108,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertIn("--expect-runtime=youtube-wiki-222|youtube-wiki-222|https://youtube-wiki-222.chxyka.ccwu.cc\n", text)
             self.assertIn("--expect-auto-domain-source-mode=managed\n", text)
             self.assertIn("--expect-auto-domain-source-commit=testcommit\n", text)
+            self.assertEqual(text.count("--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc\n"), 3)
             self.assertIn("--expect-sop-type=runtime-provisioning\n", text)
             self.assertIn("--expect-sop-type=youtube-research-wiki\n", text)
             self.assertIn("--no-options\n", text)

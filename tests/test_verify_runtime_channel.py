@@ -21,6 +21,7 @@ class RuntimeChannelHandler(BaseHTTPRequestHandler):
         "channel_name": "youtube-wiki-test",
         "channel_url": None,
         "spi_base_url": None,
+        "ui_url": "https://sop-ui-prototype.chxyka.ccwu.cc",
         "wiki_repo": "skkeoriw/wiki-test",
         "supported_sop_types": ["runtime-provisioning", "youtube-research-wiki"],
         "auto_domain_source": {
@@ -126,6 +127,7 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
                 "--expect-runtime-id=youtube-wiki-test",
                 "--expect-repo=skkeoriw/wiki-test",
                 "--expect-port=18121",
+                "--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc",
                 "--expect-auto-domain-source-mode=managed",
                 "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
                 "--expect-auto-domain-source-commit=8738556",
@@ -140,6 +142,7 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
 
         self.assertIn("[runtime-channel] ok: youtube-wiki-test", result.stdout)
         self.assertIn("repo: skkeoriw/wiki-test", result.stdout)
+        self.assertIn("ui_url: https://sop-ui-prototype.chxyka.ccwu.cc", result.stdout)
         self.assertIn("auto_domain_source: managed https://github.com/skkeoriw/auto-domain-cli.git@8738556", result.stdout)
         self.assertIn("supported_sop_types: runtime-provisioning, youtube-research-wiki", result.stdout)
 
@@ -185,6 +188,28 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("metadata.auto_domain_source.commit", result.stderr)
+
+    def test_verify_runtime_channel_rejects_ui_url_mismatch(self):
+        server = self.run_server()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+
+        result = subprocess.run(
+            [
+                str(VERIFY_SCRIPT),
+                "--name=youtube-wiki-test",
+                f"--endpoint={endpoint}",
+                f"--tunnel-api={endpoint}",
+                "--expect-runtime-id=youtube-wiki-test",
+                "--expect-repo=skkeoriw/wiki-test",
+                "--expect-ui-url=https://sop-ui.chxyka.ccwu.cc",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("metadata.ui_url", result.stderr)
 
     def test_verify_runtime_channel_rejects_missing_sop_type(self):
         metadata = dict(RuntimeChannelHandler.tunnel_metadata)

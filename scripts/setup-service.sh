@@ -9,7 +9,7 @@ NAME="${YOUTUBE_WIKI_PUBLIC_NAME:-youtube-wiki}"
 ENDPOINT=""
 REPO="${WIKI_GITHUB_REPO:-}"
 RUNTIME_ID="${YOUTUBE_WIKI_RUNTIME_ID:-youtube-wiki}"
-UI_URL="${SOP_UI_URL:-https://sop-ui.chxyka.ccwu.cc}"
+UI_URL="${SOP_UI_URL:-https://sop-ui-prototype.chxyka.ccwu.cc}"
 AUTO_DOMAIN_SERVER="${AUTO_DOMAIN_SERVER:-wss://tunnel-api.chxyka.ccwu.cc}"
 AUTO_DOMAIN_ZONE_NAME="${AUTO_DOMAIN_ZONE_NAME:-chxyka.ccwu.cc}"
 AUTO_DOMAIN_WORKER_SCRIPT="${AUTO_DOMAIN_WORKER_SCRIPT:-auto-domain-tunnel}"
@@ -223,6 +223,7 @@ verify_runtime_channel() {
       --endpoint="$ENDPOINT" \
       --expect-runtime-id="$RUNTIME_ID" \
       --expect-repo="$REPO" \
+      --expect-ui-url="$UI_URL" \
       --expect-port="$PORT"
     )
     if [ -n "$AUTO_DOMAIN_SOURCE_MODE" ]; then

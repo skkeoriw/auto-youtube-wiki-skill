@@ -163,6 +163,7 @@ while IFS='|' read -r name endpoint runtime_id repo port; do
     --expect-runtime-id="$runtime_id"
     --expect-repo="$repo"
     --expect-port="$port"
+    --expect-ui-url="$SOP_UI_URL"
   )
   if [ "$CHECK_OPTIONS" = "0" ]; then
     args+=(--no-options)

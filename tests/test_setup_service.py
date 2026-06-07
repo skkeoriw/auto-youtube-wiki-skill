@@ -155,6 +155,7 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
     def test_setup_service_prefers_managed_source_over_legacy_runner_default(self):
         text = SETUP_SERVICE.read_text(encoding="utf-8")
 
+        self.assertIn("UI_URL=\"${SOP_UI_URL:-https://sop-ui-prototype.chxyka.ccwu.cc}\"", text)
         self.assertIn("AUTO_DOMAIN_REPO=", text)
         self.assertIn("AUTO_DOMAIN_SOURCE_DIR=", text)
         self.assertIn("AUTO_DOMAIN_ALLOW_LOCAL_RUNNER=", text)
@@ -186,6 +187,7 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
 
         self.assertEqual(metadata["type"], "sop-runtime")
         self.assertEqual(metadata["runtime_id"], "youtube-wiki-test")
+        self.assertEqual(metadata["ui_url"], "https://sop-ui-prototype.example.com")
         self.assertEqual(metadata["supported_sop_types"], ["runtime-provisioning", "youtube-research-wiki"])
         self.assertEqual(metadata["auto_domain_source"], {
             "mode": "managed",
@@ -219,6 +221,7 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
                 "RUNTIME_ID=youtube-wiki-test",
                 "REPO=skkeoriw/wiki-test",
                 "PORT=18121",
+                "UI_URL=https://sop-ui-prototype.example.com",
                 "AUTO_DOMAIN_SOURCE_MODE=managed",
                 "AUTO_DOMAIN_SOURCE_REPO=https://github.com/skkeoriw/auto-domain-cli.git",
                 "AUTO_DOMAIN_SOURCE_COMMIT=8738556",
@@ -234,6 +237,7 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
                 "--endpoint=https://youtube-wiki-test.example.com",
                 "--expect-runtime-id=youtube-wiki-test",
                 "--expect-repo=skkeoriw/wiki-test",
+                "--expect-ui-url=https://sop-ui-prototype.example.com",
                 "--expect-port=18121",
                 "--expect-auto-domain-source-mode=managed",
                 "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
