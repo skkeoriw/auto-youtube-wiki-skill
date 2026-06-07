@@ -104,8 +104,18 @@ if not old:
   raise SystemExit(0)
 
 replacement = '''async function buildWsUrl() {
-  const base = SERVER.replace(/^wss?:\/\//, 'ws://').replace(/\/$/, '') + '/websocket';
-  const u = new URL(base);
+  let tunnelUrl;
+  try {
+    const parsed = new URL(SERVER.includes('://') ? SERVER : `https://${SERVER}`);
+    parsed.protocol = 'wss:';
+    parsed.pathname = '/websocket';
+    parsed.search = '';
+    tunnelUrl = parsed.toString();
+  } catch {
+    tunnelUrl = 'wss://tunnel-api.chxyka.ccwu.cc/websocket';
+  }
+
+  const u = new URL(tunnelUrl);
   if (TOKEN) u.searchParams.set('token', TOKEN);
   u.searchParams.set('port', String(PORT));
   if (NAME) u.searchParams.set('name', NAME);
