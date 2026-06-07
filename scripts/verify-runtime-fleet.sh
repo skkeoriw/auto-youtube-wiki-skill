@@ -7,6 +7,7 @@ TUNNEL_API="${TUNNEL_API:-https://tunnel-api.chxyka.ccwu.cc}"
 VERIFY_RUNTIME_CHANNEL_SCRIPT="${VERIFY_RUNTIME_CHANNEL_SCRIPT:-$SCRIPT_DIR/verify-runtime-channel.sh}"
 VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT="${VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT:-$SCRIPT_DIR/verify-tunnel-control-plane.sh}"
 VERIFY_SOP_UI_DISCOVERY_SCRIPT="${VERIFY_SOP_UI_DISCOVERY_SCRIPT:-$SCRIPT_DIR/verify-sop-ui-runtime-discovery.sh}"
+VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT="${VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT:-$SCRIPT_DIR/verify-runtime-repo-versions.sh}"
 SOP_UI_URL="${SOP_UI_URL:-https://sop-ui-prototype.chxyka.ccwu.cc}"
 EXPECT_SOURCE_MODE="${EXPECT_AUTO_DOMAIN_SOURCE_MODE:-managed}"
 EXPECT_SOURCE_REPO="${EXPECT_AUTO_DOMAIN_SOURCE_REPO:-https://github.com/skkeoriw/auto-domain-cli.git}"
@@ -15,8 +16,10 @@ EXPECT_SOP_TYPES="${EXPECT_SOP_TYPES:-runtime-provisioning,youtube-research-wiki
 CHECK_OPTIONS=1
 CHECK_CONTROL_PLANE=1
 CHECK_SOP_UI=1
+CHECK_REPO_VERSIONS=0
 REPAIR_CONTROL_PLANE=0
 ONLY_NAMES=""
+REPO_TARGETS=()
 
 DEFAULT_FLEET=(
   "youtube-wiki|https://youtube-wiki.chxyka.ccwu.cc|youtube-wiki|skkeoriw/wiki-sop-210-registry-smoke|18121"
@@ -37,6 +40,8 @@ Options:
   --only=name[,name]                  verify only matching runtime names
   --tunnel-api=https://...            tunnel-admin API base
   --sop-ui-url=https://...            SOP UI URL
+  --repo-version-check                check remote Runtime repo versions through SSH
+  --repo-target=name|user|host|key    runtime repo SSH target; can be repeated
   --repair-control-plane              call /admin/health?repair=1 before runtime checks
   --no-control-plane                  skip tunnel-admin/Cloudflare health check
   --no-sop-ui                         skip sop-ui-prototype Runtime discovery check
@@ -60,6 +65,8 @@ while [ "$#" -gt 0 ]; do
     --only=*) ONLY_NAMES="${1#--only=}"; shift ;;
     --tunnel-api=*) TUNNEL_API="${1#--tunnel-api=}"; shift ;;
     --sop-ui-url=*) SOP_UI_URL="${1#--sop-ui-url=}"; shift ;;
+    --repo-version-check) CHECK_REPO_VERSIONS=1; shift ;;
+    --repo-target=*) REPO_TARGETS+=("${1#--repo-target=}"); shift ;;
     --repair-control-plane) REPAIR_CONTROL_PLANE=1; shift ;;
     --no-control-plane) CHECK_CONTROL_PLANE=0; shift ;;
     --no-sop-ui) CHECK_SOP_UI=0; shift ;;
@@ -94,6 +101,17 @@ fi
 if [ "$CHECK_SOP_UI" = "1" ]; then
   [ -x "$VERIFY_SOP_UI_DISCOVERY_SCRIPT" ] || {
     echo "[runtime-fleet] sop-ui discovery verifier not found or not executable: $VERIFY_SOP_UI_DISCOVERY_SCRIPT" >&2
+    exit 1
+  }
+fi
+
+if [ "$CHECK_REPO_VERSIONS" = "1" ]; then
+  [ -x "$VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT" ] || {
+    echo "[runtime-fleet] runtime repo verifier not found or not executable: $VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT" >&2
+    exit 1
+  }
+  [ "${#REPO_TARGETS[@]}" -gt 0 ] || {
+    echo "[runtime-fleet] --repo-version-check requires at least one --repo-target" >&2
     exit 1
   }
 fi
@@ -181,6 +199,15 @@ if [ "$CHECK_SOP_UI" = "1" ] && [ "$failed" -eq 0 ]; then
     ui_args+=(--expect-runtime="$item")
   done
   "$VERIFY_SOP_UI_DISCOVERY_SCRIPT" "${ui_args[@]}"
+fi
+
+if [ "$CHECK_REPO_VERSIONS" = "1" ] && [ "$failed" -eq 0 ]; then
+  echo "[runtime-fleet] verifying runtime repo versions"
+  repo_args=()
+  for item in "${REPO_TARGETS[@]}"; do
+    repo_args+=(--target="$item")
+  done
+  "$VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT" "${repo_args[@]}"
 fi
 
 echo "[runtime-fleet] summary: passed=$passed failed=$failed total=$total"

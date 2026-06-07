@@ -54,14 +54,28 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
         verifier.chmod(0o755)
         return verifier
 
+    def _fake_repo_verifier(self, tmp_path: Path) -> Path:
+        verifier = tmp_path / "verify-runtime-repo-versions.sh"
+        verifier.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'REPOS\\n' >> \"$ARG_FILE\"\n"
+            "printf '%s\\n' \"$@\" >> \"$ARG_FILE\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        verifier.chmod(0o755)
+        return verifier
+
     def _run(self, verifier: Path, args_file: Path, *args: str, fail_name: str = ""):
         control_plane_verifier = self._fake_control_plane_verifier(args_file.parent)
         sop_ui_verifier = self._fake_sop_ui_verifier(args_file.parent)
+        repo_verifier = self._fake_repo_verifier(args_file.parent)
         env = os.environ.copy()
         env.update({
             "VERIFY_RUNTIME_CHANNEL_SCRIPT": str(verifier),
             "VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT": str(control_plane_verifier),
             "VERIFY_SOP_UI_DISCOVERY_SCRIPT": str(sop_ui_verifier),
+            "VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT": str(repo_verifier),
             "ARG_FILE": str(args_file),
             "FAIL_NAME": fail_name,
         })
@@ -83,6 +97,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertEqual(text.count("CALL\n"), 3)
             self.assertEqual(text.count("CONTROL\n"), 1)
             self.assertEqual(text.count("SOPUI\n"), 1)
+            self.assertNotIn("REPOS\n", text)
             self.assertIn("--tunnel-api=https://tunnel-api.chxyka.ccwu.cc\n", text)
             self.assertIn("--ui-url=https://sop-ui-prototype.chxyka.ccwu.cc\n", text)
             self.assertIn("--name=youtube-wiki\n", text)
@@ -152,6 +167,22 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             text = args_file.read_text(encoding="utf-8")
             self.assertNotIn("SOPUI\n", text)
+
+    def test_repo_version_check_invokes_repo_verifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier, args_file = self._fake_verifier(Path(tmp))
+            result = self._run(
+                verifier,
+                args_file,
+                "--only=youtube-wiki-222",
+                "--repo-version-check",
+                "--repo-target=youtube-wiki-222|runtime|34.29.222.183|/tmp/key",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = args_file.read_text(encoding="utf-8")
+            self.assertIn("REPOS\n", text)
+            self.assertIn("--target=youtube-wiki-222|runtime|34.29.222.183|/tmp/key\n", text)
 
 
 if __name__ == "__main__":
