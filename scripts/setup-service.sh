@@ -11,8 +11,11 @@ REPO="${WIKI_GITHUB_REPO:-}"
 RUNTIME_ID="${YOUTUBE_WIKI_RUNTIME_ID:-youtube-wiki}"
 UI_URL="${SOP_UI_URL:-https://sop-ui.chxyka.ccwu.cc}"
 AUTO_DOMAIN_SERVER="${AUTO_DOMAIN_SERVER:-wss://tunnel-api.chxyka.ccwu.cc}"
+AUTO_DOMAIN_ZONE_NAME="${AUTO_DOMAIN_ZONE_NAME:-chxyka.ccwu.cc}"
+AUTO_DOMAIN_WORKER_SCRIPT="${AUTO_DOMAIN_WORKER_SCRIPT:-auto-domain-tunnel}"
 AGENT_URL="${AGENT_URL:-https://skill.vyibc.com/agent.js}"
 AUTO_DOMAIN_SCRIPT="${AUTO_DOMAIN_SCRIPT:-$HOME/auto-domain-cli/skills/auto-domain/scripts/run.sh}"
+PUBLIC_VERIFY_PATH="${PUBLIC_VERIFY_PATH:-/api/sop}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -48,6 +51,14 @@ command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "node is required" >&2; exit 1; }
 command -v npm >/dev/null 2>&1 || { echo "npm is required" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
+
+if [ -n "${CF_API_KEY:-${CLOUDFLARE_API_KEY:-}}" ] && [ -n "${CF_EMAIL:-${CLOUDFLARE_EMAIL:-}}" ]; then
+  bash "$SCRIPT_DIR/ensure-cloudflare-tunnel-routes.sh" \
+    --zone-name="$AUTO_DOMAIN_ZONE_NAME" \
+    --worker-script="$AUTO_DOMAIN_WORKER_SCRIPT"
+else
+  echo "[setup-service] Cloudflare route ensure skipped: CF_EMAIL/CF_API_KEY not set"
+fi
 
 bash "$SCRIPT_DIR/start-local-service.sh" --stop >/dev/null 2>&1 || true
 bash "$SCRIPT_DIR/start-local-service.sh" --port="$PORT" --daemon
@@ -85,6 +96,22 @@ cleanup_auto_domain() {
   if pgrep -af "$pattern" >/dev/null 2>&1; then
     pkill -f "$pattern" || true
   fi
+}
+
+verify_public_channel() {
+  local url="${ENDPOINT%/}${PUBLIC_VERIFY_PATH}"
+  echo "[setup-service] verifying public channel: $url"
+  for _ in $(seq 1 20); do
+    if curl -fsS --connect-timeout 8 --max-time 20 "$url" >/dev/null 2>&1; then
+      echo "[setup-service] public channel verified: $url"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "[setup-service] public channel verification failed: $url" >&2
+  curl -k -i --connect-timeout 8 --max-time 20 "$url" >&2 || true
+  return 1
 }
 
 fix_agent_ws_host() {
@@ -163,6 +190,7 @@ if [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
     if [ -f "$HOME/.auto-domain/agent.log" ] && grep -q "Public URL" "$HOME/.auto-domain/agent.log" 2>/dev/null; then
       echo "Public URL : https://$NAME.chxyka.ccwu.cc"
       echo "Logs: $HOME/.auto-domain/agent.log"
+      verify_public_channel
       exit 0
     fi
     if [ -f "$HOME/.auto-domain/agent.pid" ] && ! kill -0 "$(cat "$HOME/.auto-domain/agent.pid")" 2>/dev/null; then
@@ -222,6 +250,7 @@ for _ in $(seq 1 30); do
   if grep -q "Public URL" "$CHANNEL_DIR/agent.log" 2>/dev/null; then
     echo "Public channel ready: $ENDPOINT"
     echo "Logs: $CHANNEL_DIR/agent.log"
+    verify_public_channel
     exit 0
   fi
   if ! kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 2>/dev/null; then
