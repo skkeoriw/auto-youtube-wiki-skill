@@ -98,6 +98,12 @@ cleanup_auto_domain() {
   fi
 }
 
+auto_domain_script_supports_safe_metadata() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  grep -q 'ARGS=(' "$file" && grep -q '"${ARGS\[@\]}"' "$file"
+}
+
 verify_public_channel() {
   local url="${ENDPOINT%/}${PUBLIC_VERIFY_PATH}"
   echo "[setup-service] verifying public channel: $url"
@@ -171,7 +177,7 @@ PY
 cleanup_auto_domain "--name=$NAME"
 cleanup_auto_domain "agent.js .*--name=$NAME"
 
-if [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
+if [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$AUTO_DOMAIN_SCRIPT"; then
   echo "[setup-service] using local auto-domain-cli runner: $AUTO_DOMAIN_SCRIPT"
   bash "$AUTO_DOMAIN_SCRIPT" --stop >/dev/null 2>&1 || true
   bash "$AUTO_DOMAIN_SCRIPT" \
@@ -208,6 +214,8 @@ if [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
   echo "timed out waiting for public channel (auto-domain-cli)" >&2
   tail -n 120 "$HOME/.auto-domain/agent.log" >&2 || true
   exit 1
+elif [ -f "$AUTO_DOMAIN_SCRIPT" ]; then
+  echo "[setup-service] local auto-domain-cli runner is too old for JSON metadata; using fallback agent: $AUTO_DOMAIN_SCRIPT"
 fi
 
 CHANNEL_DIR="$HOME/.auto-domain-$NAME"
