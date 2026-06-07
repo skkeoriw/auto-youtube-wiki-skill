@@ -151,6 +151,31 @@ verify_public_channel() {
   return 1
 }
 
+verify_runtime_channel() {
+  local verifier="$SCRIPT_DIR/verify-runtime-channel.sh"
+  [ -x "$verifier" ] || {
+    echo "[setup-service] runtime channel verifier not found or not executable: $verifier" >&2
+    return 1
+  }
+
+  echo "[setup-service] verifying runtime channel metadata: $NAME"
+  for _ in $(seq 1 10); do
+    if "$verifier" \
+      --name="$NAME" \
+      --endpoint="$ENDPOINT" \
+      --expect-runtime-id="$RUNTIME_ID" \
+      --expect-repo="$REPO" \
+      --expect-port="$PORT"; then
+      echo "[setup-service] runtime channel metadata verified: $NAME"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "[setup-service] runtime channel metadata verification failed: $NAME" >&2
+  return 1
+}
+
 fix_agent_ws_host() {
   local file="$1"
   [ -f "$file" ] || return 0
@@ -228,6 +253,7 @@ if [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$A
       echo "Public URL : https://$NAME.chxyka.ccwu.cc"
       echo "Logs: $HOME/.auto-domain/agent.log"
       verify_public_channel
+      verify_runtime_channel
       exit 0
     fi
     if [ -f "$HOME/.auto-domain/agent.pid" ] && ! kill -0 "$(cat "$HOME/.auto-domain/agent.pid")" 2>/dev/null; then
@@ -278,6 +304,7 @@ for _ in $(seq 1 30); do
     echo "Public channel ready: $ENDPOINT"
     echo "Logs: $CHANNEL_DIR/agent.log"
     verify_public_channel
+    verify_runtime_channel
     exit 0
   fi
   if ! kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 2>/dev/null; then

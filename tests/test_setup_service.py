@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from shlex import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,9 +105,50 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
         self.assertIn("AUTO_DOMAIN_REPO=", text)
         self.assertIn("AUTO_DOMAIN_SOURCE_DIR=", text)
         self.assertIn("prepare_auto_domain_source_agent", text)
+        self.assertIn("verify_runtime_channel", text)
         self.assertIn('setsid node "$AUTO_DOMAIN_AGENT_JS"', text)
         self.assertIn("using managed latest source instead", text)
         self.assertNotIn("AGENT_URL=", text)
+
+    def test_verify_runtime_channel_invokes_public_verifier_with_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            args_file = tmp_path / "args.txt"
+            verifier = tmp_path / "verify-runtime-channel.sh"
+            verifier.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$@\" > \"$ARG_FILE\"\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            verifier.chmod(0o755)
+
+            fn = _extract_shell_function("verify_runtime_channel")
+            env = os.environ.copy()
+            env.update({
+                "ARG_FILE": str(args_file),
+            })
+            cmd = "\n".join([
+                f"SCRIPT_DIR={quote(str(tmp_path))}",
+                "NAME=youtube-wiki-test",
+                "ENDPOINT=https://youtube-wiki-test.example.com",
+                "RUNTIME_ID=youtube-wiki-test",
+                "REPO=skkeoriw/wiki-test",
+                "PORT=18121",
+                fn,
+                "verify_runtime_channel",
+            ])
+            result = _run(cmd, env=env)
+
+            self.assertIn("runtime channel metadata verified", result.stdout)
+            args = args_file.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(args, [
+                "--name=youtube-wiki-test",
+                "--endpoint=https://youtube-wiki-test.example.com",
+                "--expect-runtime-id=youtube-wiki-test",
+                "--expect-repo=skkeoriw/wiki-test",
+                "--expect-port=18121",
+            ])
 
 
 if __name__ == "__main__":
