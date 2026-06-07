@@ -9,6 +9,7 @@ VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT="${VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT:-$SCRIP
 EXPECT_SOURCE_MODE="${EXPECT_AUTO_DOMAIN_SOURCE_MODE:-managed}"
 EXPECT_SOURCE_REPO="${EXPECT_AUTO_DOMAIN_SOURCE_REPO:-https://github.com/skkeoriw/auto-domain-cli.git}"
 EXPECT_SOURCE_COMMIT="${EXPECT_AUTO_DOMAIN_SOURCE_COMMIT:-8738556}"
+EXPECT_SOP_TYPES="${EXPECT_SOP_TYPES:-runtime-provisioning,youtube-research-wiki}"
 CHECK_OPTIONS=1
 CHECK_CONTROL_PLANE=1
 REPAIR_CONTROL_PLANE=0
@@ -36,7 +37,9 @@ Options:
   --source-mode=managed               expected auto-domain source mode
   --source-repo=https://...           expected auto-domain source repo
   --source-commit=8738556             expected auto-domain source commit
+  --sop-types=a,b                     expected metadata.supported_sop_types
   --no-source-check                   skip auto-domain source expectations
+  --no-sop-type-check                 skip supported_sop_types expectations
   --no-options                        skip public OPTIONS check
   -h, --help                          show this help
 
@@ -55,7 +58,9 @@ while [ "$#" -gt 0 ]; do
     --source-mode=*) EXPECT_SOURCE_MODE="${1#--source-mode=}"; shift ;;
     --source-repo=*) EXPECT_SOURCE_REPO="${1#--source-repo=}"; shift ;;
     --source-commit=*) EXPECT_SOURCE_COMMIT="${1#--source-commit=}"; shift ;;
+    --sop-types=*) EXPECT_SOP_TYPES="${1#--sop-types=}"; shift ;;
     --no-source-check) EXPECT_SOURCE_MODE=""; EXPECT_SOURCE_REPO=""; EXPECT_SOURCE_COMMIT=""; shift ;;
+    --no-sop-type-check) EXPECT_SOP_TYPES=""; shift ;;
     --no-options) CHECK_OPTIONS=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -136,6 +141,12 @@ while IFS='|' read -r name endpoint runtime_id repo port; do
   fi
   if [ -n "$EXPECT_SOURCE_COMMIT" ]; then
     args+=(--expect-auto-domain-source-commit="$EXPECT_SOURCE_COMMIT")
+  fi
+  if [ -n "$EXPECT_SOP_TYPES" ]; then
+    IFS=',' read -r -a sop_type_items <<< "$EXPECT_SOP_TYPES"
+    for sop_type in "${sop_type_items[@]}"; do
+      [ -n "$sop_type" ] && args+=(--expect-sop-type="$sop_type")
+    done
   fi
 
   if "$VERIFY_RUNTIME_CHANNEL_SCRIPT" "${args[@]}"; then

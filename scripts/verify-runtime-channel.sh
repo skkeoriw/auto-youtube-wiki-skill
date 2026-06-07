@@ -10,6 +10,7 @@ EXPECT_PORT=""
 EXPECT_AUTO_DOMAIN_SOURCE_MODE=""
 EXPECT_AUTO_DOMAIN_SOURCE_REPO=""
 EXPECT_AUTO_DOMAIN_SOURCE_COMMIT=""
+EXPECT_SOP_TYPES=()
 CHECK_OPTIONS=1
 
 while [ "$#" -gt 0 ]; do
@@ -23,6 +24,7 @@ while [ "$#" -gt 0 ]; do
     --expect-auto-domain-source-mode=*) EXPECT_AUTO_DOMAIN_SOURCE_MODE="${1#--expect-auto-domain-source-mode=}"; shift ;;
     --expect-auto-domain-source-repo=*) EXPECT_AUTO_DOMAIN_SOURCE_REPO="${1#--expect-auto-domain-source-repo=}"; shift ;;
     --expect-auto-domain-source-commit=*) EXPECT_AUTO_DOMAIN_SOURCE_COMMIT="${1#--expect-auto-domain-source-commit=}"; shift ;;
+    --expect-sop-type=*) EXPECT_SOP_TYPES+=("${1#--expect-sop-type=}"); shift ;;
     --no-options) CHECK_OPTIONS=0; shift ;;
     -h|--help)
       cat <<'EOF'
@@ -35,7 +37,9 @@ Usage:
     [--expect-port=18121] \
     [--expect-auto-domain-source-mode=managed] \
     [--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git] \
-    [--expect-auto-domain-source-commit=8738556]
+    [--expect-auto-domain-source-commit=8738556] \
+    [--expect-sop-type=runtime-provisioning] \
+    [--expect-sop-type=youtube-research-wiki]
 
 Checks tunnel-admin metadata, public /api/sop, and OPTIONS for a SOP Runtime.
 Does not require jq.
@@ -52,9 +56,11 @@ done
 [ -n "$ENDPOINT" ] || { echo "--endpoint is required" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 
+EXPECT_SOP_TYPES_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EXPECT_SOP_TYPES[@]}")"
+
 python3 - "$NAME" "$ENDPOINT" "$TUNNEL_API" "$EXPECT_RUNTIME_ID" "$EXPECT_REPO" "$EXPECT_PORT" \
   "$EXPECT_AUTO_DOMAIN_SOURCE_MODE" "$EXPECT_AUTO_DOMAIN_SOURCE_REPO" "$EXPECT_AUTO_DOMAIN_SOURCE_COMMIT" \
-  "$CHECK_OPTIONS" <<'PY'
+  "$CHECK_OPTIONS" "$EXPECT_SOP_TYPES_JSON" <<'PY'
 import json
 import sys
 import urllib.error
@@ -73,10 +79,15 @@ import urllib.request
     expect_source_repo,
     expect_source_commit,
     check_options,
+    expect_sop_types_json,
 ) = sys.argv[1:]
 endpoint = endpoint.rstrip("/")
 tunnel_api = tunnel_api.rstrip("/")
 check_options = check_options == "1"
+try:
+    expect_sop_types = json.loads(expect_sop_types_json)
+except json.JSONDecodeError:
+    expect_sop_types = []
 
 if not name:
     host = urllib.parse.urlparse(endpoint).hostname or ""
@@ -179,6 +190,15 @@ if str(metadata.get("channel_url") or "").rstrip("/") != endpoint:
 if expect_repo and metadata.get("wiki_repo") != expect_repo:
     fail(f"{name} metadata.wiki_repo={metadata.get('wiki_repo')!r}, expected {expect_repo}")
 
+if expect_sop_types:
+    supported_sop_types = metadata.get("supported_sop_types")
+    if not isinstance(supported_sop_types, list):
+        fail(f"{name} metadata.supported_sop_types is missing or not a list")
+    supported = {str(item) for item in supported_sop_types}
+    missing = [item for item in expect_sop_types if item not in supported]
+    if missing:
+        fail(f"{name} metadata.supported_sop_types missing: {', '.join(missing)}")
+
 source = metadata.get("auto_domain_source")
 if any((expect_source_mode, expect_source_repo, expect_source_commit)):
     if not isinstance(source, dict):
@@ -214,4 +234,6 @@ if isinstance(source, dict):
         "[runtime-channel] auto_domain_source: "
         f"{source.get('mode', '')} {source.get('repo', '')}@{source.get('commit', '')}"
     )
+if expect_sop_types:
+    print(f"[runtime-channel] supported_sop_types: {', '.join(expect_sop_types)}")
 PY

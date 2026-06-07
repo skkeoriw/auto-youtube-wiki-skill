@@ -74,6 +74,8 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertIn("--name=youtube-wiki-222\n", text)
             self.assertIn("--expect-auto-domain-source-mode=managed\n", text)
             self.assertIn("--expect-auto-domain-source-commit=testcommit\n", text)
+            self.assertIn("--expect-sop-type=runtime-provisioning\n", text)
+            self.assertIn("--expect-sop-type=youtube-research-wiki\n", text)
             self.assertIn("--no-options\n", text)
             self.assertIn("passed=3 failed=0 total=3", result.stdout)
 
@@ -108,6 +110,15 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             text = args_file.read_text(encoding="utf-8")
             self.assertNotIn("CONTROL\n", text)
             self.assertEqual(text.count("CALL\n"), 1)
+
+    def test_no_sop_type_check_skips_sop_type_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier, args_file = self._fake_verifier(Path(tmp))
+            result = self._run(verifier, args_file, "--only=youtube-wiki-222", "--no-sop-type-check")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = args_file.read_text(encoding="utf-8")
+            self.assertNotIn("--expect-sop-type=", text)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ class RuntimeChannelHandler(BaseHTTPRequestHandler):
         "channel_url": None,
         "spi_base_url": None,
         "wiki_repo": "skkeoriw/wiki-test",
+        "supported_sop_types": ["runtime-provisioning", "youtube-research-wiki"],
         "auto_domain_source": {
             "mode": "managed",
             "repo": "https://github.com/skkeoriw/auto-domain-cli.git",
@@ -56,9 +57,19 @@ class RuntimeChannelHandler(BaseHTTPRequestHandler):
             metadata = dict(self.tunnel_metadata)
             metadata["channel_url"] = endpoint
             metadata["spi_base_url"] = f"{endpoint}/api/sop"
+            override = self.metadata_override
+            if override is not None:
+                try:
+                    override_data = json.loads(override)
+                except (TypeError, json.JSONDecodeError):
+                    override_data = None
+                if isinstance(override_data, dict):
+                    override_data["channel_url"] = endpoint
+                    override_data["spi_base_url"] = f"{endpoint}/api/sop"
+                    override = json.dumps(override_data)
             raw_metadata = (
-                self.metadata_override
-                if self.metadata_override is not None
+                override
+                if override is not None
                 else json.dumps(metadata)
             )
             self._send_json({
@@ -118,6 +129,8 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
                 "--expect-auto-domain-source-mode=managed",
                 "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
                 "--expect-auto-domain-source-commit=8738556",
+                "--expect-sop-type=runtime-provisioning",
+                "--expect-sop-type=youtube-research-wiki",
             ],
             text=True,
             stdout=subprocess.PIPE,
@@ -128,6 +141,7 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
         self.assertIn("[runtime-channel] ok: youtube-wiki-test", result.stdout)
         self.assertIn("repo: skkeoriw/wiki-test", result.stdout)
         self.assertIn("auto_domain_source: managed https://github.com/skkeoriw/auto-domain-cli.git@8738556", result.stdout)
+        self.assertIn("supported_sop_types: runtime-provisioning, youtube-research-wiki", result.stdout)
 
     def test_verify_runtime_channel_rejects_truncated_metadata(self):
         server = self.run_server(metadata_override='{"title":')
@@ -171,6 +185,30 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("metadata.auto_domain_source.commit", result.stderr)
+
+    def test_verify_runtime_channel_rejects_missing_sop_type(self):
+        metadata = dict(RuntimeChannelHandler.tunnel_metadata)
+        metadata["supported_sop_types"] = ["youtube-research-wiki"]
+        server = self.run_server(metadata_override=json.dumps(metadata))
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+
+        result = subprocess.run(
+            [
+                str(VERIFY_SCRIPT),
+                "--name=youtube-wiki-test",
+                f"--endpoint={endpoint}",
+                f"--tunnel-api={endpoint}",
+                "--expect-runtime-id=youtube-wiki-test",
+                "--expect-repo=skkeoriw/wiki-test",
+                "--expect-sop-type=runtime-provisioning",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("metadata.supported_sop_types missing: runtime-provisioning", result.stderr)
 
 
 if __name__ == "__main__":
