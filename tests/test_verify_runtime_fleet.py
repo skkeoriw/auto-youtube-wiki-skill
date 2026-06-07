@@ -30,10 +30,24 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
         verifier.chmod(0o755)
         return verifier, args_file
 
+    def _fake_control_plane_verifier(self, tmp_path: Path) -> Path:
+        verifier = tmp_path / "verify-tunnel-control-plane.sh"
+        verifier.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'CONTROL\\n' >> \"$ARG_FILE\"\n"
+            "printf '%s\\n' \"$@\" >> \"$ARG_FILE\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        verifier.chmod(0o755)
+        return verifier
+
     def _run(self, verifier: Path, args_file: Path, *args: str, fail_name: str = ""):
+        control_plane_verifier = self._fake_control_plane_verifier(args_file.parent)
         env = os.environ.copy()
         env.update({
             "VERIFY_RUNTIME_CHANNEL_SCRIPT": str(verifier),
+            "VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT": str(control_plane_verifier),
             "ARG_FILE": str(args_file),
             "FAIL_NAME": fail_name,
         })
@@ -53,6 +67,8 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             text = args_file.read_text(encoding="utf-8")
             self.assertEqual(text.count("CALL\n"), 3)
+            self.assertEqual(text.count("CONTROL\n"), 1)
+            self.assertIn("--tunnel-api=https://tunnel-api.chxyka.ccwu.cc\n", text)
             self.assertIn("--name=youtube-wiki\n", text)
             self.assertIn("--name=youtube-wiki-168\n", text)
             self.assertIn("--name=youtube-wiki-222\n", text)
@@ -69,6 +85,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             text = args_file.read_text(encoding="utf-8")
             self.assertEqual(text.count("CALL\n"), 1)
+            self.assertEqual(text.count("CONTROL\n"), 1)
             self.assertIn("--name=youtube-wiki-222\n", text)
             self.assertNotIn("--name=youtube-wiki\n", text)
             self.assertIn("passed=1 failed=0 total=1", result.stdout)
@@ -81,6 +98,16 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("passed=2 failed=1 total=3", result.stdout)
             self.assertIn("failed runtimes: youtube-wiki-168", result.stderr)
+
+    def test_no_control_plane_skips_control_plane_verifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier, args_file = self._fake_verifier(Path(tmp))
+            result = self._run(verifier, args_file, "--only=youtube-wiki-222", "--no-control-plane")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = args_file.read_text(encoding="utf-8")
+            self.assertNotIn("CONTROL\n", text)
+            self.assertEqual(text.count("CALL\n"), 1)
 
 
 if __name__ == "__main__":

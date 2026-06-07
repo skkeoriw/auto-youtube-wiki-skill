@@ -5,10 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TUNNEL_API="${TUNNEL_API:-https://tunnel-api.chxyka.ccwu.cc}"
 VERIFY_RUNTIME_CHANNEL_SCRIPT="${VERIFY_RUNTIME_CHANNEL_SCRIPT:-$SCRIPT_DIR/verify-runtime-channel.sh}"
+VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT="${VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT:-$SCRIPT_DIR/verify-tunnel-control-plane.sh}"
 EXPECT_SOURCE_MODE="${EXPECT_AUTO_DOMAIN_SOURCE_MODE:-managed}"
 EXPECT_SOURCE_REPO="${EXPECT_AUTO_DOMAIN_SOURCE_REPO:-https://github.com/skkeoriw/auto-domain-cli.git}"
 EXPECT_SOURCE_COMMIT="${EXPECT_AUTO_DOMAIN_SOURCE_COMMIT:-8738556}"
 CHECK_OPTIONS=1
+CHECK_CONTROL_PLANE=1
+REPAIR_CONTROL_PLANE=0
 ONLY_NAMES=""
 
 DEFAULT_FLEET=(
@@ -23,11 +26,13 @@ Usage:
   scripts/verify-runtime-fleet.sh [options]
 
 Checks all known SOP Runtime public channels through tunnel-admin metadata,
-public /api/sop, OPTIONS, and auto-domain source metadata.
+public /api/sop, OPTIONS, auto-domain source metadata, and tunnel control-plane health.
 
 Options:
   --only=name[,name]                  verify only matching runtime names
   --tunnel-api=https://...            tunnel-admin API base
+  --repair-control-plane              call /admin/health?repair=1 before runtime checks
+  --no-control-plane                  skip tunnel-admin/Cloudflare health check
   --source-mode=managed               expected auto-domain source mode
   --source-repo=https://...           expected auto-domain source repo
   --source-commit=8738556             expected auto-domain source commit
@@ -45,6 +50,8 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --only=*) ONLY_NAMES="${1#--only=}"; shift ;;
     --tunnel-api=*) TUNNEL_API="${1#--tunnel-api=}"; shift ;;
+    --repair-control-plane) REPAIR_CONTROL_PLANE=1; shift ;;
+    --no-control-plane) CHECK_CONTROL_PLANE=0; shift ;;
     --source-mode=*) EXPECT_SOURCE_MODE="${1#--source-mode=}"; shift ;;
     --source-repo=*) EXPECT_SOURCE_REPO="${1#--source-repo=}"; shift ;;
     --source-commit=*) EXPECT_SOURCE_COMMIT="${1#--source-commit=}"; shift ;;
@@ -63,6 +70,13 @@ done
   echo "[runtime-fleet] verifier not found or not executable: $VERIFY_RUNTIME_CHANNEL_SCRIPT" >&2
   exit 1
 }
+
+if [ "$CHECK_CONTROL_PLANE" = "1" ]; then
+  [ -x "$VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT" ] || {
+    echo "[runtime-fleet] control-plane verifier not found or not executable: $VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT" >&2
+    exit 1
+  }
+fi
 
 should_verify() {
   local name="$1"
@@ -87,6 +101,15 @@ total=0
 passed=0
 failed=0
 failures=()
+
+if [ "$CHECK_CONTROL_PLANE" = "1" ]; then
+  echo "[runtime-fleet] verifying tunnel control plane -> $TUNNEL_API"
+  control_plane_args=(--tunnel-api="$TUNNEL_API")
+  if [ "$REPAIR_CONTROL_PLANE" = "1" ]; then
+    control_plane_args+=(--repair)
+  fi
+  "$VERIFY_TUNNEL_CONTROL_PLANE_SCRIPT" "${control_plane_args[@]}"
+fi
 
 while IFS='|' read -r name endpoint runtime_id repo port; do
   [ -n "${name:-}" ] || continue

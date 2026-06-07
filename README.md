@@ -84,10 +84,21 @@ bash <(curl -fsSL https://skill.vyibc.com/youtube-wiki.sh) --mode=...
 - `scripts/bridge.py` — Python HTTP bridge，无需修改
 - `scripts/start-local-service.sh` — bridge 启动脚本
 - `scripts/setup-service.sh` — 标准服务部署脚本，负责 bridge + tunnel metadata
+- `scripts/verify-tunnel-control-plane.sh` — 验证 tunnel-admin / Cloudflare route / D1 / gateway probe
+- `scripts/verify-runtime-fleet.sh` — 验证 control-plane 和已知 Runtime 通道
 
 ---
 
 ## 4. 调用示例
+
+### 验证 Runtime 通道层
+
+只检查 tunnel-admin / Cloudflare / Runtime `/api/sop`，不会触发 YouTube workflow：
+
+```bash
+./scripts/verify-tunnel-control-plane.sh
+./scripts/verify-runtime-fleet.sh
+```
 
 ### 触发 YouTube 研究流程
 
