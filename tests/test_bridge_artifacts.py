@@ -179,6 +179,18 @@ class ArtifactResolutionTest(unittest.TestCase):
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
 
+    def test_indexed_artifact_preview_is_backfilled(self):
+        artifact = {
+            "id": "indexed-1",
+            "path": "wiki/entities/Agent.md",
+            "format": "markdown",
+            "mime_type": "text/markdown",
+        }
+        enriched = bridge.artifact_with_preview(self.sop, artifact)
+        self.assertEqual(enriched["preview"], "# Agent")
+        self.assertFalse(enriched["preview_truncated"])
+        self.assertNotIn("preview", artifact)
+
     def test_sse_event_replay_and_format(self):
         events_file = self.wiki / "raw/pipeline-runs/pipe-1/events.jsonl"
         events_file.write_text(

@@ -222,6 +222,37 @@ def artifact_record(sop, node_id, output_name, path, resolution):
     return record
 
 
+def artifact_with_preview(sop, artifact):
+    """Attach a bounded text preview for indexed artifacts at response time."""
+    if not isinstance(artifact, dict):
+        return artifact
+    record = dict(artifact)
+    if record.get("preview"):
+        return record
+    path = safe_artifact_path(sop["wiki_local_path"], record.get("path", ""))
+    if not path or not path.is_file():
+        return record
+    suffix = path.suffix.lower()
+    if suffix not in TEXT_FORMATS:
+        return record
+    try:
+        stat = path.stat()
+        if stat.st_size > 1024 * 1024:
+            return record
+        preview = path.read_text(encoding="utf-8", errors="replace")[:16000]
+        record["preview"] = preview
+        record["preview_truncated"] = stat.st_size > len(preview.encode("utf-8"))
+    except OSError:
+        pass
+    return record
+
+
+def artifacts_with_preview(sop, artifacts):
+    if not isinstance(artifacts, list):
+        return artifacts
+    return [artifact_with_preview(sop, artifact) for artifact in artifacts]
+
+
 def run_context(sop, pipeline_id):
     wiki = Path(sop["wiki_local_path"])
     candidates = [wiki / "raw" / "pipeline-runs" / pipeline_id / "context.json"]
@@ -414,7 +445,7 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         try:
             indexed = store.get_node_state(pipeline_id, node_id)
             if indexed:
-                indexed_artifacts = store.get_artifacts(pipeline_id, node_id)
+                indexed_artifacts = artifacts_with_preview(sop, store.get_artifacts(pipeline_id, node_id))
                 detail.update({
                     **indexed,
                     "artifacts": indexed_artifacts,
@@ -1508,6 +1539,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 except Exception:
                                     indexed_artifacts = None
                             data = indexed_artifacts if indexed_artifacts is not None else read_json(run_dir / "artifacts.json")
+                            data = artifacts_with_preview(sop, data)
                         else:
                             data = (
                                 normalized_run_dag(sop, path[4])
