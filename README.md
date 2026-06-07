@@ -63,6 +63,17 @@ bash <(curl -fsSL 'https://skill.vyibc.com/install-youtube-wiki.sh')
 脚本会启动本地 HTTP bridge、注册 auto-domain 隧道，并把可复制的
 Skill/CLI 命令以 JSON metadata 写入 tunnel-admin。
 
+Runtime 通道注册默认使用受控的 managed auto-domain 源码：
+
+```text
+https://github.com/skkeoriw/auto-domain-cli.git#main
+```
+
+`setup-service.sh` 每次创建 tunnel 前都会同步该源码缓存。如果缓存目录不是
+Git 仓库、指向了错误 repo，或存在本地脏改动，脚本会重建/清理后再注册
+tunnel。除非显式设置 `AUTO_DOMAIN_ALLOW_LOCAL_RUNNER=1`，不要使用本机临时
+auto-domain runner 创建 Runtime 通道。
+
 之后在任何地方执行 skill，都会调用到这台机器上的本地脚本：
 
 ```bash

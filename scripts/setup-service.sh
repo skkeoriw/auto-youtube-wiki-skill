@@ -140,14 +140,46 @@ prepare_auto_domain_source_agent() {
 
   mkdir -p "$(dirname "$source_dir")"
 
+  if [ -e "$source_dir" ] && [ ! -d "$source_dir/.git" ]; then
+    echo "[setup-service] auto-domain source cache is not a git repo; rebuilding: $source_dir" >&2
+    rm -rf "$source_dir"
+  fi
+
   if [ -d "$source_dir/.git" ]; then
+    local current_repo
+    current_repo="$(git -C "$source_dir" remote get-url origin 2>/dev/null || true)"
+    if [ "$current_repo" != "$AUTO_DOMAIN_REPO" ]; then
+      echo "[setup-service] auto-domain source cache repo changed; rebuilding: ${current_repo:-unknown} -> $AUTO_DOMAIN_REPO" >&2
+      rm -rf "$source_dir"
+    fi
+  fi
+
+  if [ -d "$source_dir/.git" ]; then
+    git -C "$source_dir" remote set-url origin "$AUTO_DOMAIN_REPO"
     git -C "$source_dir" fetch --quiet --depth 1 origin "$AUTO_DOMAIN_REF"
     git -C "$source_dir" checkout --quiet -B "$AUTO_DOMAIN_REF" FETCH_HEAD
+    git -C "$source_dir" reset --quiet --hard FETCH_HEAD
+    git -C "$source_dir" clean --quiet -ffd
   else
     rm -rf "$tmp_dir"
     git clone --quiet --depth 1 --branch "$AUTO_DOMAIN_REF" "$AUTO_DOMAIN_REPO" "$tmp_dir"
     rm -rf "$source_dir"
     mv "$tmp_dir" "$source_dir"
+  fi
+
+  local actual_repo
+  actual_repo="$(git -C "$source_dir" remote get-url origin 2>/dev/null || true)"
+  if [ "$actual_repo" != "$AUTO_DOMAIN_REPO" ]; then
+    echo "[setup-service] auto-domain source repo mismatch: ${actual_repo:-unknown}, expected $AUTO_DOMAIN_REPO" >&2
+    return 1
+  fi
+
+  local dirty
+  dirty="$(git -C "$source_dir" status --short 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    echo "[setup-service] auto-domain source cache is dirty after sync: $source_dir" >&2
+    printf '%s\n' "$dirty" >&2
+    return 1
   fi
 
   [ -f "$agent_js" ] || {

@@ -70,6 +70,9 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
             self.assertIn("using latest auto-domain source", first.stderr)
             self.assertEqual(_run("git status --short", cwd=source_dir).stdout.strip(), "")
 
+            expected_agent.write_text("console.log('local dirty copy')\n", encoding="utf-8")
+            (source_dir / "local-junk.tmp").write_text("junk\n", encoding="utf-8")
+
             agent.write_text("console.log('v2')\n", encoding="utf-8")
             _run("git add . && git commit -m update-agent", cwd=repo)
             second = _run(f"{fn}\nprepare_auto_domain_source_agent", env=env)
@@ -80,6 +83,49 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
                 "update-agent",
             )
             self.assertEqual(_run("git status --short", cwd=source_dir).stdout.strip(), "")
+            self.assertFalse((source_dir / "local-junk.tmp").exists())
+
+    def test_managed_source_rebuilds_cache_when_repo_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            old_repo = tmp_path / "old-repo"
+            new_repo = tmp_path / "new-repo"
+            source_dir = tmp_path / "managed-source"
+
+            for repo, body, message in (
+                (old_repo, "console.log('old repo')\n", "old-initial"),
+                (new_repo, "console.log('new repo')\n", "new-initial"),
+            ):
+                agent = repo / "skills/auto-domain/agent/agent.js"
+                agent.parent.mkdir(parents=True)
+                agent.write_text(body, encoding="utf-8")
+                _run("git init -b main", cwd=repo)
+                _run("git config user.email test@example.local && git config user.name test", cwd=repo)
+                _run(f"git add . && git commit -m {message}", cwd=repo)
+
+            fn = _extract_shell_function("prepare_auto_domain_source_agent")
+            env = os.environ.copy()
+            env.update({
+                "AUTO_DOMAIN_REPO": str(old_repo),
+                "AUTO_DOMAIN_REF": "main",
+                "AUTO_DOMAIN_SOURCE_DIR": str(source_dir),
+            })
+            _run(f"{fn}\nprepare_auto_domain_source_agent", env=env)
+
+            old_agent = source_dir / "skills/auto-domain/agent/agent.js"
+            old_agent.write_text("console.log('dirty old cache')\n", encoding="utf-8")
+            (source_dir / "local-junk.tmp").write_text("junk\n", encoding="utf-8")
+
+            env["AUTO_DOMAIN_REPO"] = str(new_repo)
+            result = _run(f"{fn}\nprepare_auto_domain_source_agent", env=env)
+
+            expected_agent = source_dir / "skills/auto-domain/agent/agent.js"
+            self.assertEqual(result.stdout.strip(), str(expected_agent))
+            self.assertIn("auto-domain source cache repo changed", result.stderr)
+            self.assertEqual(expected_agent.read_text(encoding="utf-8"), "console.log('new repo')\n")
+            self.assertEqual(_run("git remote get-url origin", cwd=source_dir).stdout.strip(), str(new_repo))
+            self.assertEqual(_run("git status --short", cwd=source_dir).stdout.strip(), "")
+            self.assertFalse((source_dir / "local-junk.tmp").exists())
 
     def test_safe_metadata_runner_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
