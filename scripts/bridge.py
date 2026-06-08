@@ -61,6 +61,78 @@ RUNTIME_MANAGEMENT_NODES = [
 ]
 
 SECRET_KEYS = {"password", "token", "secret", "credential", "private_key", "ssh_private_key", "private_key_content"}
+RUNTIME_CAPABILITY_ENV = {
+    "GITHUB_TOKEN": ["github_token", "repo_token"],
+    "DEEPSEEK_API_KEY": ["deepseek_api_key", "hermes_deepseek_api_key"],
+    "WIKI_LLM_PROVIDER": ["wiki_llm_provider", "default_model_provider"],
+    "WIKI_DEEPSEEK_MODEL": ["wiki_deepseek_model", "hermes_default_model"],
+    "GOOGLE_CLOUD_API_KEY": ["google_cloud_api_key", "gemini_api_key"],
+    "GEMINI_API_KEY": ["gemini_api_key"],
+    "WIKI_GEMINI_MODEL": ["wiki_gemini_model", "gemini_model"],
+    "GOOGLE_PROJECT_ID": ["google_project_id"],
+    "VERTEX_LOCATION": ["vertex_location"],
+    "WIKI_VERTEX_MODEL": ["wiki_vertex_model", "vertex_model"],
+    "HERMES_WEBHOOK_TOKEN": ["hermes_webhook_token"],
+    "HERMES_WEBHOOK_PORT": ["hermes_webhook_port"],
+    "HERMES_WEBHOOK_URL": ["hermes_webhook_url"],
+    "WEBHOOK_PUBLIC_HOST": ["webhook_public_host", "hermes_public_host"],
+    "NOTEBOOKLM_BRIDGE_URL": ["notebooklm_bridge_url"],
+    "NOTEBOOKLM_BRIDGE_TOKEN": ["notebooklm_bridge_token"],
+    "NOTEBOOKLM_CLIENT_ID": ["notebooklm_client_id"],
+    "BRIDGE_PORT": ["bridge_port"],
+    "YOUTUBE_WIKI_TG_TOKEN": ["youtube_wiki_tg_token", "telegram_token"],
+    "YOUTUBE_WIKI_TG_CHAT_ID": ["youtube_wiki_tg_chat_id", "telegram_chat_id"],
+    "YOUTUBE_CONTENT_API_URL": ["youtube_content_api_url"],
+    "YOUTUBE_CONTENT_API_TOKEN": ["youtube_content_api_token"],
+    "YOUTUBE_RESEARCH_WORKFLOW_URL": ["youtube_research_workflow_url"],
+    "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": ["youtube_research_workflow_token"],
+    "CLOUDFLARE_EMAIL": ["cloudflare_email", "cf_email"],
+    "CLOUDFLARE_API_KEY": ["cloudflare_api_key", "cf_api_key"],
+    "CF_EMAIL": ["cf_email", "cloudflare_email"],
+    "CF_API_KEY": ["cf_api_key", "cloudflare_api_key"],
+    "TUNNEL_API": ["tunnel_api_url"],
+    "SOP_UI_URL": ["sop_ui_url"],
+}
+RUNTIME_REQUIRED_ENV = {
+    "GITHUB_TOKEN",
+    "DEEPSEEK_API_KEY",
+    "NOTEBOOKLM_BRIDGE_URL",
+    "NOTEBOOKLM_BRIDGE_TOKEN",
+    "CLOUDFLARE_API_KEY",
+    "CF_API_KEY",
+}
+RUNTIME_CONFIG_CATEGORIES = {
+    "GITHUB_TOKEN": "github",
+    "DEEPSEEK_API_KEY": "hermes",
+    "WIKI_LLM_PROVIDER": "llm",
+    "WIKI_DEEPSEEK_MODEL": "llm",
+    "GOOGLE_CLOUD_API_KEY": "llm",
+    "GEMINI_API_KEY": "llm",
+    "WIKI_GEMINI_MODEL": "llm",
+    "GOOGLE_PROJECT_ID": "llm",
+    "VERTEX_LOCATION": "llm",
+    "WIKI_VERTEX_MODEL": "llm",
+    "HERMES_WEBHOOK_TOKEN": "hermes",
+    "HERMES_WEBHOOK_PORT": "hermes",
+    "HERMES_WEBHOOK_URL": "hermes",
+    "WEBHOOK_PUBLIC_HOST": "hermes",
+    "NOTEBOOKLM_BRIDGE_URL": "notebooklm",
+    "NOTEBOOKLM_BRIDGE_TOKEN": "notebooklm",
+    "NOTEBOOKLM_CLIENT_ID": "notebooklm",
+    "BRIDGE_PORT": "runtime",
+    "YOUTUBE_WIKI_TG_TOKEN": "telegram",
+    "YOUTUBE_WIKI_TG_CHAT_ID": "telegram",
+    "YOUTUBE_CONTENT_API_URL": "youtube",
+    "YOUTUBE_CONTENT_API_TOKEN": "youtube",
+    "YOUTUBE_RESEARCH_WORKFLOW_URL": "youtube",
+    "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "youtube",
+    "CLOUDFLARE_EMAIL": "cloudflare",
+    "CLOUDFLARE_API_KEY": "cloudflare",
+    "CF_EMAIL": "cloudflare",
+    "CF_API_KEY": "cloudflare",
+    "TUNNEL_API": "cloudflare",
+    "SOP_UI_URL": "runtime",
+}
 
 
 def json_response(handler, status, data):
@@ -122,12 +194,22 @@ def mask_value(value):
     return f"{text[:3]}***{text[-3:]}"
 
 
+def is_secret_key(key):
+    key_l = str(key).lower()
+    return any(secret in key_l for secret in SECRET_KEYS)
+
+
+def display_config_value(key, value):
+    if value in {None, ""}:
+        return ""
+    return mask_value(value) if is_secret_key(key) else str(value)
+
+
 def mask_data(value):
     if isinstance(value, dict):
         result = {}
         for key, item in value.items():
-            key_l = str(key).lower()
-            if any(secret in key_l for secret in SECRET_KEYS):
+            if is_secret_key(key):
                 result[key] = mask_value(item) if item else item
             else:
                 result[key] = mask_data(item)
@@ -142,6 +224,81 @@ def read_yaml(path):
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
+
+
+def read_env_file_values(path):
+    env_path = Path(path).expanduser()
+    values = {}
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            if key:
+                values[key] = value
+    except Exception:
+        return {}
+    return values
+
+
+def runtime_config_group_status(items):
+    groups = {}
+    for item in items:
+        category = item.get("category") or "runtime"
+        groups.setdefault(category, False)
+        if item.get("present"):
+            groups[category] = True
+    groups["llm"] = groups.get("llm", False) or groups.get("hermes", False)
+    groups["tunnel"] = groups.get("cloudflare", False)
+    return groups
+
+
+def runtime_config_inheritance_preview(sop):
+    env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
+    env_file_values = read_env_file_values(env_file)
+    items = []
+    for key, aliases in RUNTIME_CAPABILITY_ENV.items():
+        source = "missing"
+        raw_value = ""
+        matched_key = ""
+        candidate_keys = [key, *aliases]
+        for candidate in candidate_keys:
+            if candidate in os.environ and os.environ.get(candidate, "") != "":
+                source = "environment"
+                raw_value = os.environ.get(candidate, "")
+                matched_key = candidate
+                break
+        if not raw_value:
+            for candidate in candidate_keys:
+                if candidate in env_file_values and env_file_values.get(candidate, "") != "":
+                    source = "env_file"
+                    raw_value = env_file_values.get(candidate, "")
+                    matched_key = candidate
+                    break
+        items.append({
+            "key": key,
+            "aliases": aliases,
+            "matched_key": matched_key,
+            "source": source,
+            "present": bool(raw_value),
+            "masked_value": display_config_value(key, raw_value),
+            "secret": is_secret_key(key),
+            "required": key in RUNTIME_REQUIRED_ENV,
+            "category": RUNTIME_CONFIG_CATEGORIES.get(key, "runtime"),
+        })
+    return {
+        "instance_id": sop.get("instance_id") or sop.get("id", "runtime-management"),
+        "env_file": str(Path(env_file).expanduser()),
+        "items": items,
+        "groups": runtime_config_group_status(items),
+        "note": "Secret-like values are masked; field names, source and presence are always shown.",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def run_workspace(sop, pipeline_id):
@@ -2323,6 +2480,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return json_response(self, 404, {"detail": "SOP not found"})
                 if len(path) == 3:
                     return json_response(self, 200, {k: v for k, v in sop.items() if k != "sop_file"})
+                if len(path) == 5 and path[3] == "config" and path[4] == "inheritance":
+                    if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
+                        return json_response(self, 404, {"detail": "Runtime inheritance preview is only available for runtime-management"})
+                    return json_response(self, 200, runtime_config_inheritance_preview(sop))
                 if len(path) == 4 and path[3] == "dag":
                     return json_response(self, 200, sop_dag(sop))
                 if len(path) == 4 and path[3] == "runs":

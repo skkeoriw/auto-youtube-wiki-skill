@@ -179,6 +179,34 @@ class ArtifactResolutionTest(unittest.TestCase):
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
 
+    def test_runtime_inheritance_preview_masks_secret_values(self):
+        env_file = self.wiki / ".agent-brain-plugins.env"
+        env_file.write_text(
+            "GITHUB_TOKEN=test_visible_secret_value\n"
+            "NOTEBOOKLM_BRIDGE_URL=https://notebooklm-bridge.example/run\n"
+            "NOTEBOOKLM_BRIDGE_TOKEN=bridge-secret-token\n"
+            "WIKI_VERTEX_MODEL=gemini-1.5-pro\n",
+            encoding="utf-8",
+        )
+        sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}
+        with patch.dict(os.environ, {
+            "YOUTUBE_WIKI_ENV_FILE": str(env_file),
+            "GITHUB_TOKEN": "",
+            "NOTEBOOKLM_BRIDGE_URL": "",
+            "NOTEBOOKLM_BRIDGE_TOKEN": "",
+            "WIKI_VERTEX_MODEL": "",
+            "SOP_UI_URL": "",
+        }, clear=False):
+            preview = bridge.runtime_config_inheritance_preview(sop)
+
+        by_key = {item["key"]: item for item in preview["items"]}
+        self.assertEqual(by_key["GITHUB_TOKEN"]["source"], "env_file")
+        self.assertTrue(by_key["GITHUB_TOKEN"]["secret"])
+        self.assertNotIn("visible_secret_value", json.dumps(preview))
+        self.assertEqual(by_key["NOTEBOOKLM_BRIDGE_URL"]["masked_value"], "https://notebooklm-bridge.example/run")
+        self.assertEqual(by_key["WIKI_VERTEX_MODEL"]["masked_value"], "gemini-1.5-pro")
+        self.assertEqual(by_key["SOP_UI_URL"]["source"], "missing")
+
     def test_indexed_artifact_preview_is_backfilled(self):
         artifact = {
             "id": "indexed-1",
