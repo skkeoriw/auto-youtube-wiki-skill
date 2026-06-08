@@ -1347,6 +1347,7 @@ def ensure_runtime_management_sop(runtime):
     try:
         workspace.mkdir(parents=True, exist_ok=True)
         shutil.copytree(template, workspace, dirs_exist_ok=True)
+        (workspace / ".sop").mkdir(parents=True, exist_ok=True)
         store_cls = run_index_class()
         if store_cls:
             store_cls(workspace).initialize()
