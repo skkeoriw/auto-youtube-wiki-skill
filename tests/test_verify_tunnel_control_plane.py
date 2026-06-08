@@ -15,6 +15,7 @@ VERIFY_SCRIPT = ROOT / "scripts" / "verify-tunnel-control-plane.sh"
 class TunnelControlPlaneHandler(BaseHTTPRequestHandler):
     broken_health = False
     broken_page = False
+    stale_threshold = "10 * 60 * 1000"
 
     def log_message(self, _format, *_args):
         return
@@ -81,7 +82,12 @@ class TunnelControlPlaneHandler(BaseHTTPRequestHandler):
             if self.broken_page:
                 self._send_html("<html><body>No source assets</body></html>")
             else:
-                self._send_html("<html><body><th>Source</th><script>function sourceBadge(){}</script></body></html>")
+                self._send_html(
+                    "<html><body><th>Source</th><script>"
+                    f"const TUNNEL_STALE_AFTER_MS = {self.stale_threshold};"
+                    "function sourceBadge(){}"
+                    "</script></body></html>"
+                )
             return
 
         self.send_response(404)
@@ -95,6 +101,7 @@ class VerifyTunnelControlPlaneTest(unittest.TestCase):
 
         Handler.broken_health = broken_health
         Handler.broken_page = broken_page
+        Handler.stale_threshold = "10 * 60 * 1000"
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -159,6 +166,35 @@ class VerifyTunnelControlPlaneTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Source column", result.stderr)
+
+    def test_verify_tunnel_control_plane_rejects_short_stale_threshold(self):
+        class Handler(TunnelControlPlaneHandler):
+            pass
+
+        Handler.broken_health = False
+        Handler.broken_page = False
+        Handler.stale_threshold = "90000"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+
+        result = subprocess.run(
+            [
+                str(VERIFY_SCRIPT),
+                f"--tunnel-api={endpoint}",
+                f"--admin-page={endpoint}/admin-page",
+                "--zone-name=example.com",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TUNNEL_STALE_AFTER_MS=90000", result.stderr)
 
 
 if __name__ == "__main__":

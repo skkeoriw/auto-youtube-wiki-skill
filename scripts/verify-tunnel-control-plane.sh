@@ -7,6 +7,7 @@ ZONE_NAME="${AUTO_DOMAIN_ZONE_NAME:-chxyka.ccwu.cc}"
 WORKER_SCRIPT="${AUTO_DOMAIN_WORKER_SCRIPT:-auto-domain-tunnel}"
 CHECK_ADMIN_PAGE=1
 CHECK_SOURCE_COLUMN=1
+CHECK_STALE_THRESHOLD=1
 REPAIR=0
 
 usage() {
@@ -24,6 +25,7 @@ Options:
   --repair                            call /admin/health?repair=1 before checking
   --no-admin-page                     skip tunnel-admin page check
   --no-source-column                  skip Source column check on admin page
+  --no-stale-threshold                skip tunnel-admin stale threshold check
   -h, --help                          show this help
 EOF
 }
@@ -37,6 +39,7 @@ while [ "$#" -gt 0 ]; do
     --repair) REPAIR=1; shift ;;
     --no-admin-page) CHECK_ADMIN_PAGE=0; shift ;;
     --no-source-column) CHECK_SOURCE_COLUMN=0; shift ;;
+    --no-stale-threshold) CHECK_STALE_THRESHOLD=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "unknown argument: $1" >&2
@@ -49,8 +52,9 @@ done
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 
 python3 - "$TUNNEL_API" "$ADMIN_PAGE" "$ZONE_NAME" "$WORKER_SCRIPT" \
-  "$CHECK_ADMIN_PAGE" "$CHECK_SOURCE_COLUMN" "$REPAIR" <<'PY'
+  "$CHECK_ADMIN_PAGE" "$CHECK_SOURCE_COLUMN" "$CHECK_STALE_THRESHOLD" "$REPAIR" <<'PY'
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -63,12 +67,14 @@ import urllib.request
     worker_script,
     check_admin_page,
     check_source_column,
+    check_stale_threshold,
     repair,
 ) = sys.argv[1:]
 
 tunnel_api = tunnel_api.rstrip("/")
 check_admin_page = check_admin_page == "1"
 check_source_column = check_source_column == "1"
+check_stale_threshold = check_stale_threshold == "1"
 repair = repair == "1"
 
 
@@ -165,6 +171,19 @@ if check_admin_page:
         fail(f"GET {admin_page} returned {status}, expected 200")
     if check_source_column and ("Source" not in html or "sourceBadge" not in html):
         fail("tunnel-admin page does not include Source column/sourceBadge assets")
+    if check_stale_threshold:
+        match = re.search(r"const\s+TUNNEL_STALE_AFTER_MS\s*=\s*([^;]+);", html)
+        if not match:
+            fail("tunnel-admin page does not declare TUNNEL_STALE_AFTER_MS")
+        expression = match.group(1).strip()
+        if not re.fullmatch(r"[0-9\s+\-*/().]+", expression):
+            fail(f"tunnel-admin stale threshold expression is not numeric: {expression!r}")
+        try:
+            threshold = float(eval(expression, {"__builtins__": {}}, {}))
+        except Exception as exc:
+            fail(f"could not evaluate TUNNEL_STALE_AFTER_MS: {exc}")
+        if threshold < 600000:
+            fail(f"TUNNEL_STALE_AFTER_MS={threshold:g}, expected at least 600000")
 
 print("[tunnel-control-plane] ok")
 print(f"[tunnel-control-plane] api: {tunnel_api}")
