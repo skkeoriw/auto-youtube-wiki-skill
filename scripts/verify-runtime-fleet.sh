@@ -12,7 +12,8 @@ VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT="${VERIFY_RUNTIME_REPO_VERSIONS_SCRIPT:-$SCR
 SOP_UI_URL="${SOP_UI_URL:-https://sop-ui-prototype.chxyka.ccwu.cc}"
 EXPECT_SOURCE_MODE="${EXPECT_AUTO_DOMAIN_SOURCE_MODE:-managed}"
 EXPECT_SOURCE_REPO="${EXPECT_AUTO_DOMAIN_SOURCE_REPO:-https://github.com/skkeoriw/auto-domain-cli.git}"
-EXPECT_SOURCE_COMMIT="${EXPECT_AUTO_DOMAIN_SOURCE_COMMIT:-8738556}"
+EXPECT_SOURCE_REF="${EXPECT_AUTO_DOMAIN_SOURCE_REF:-main}"
+EXPECT_SOURCE_COMMIT="${EXPECT_AUTO_DOMAIN_SOURCE_COMMIT:-latest}"
 EXPECT_SOP_TYPES="${EXPECT_SOP_TYPES:-runtime-provisioning,youtube-research-wiki}"
 CHECK_OPTIONS=1
 CHECK_INVENTORY=1
@@ -53,7 +54,8 @@ Options:
   --no-sop-ui                         skip sop-ui-prototype Runtime discovery check
   --source-mode=managed               expected auto-domain source mode
   --source-repo=https://...           expected auto-domain source repo
-  --source-commit=8738556             expected auto-domain source commit
+  --source-ref=main                   expected auto-domain source ref
+  --source-commit=latest              expected auto-domain source commit; "latest" resolves source-ref through git ls-remote
   --sop-types=a,b                     expected metadata.supported_sop_types
   --no-source-check                   skip auto-domain source expectations
   --no-sop-type-check                 skip supported_sop_types expectations
@@ -80,9 +82,10 @@ while [ "$#" -gt 0 ]; do
     --no-sop-ui) CHECK_SOP_UI=0; shift ;;
     --source-mode=*) EXPECT_SOURCE_MODE="${1#--source-mode=}"; shift ;;
     --source-repo=*) EXPECT_SOURCE_REPO="${1#--source-repo=}"; shift ;;
+    --source-ref=*) EXPECT_SOURCE_REF="${1#--source-ref=}"; shift ;;
     --source-commit=*) EXPECT_SOURCE_COMMIT="${1#--source-commit=}"; shift ;;
     --sop-types=*) EXPECT_SOP_TYPES="${1#--sop-types=}"; shift ;;
-    --no-source-check) EXPECT_SOURCE_MODE=""; EXPECT_SOURCE_REPO=""; EXPECT_SOURCE_COMMIT=""; shift ;;
+    --no-source-check) EXPECT_SOURCE_MODE=""; EXPECT_SOURCE_REPO=""; EXPECT_SOURCE_REF=""; EXPECT_SOURCE_COMMIT=""; shift ;;
     --no-sop-type-check) EXPECT_SOP_TYPES=""; shift ;;
     --no-options) CHECK_OPTIONS=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -150,12 +153,49 @@ load_specs() {
   fi
 }
 
+resolve_expected_source_commit() {
+  [ -n "$EXPECT_SOURCE_COMMIT" ] || return 0
+  [ "$EXPECT_SOURCE_COMMIT" = "latest" ] || return 0
+  [ -n "$EXPECT_SOURCE_REPO" ] || {
+    echo "[runtime-fleet] --source-commit=latest requires --source-repo" >&2
+    exit 1
+  }
+  [ -n "$EXPECT_SOURCE_REF" ] || {
+    echo "[runtime-fleet] --source-commit=latest requires --source-ref" >&2
+    exit 1
+  }
+  command -v git >/dev/null 2>&1 || {
+    echo "[runtime-fleet] git is required for --source-commit=latest" >&2
+    exit 1
+  }
+
+  local line sha
+  line="$(git ls-remote "$EXPECT_SOURCE_REPO" "$EXPECT_SOURCE_REF" 2>/dev/null | head -n 1 || true)"
+  if [ -z "$line" ]; then
+    line="$(git ls-remote --heads "$EXPECT_SOURCE_REPO" "$EXPECT_SOURCE_REF" 2>/dev/null | head -n 1 || true)"
+  fi
+  [ -n "$line" ] || {
+    echo "[runtime-fleet] could not resolve auto-domain source latest: $EXPECT_SOURCE_REPO $EXPECT_SOURCE_REF" >&2
+    exit 1
+  }
+  sha="${line%%[[:space:]]*}"
+  [ -n "$sha" ] || {
+    echo "[runtime-fleet] invalid git ls-remote output for $EXPECT_SOURCE_REPO $EXPECT_SOURCE_REF" >&2
+    exit 1
+  }
+
+  EXPECT_SOURCE_COMMIT="${sha:0:7}"
+  echo "[runtime-fleet] resolved auto-domain source latest: $EXPECT_SOURCE_REPO@$EXPECT_SOURCE_REF -> $EXPECT_SOURCE_COMMIT"
+}
+
 total=0
 passed=0
 failed=0
 failures=()
 ui_expected_runtimes=()
 inventory_expected_runtimes=()
+
+resolve_expected_source_commit
 
 if [ "$CHECK_CONTROL_PLANE" = "1" ]; then
   echo "[runtime-fleet] verifying tunnel control plane -> $TUNNEL_API"
@@ -206,6 +246,9 @@ while IFS='|' read -r name endpoint runtime_id repo port; do
   fi
   if [ -n "$EXPECT_SOURCE_REPO" ]; then
     args+=(--expect-auto-domain-source-repo="$EXPECT_SOURCE_REPO")
+  fi
+  if [ -n "$EXPECT_SOURCE_REF" ]; then
+    args+=(--expect-auto-domain-source-ref="$EXPECT_SOURCE_REF")
   fi
   if [ -n "$EXPECT_SOURCE_COMMIT" ]; then
     args+=(--expect-auto-domain-source-commit="$EXPECT_SOURCE_COMMIT")

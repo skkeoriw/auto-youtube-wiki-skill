@@ -122,6 +122,7 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertIn("--expect-runtime=youtube-wiki-168|youtube-wiki-168|https://youtube-wiki-168.chxyka.ccwu.cc\n", text)
             self.assertIn("--expect-runtime=youtube-wiki-222|youtube-wiki-222|https://youtube-wiki-222.chxyka.ccwu.cc\n", text)
             self.assertIn("--expect-auto-domain-source-mode=managed\n", text)
+            self.assertIn("--expect-auto-domain-source-ref=main\n", text)
             self.assertIn("--expect-auto-domain-source-commit=testcommit\n", text)
             self.assertEqual(text.count("--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc\n"), 4)
             self.assertIn("--expect-sop-type=runtime-provisioning\n", text)
@@ -195,6 +196,52 @@ class VerifyRuntimeFleetTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             text = args_file.read_text(encoding="utf-8")
             self.assertNotIn("--expect-sop-type=", text)
+
+    def test_source_commit_latest_resolves_git_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_repo = tmp_path / "auto-domain-cli"
+            subprocess.run(["git", "init", "-q", str(source_repo)], check=True)
+            subprocess.run(["git", "-C", str(source_repo), "checkout", "-q", "-b", "main"], check=True)
+            (source_repo / "README.md").write_text("auto-domain source\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source_repo), "add", "README.md"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source_repo),
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.local",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "init",
+                ],
+                check=True,
+            )
+            expected_commit = subprocess.check_output(
+                ["git", "-C", str(source_repo), "rev-parse", "--short", "HEAD"],
+                text=True,
+            ).strip()
+
+            verifier, args_file = self._fake_verifier(tmp_path)
+            result = self._run(
+                verifier,
+                args_file,
+                "--only=youtube-wiki-222",
+                f"--source-repo={source_repo}",
+                "--source-ref=main",
+                "--source-commit=latest",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"resolved auto-domain source latest: {source_repo}@main -> {expected_commit}", result.stdout)
+            text = args_file.read_text(encoding="utf-8")
+            self.assertIn(f"--expect-auto-domain-source-repo={source_repo}\n", text)
+            self.assertIn("--expect-auto-domain-source-ref=main\n", text)
+            self.assertIn(f"--expect-auto-domain-source-commit={expected_commit}\n", text)
 
     def test_no_sop_ui_skips_ui_discovery_verifier(self):
         with tempfile.TemporaryDirectory() as tmp:

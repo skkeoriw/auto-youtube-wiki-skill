@@ -10,6 +10,7 @@ EXPECT_PORT=""
 EXPECT_UI_URL=""
 EXPECT_AUTO_DOMAIN_SOURCE_MODE=""
 EXPECT_AUTO_DOMAIN_SOURCE_REPO=""
+EXPECT_AUTO_DOMAIN_SOURCE_REF=""
 EXPECT_AUTO_DOMAIN_SOURCE_COMMIT=""
 EXPECT_SOP_TYPES=()
 CHECK_OPTIONS=1
@@ -25,6 +26,7 @@ while [ "$#" -gt 0 ]; do
     --expect-ui-url=*) EXPECT_UI_URL="${1#--expect-ui-url=}"; shift ;;
     --expect-auto-domain-source-mode=*) EXPECT_AUTO_DOMAIN_SOURCE_MODE="${1#--expect-auto-domain-source-mode=}"; shift ;;
     --expect-auto-domain-source-repo=*) EXPECT_AUTO_DOMAIN_SOURCE_REPO="${1#--expect-auto-domain-source-repo=}"; shift ;;
+    --expect-auto-domain-source-ref=*) EXPECT_AUTO_DOMAIN_SOURCE_REF="${1#--expect-auto-domain-source-ref=}"; shift ;;
     --expect-auto-domain-source-commit=*) EXPECT_AUTO_DOMAIN_SOURCE_COMMIT="${1#--expect-auto-domain-source-commit=}"; shift ;;
     --expect-sop-type=*) EXPECT_SOP_TYPES+=("${1#--expect-sop-type=}"); shift ;;
     --no-options) CHECK_OPTIONS=0; shift ;;
@@ -40,6 +42,7 @@ Usage:
     [--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc] \
     [--expect-auto-domain-source-mode=managed] \
     [--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git] \
+    [--expect-auto-domain-source-ref=main] \
     [--expect-auto-domain-source-commit=8738556] \
     [--expect-sop-type=runtime-provisioning] \
     [--expect-sop-type=youtube-research-wiki]
@@ -62,7 +65,7 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; 
 EXPECT_SOP_TYPES_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EXPECT_SOP_TYPES[@]}")"
 
 python3 - "$NAME" "$ENDPOINT" "$TUNNEL_API" "$EXPECT_RUNTIME_ID" "$EXPECT_REPO" "$EXPECT_PORT" "$EXPECT_UI_URL" \
-  "$EXPECT_AUTO_DOMAIN_SOURCE_MODE" "$EXPECT_AUTO_DOMAIN_SOURCE_REPO" "$EXPECT_AUTO_DOMAIN_SOURCE_COMMIT" \
+  "$EXPECT_AUTO_DOMAIN_SOURCE_MODE" "$EXPECT_AUTO_DOMAIN_SOURCE_REPO" "$EXPECT_AUTO_DOMAIN_SOURCE_REF" "$EXPECT_AUTO_DOMAIN_SOURCE_COMMIT" \
   "$CHECK_OPTIONS" "$EXPECT_SOP_TYPES_JSON" <<'PY'
 import json
 import sys
@@ -81,6 +84,7 @@ import urllib.request
     expect_ui_url,
     expect_source_mode,
     expect_source_repo,
+    expect_source_ref,
     expect_source_commit,
     check_options,
     expect_sop_types_json,
@@ -206,13 +210,15 @@ if expect_sop_types:
         fail(f"{name} metadata.supported_sop_types missing: {', '.join(missing)}")
 
 source = metadata.get("auto_domain_source")
-if any((expect_source_mode, expect_source_repo, expect_source_commit)):
+if any((expect_source_mode, expect_source_repo, expect_source_ref, expect_source_commit)):
     if not isinstance(source, dict):
         fail(f"{name} metadata.auto_domain_source is missing")
     if expect_source_mode and source.get("mode") != expect_source_mode:
         fail(f"{name} metadata.auto_domain_source.mode={source.get('mode')!r}, expected {expect_source_mode}")
     if expect_source_repo and source.get("repo") != expect_source_repo:
         fail(f"{name} metadata.auto_domain_source.repo={source.get('repo')!r}, expected {expect_source_repo}")
+    if expect_source_ref and source.get("ref") != expect_source_ref:
+        fail(f"{name} metadata.auto_domain_source.ref={source.get('ref')!r}, expected {expect_source_ref}")
     if expect_source_commit and source.get("commit") != expect_source_commit:
         fail(f"{name} metadata.auto_domain_source.commit={source.get('commit')!r}, expected {expect_source_commit}")
 
@@ -238,9 +244,10 @@ print(f"[runtime-channel] local_port: {tunnel.get('local_port')}")
 if metadata.get("ui_url"):
     print(f"[runtime-channel] ui_url: {metadata.get('ui_url')}")
 if isinstance(source, dict):
+    ref_text = f" (ref {source.get('ref')})" if source.get("ref") else ""
     print(
         "[runtime-channel] auto_domain_source: "
-        f"{source.get('mode', '')} {source.get('repo', '')}@{source.get('commit', '')}"
+        f"{source.get('mode', '')} {source.get('repo', '')}@{source.get('commit', '')}{ref_text}"
     )
 if expect_sop_types:
     print(f"[runtime-channel] supported_sop_types: {', '.join(expect_sop_types)}")

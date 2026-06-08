@@ -130,6 +130,7 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
                 "--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc",
                 "--expect-auto-domain-source-mode=managed",
                 "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
+                "--expect-auto-domain-source-ref=main",
                 "--expect-auto-domain-source-commit=8738556",
                 "--expect-sop-type=runtime-provisioning",
                 "--expect-sop-type=youtube-research-wiki",
@@ -188,6 +189,28 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("metadata.auto_domain_source.commit", result.stderr)
+
+    def test_verify_runtime_channel_rejects_auto_domain_ref_mismatch(self):
+        server = self.run_server()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+
+        result = subprocess.run(
+            [
+                str(VERIFY_SCRIPT),
+                "--name=youtube-wiki-test",
+                f"--endpoint={endpoint}",
+                f"--tunnel-api={endpoint}",
+                "--expect-runtime-id=youtube-wiki-test",
+                "--expect-repo=skkeoriw/wiki-test",
+                "--expect-auto-domain-source-ref=release",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("metadata.auto_domain_source.ref", result.stderr)
 
     def test_verify_runtime_channel_rejects_ui_url_mismatch(self):
         server = self.run_server()
