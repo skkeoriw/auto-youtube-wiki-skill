@@ -44,7 +44,11 @@ DELETE_RUNTIME_NODES = [
     "resolve-runtime-target",
     "safety-check",
     "stop-runtime-services",
-    "disable-channel",
+    "unregister-channel",
+    "cleanup-runtime-services",
+    "cleanup-runtime-files",
+    "verify-local-clean",
+    "verify-channel-removed",
     "verify-runtime-removed",
 ]
 
