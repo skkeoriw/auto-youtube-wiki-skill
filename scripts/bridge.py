@@ -21,8 +21,13 @@ SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
 _RUN_INDEX_CLASS = None
 
+RUNTIME_MANAGEMENT_COMMON_NODES = [
+    "management-request-validate",
+    "action-router",
+]
+
 CREATE_RUNTIME_NODES = [
-    "parse-ssh-request",
+    "parse-create-runtime-request",
     "ssh-preflight",
     "infer-runtime-plan",
     "install-base-deps",
@@ -32,17 +37,23 @@ CREATE_RUNTIME_NODES = [
     "start-runtime-bridge",
     "register-channel",
     "verify-runtime-visible",
-    "runtime-provision-summary",
 ]
 
 DELETE_RUNTIME_NODES = [
-    "parse-runtime-delete-request",
+    "parse-delete-runtime-request",
     "resolve-runtime-target",
     "safety-check",
     "stop-runtime-services",
     "disable-channel",
     "verify-runtime-removed",
-    "delete-summary",
+]
+
+RUNTIME_MANAGEMENT_SUMMARY_NODE = "management-summary"
+RUNTIME_MANAGEMENT_NODES = [
+    *RUNTIME_MANAGEMENT_COMMON_NODES,
+    *CREATE_RUNTIME_NODES,
+    *DELETE_RUNTIME_NODES,
+    RUNTIME_MANAGEMENT_SUMMARY_NODE,
 ]
 
 SECRET_KEYS = {"password", "token", "secret", "credential", "private_key", "ssh_private_key", "private_key_content"}
@@ -428,12 +439,24 @@ def resolve_context_value(context, source):
     return value
 
 
+def run_dag_node_config(sop, pipeline_id, node_id):
+    snapshot = read_json(run_workspace(sop, pipeline_id) / "dag.json") or {}
+    nodes = snapshot.get("nodes") or []
+    if isinstance(nodes, dict):
+        item = nodes.get(node_id)
+        return dict(item or {}) if isinstance(item, dict) else None
+    for item in nodes if isinstance(nodes, list) else []:
+        if isinstance(item, dict) and item.get("id") == node_id:
+            return dict(item)
+    return None
+
+
 def node_runtime_detail(sop, pipeline_id, node_id):
     wiki = Path(sop["wiki_local_path"])
     workspace = run_workspace(sop, pipeline_id)
     node_file = workspace / "nodes" / f"{node_id}.json"
     state = read_json(node_file) or {}
-    config = (sop.get("nodes") or {}).get(node_id) or {}
+    config = (sop.get("nodes") or {}).get(node_id) or run_dag_node_config(sop, pipeline_id, node_id) or {}
     context = run_context(sop, pipeline_id)
 
     declared_inputs = normalized_contract(config.get("inputs", state.get("inputs", {})), "input")
@@ -514,6 +537,11 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         "pipeline_id": state.get("pipeline_id", pipeline_id),
         "node_id": state.get("node_id", node_id),
         "status": state.get("status", "waiting"),
+        "title": state.get("title") or config.get("title", node_id),
+        "purpose": state.get("purpose") or config.get("purpose", config.get("description", "")),
+        "branch": state.get("branch") or config.get("branch", ""),
+        "retryable": state.get("retryable", True),
+        "manual_fix_hint": state.get("manual_fix_hint", ""),
         "executor": config.get("executor") or {
             "type": "skill",
             "skill": config.get("skill", ""),
@@ -527,6 +555,7 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         "discovered_candidates": discovered_candidates,
         "capabilities": read_json(workspace / "nodes" / node_id / "capabilities.json") or {},
         "plan": read_json(workspace / "nodes" / node_id / "plan.json"),
+        "infra": config.get("infra", {}),
         "validation": {
             "status": validation_status,
             "missing_outputs": recorded_validation.get("missing_outputs", missing),
@@ -592,6 +621,8 @@ def node_static_config(sop, node_id):
     return {
         "node_id": node_id,
         "title": config.get("title", node_id),
+        "purpose": config.get("purpose", config.get("description", "")),
+        "branch": config.get("branch", ""),
         "mode": config.get("mode", "blocking"),
         "needs": config.get("needs") or [],
         "executor": {
@@ -609,7 +640,8 @@ def node_static_config(sop, node_id):
         "skill_script": skill_script,
         "skill_readme": skill_readme,
         "manifest": manifest,
-        "ui": manifest.get("ui") if isinstance(manifest.get("ui"), dict) else {},
+        "ui": config.get("ui") if isinstance(config.get("ui"), dict) else manifest.get("ui") if isinstance(manifest.get("ui"), dict) else {},
+        "retryable": config.get("retryable", True),
     }
 
 
@@ -728,7 +760,10 @@ def node_registry_item(sop, node_id, endpoint=""):
     manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
     return {
         **static,
-        "description": manifest.get("description", ""),
+        "description": static.get("purpose") or manifest.get("description", ""),
+        "purpose": static.get("purpose", ""),
+        "branch": static.get("branch", ""),
+        "retryable": static.get("retryable", True),
         "case": classify_node(node_id, config, static),
         "skill": {
             "id": (static.get("executor") or {}).get("skill", ""),
@@ -1596,6 +1631,8 @@ def sop_dag(sop):
         nodes.append({
             "id": node_id,
             "title": node.get("title", node_id),
+            "purpose": node.get("purpose", static.get("purpose", "")),
+            "branch": node.get("branch", static.get("branch", "")),
             "mode": node.get("mode", "blocking"),
             "webhook_route": node.get("webhook_route", node.get("route", "")),
             "needs": node.get("needs") or [],
@@ -1775,6 +1812,16 @@ def normalized_run_dag(sop, pipeline_id):
     return {**snapshot, "nodes": nodes, "edges": edges}
 
 
+def run_node_ids(sop, pipeline_id):
+    dag = normalized_run_dag(sop, pipeline_id)
+    if dag:
+        return {str(node.get("id", "")) for node in dag.get("nodes", []) if node.get("id")}
+    run = read_json(run_workspace(sop, pipeline_id) / "run.json") or {}
+    if isinstance(run.get("nodes"), dict):
+        return set(run["nodes"].keys())
+    return set((sop.get("nodes") or {}).keys())
+
+
 def run_artifact_candidates(sop, pipeline_id):
     candidates = []
     seen = set()
@@ -1788,7 +1835,13 @@ def run_artifact_candidates(sop, pipeline_id):
 
 
 def runtime_management_nodes(action):
-    return DELETE_RUNTIME_NODES if action == "delete-runtime" else CREATE_RUNTIME_NODES
+    return RUNTIME_MANAGEMENT_NODES
+
+
+def runtime_management_active_nodes(action):
+    if action == "delete-runtime":
+        return {*RUNTIME_MANAGEMENT_COMMON_NODES, *DELETE_RUNTIME_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
+    return {*RUNTIME_MANAGEMENT_COMMON_NODES, *CREATE_RUNTIME_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
 
 
 def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
@@ -1796,7 +1849,35 @@ def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
     run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
     now = _now_iso_utc()
     nodes = runtime_management_nodes(action)
-    node_status = {node: "waiting" for node in nodes}
+    active_nodes = runtime_management_active_nodes(action)
+    node_status = {node: ("waiting" if node in active_nodes else "skipped") for node in nodes}
+    dag = sop_dag(sop)
+    if not dag.get("nodes"):
+        dag = {
+            "sop_id": "runtime-management",
+            "nodes": [{
+                "id": node,
+                "title": node.replace("-", " ").title(),
+                "mode": "blocking",
+                "needs": [] if node == RUNTIME_MANAGEMENT_COMMON_NODES[0] else (
+                    ["management-request-validate"] if node == "action-router"
+                    else ["action-router"] if node in {CREATE_RUNTIME_NODES[0], DELETE_RUNTIME_NODES[0]}
+                    else [CREATE_RUNTIME_NODES[CREATE_RUNTIME_NODES.index(node) - 1]] if node in CREATE_RUNTIME_NODES
+                    else [DELETE_RUNTIME_NODES[DELETE_RUNTIME_NODES.index(node) - 1]] if node in DELETE_RUNTIME_NODES
+                    else [CREATE_RUNTIME_NODES[-1], DELETE_RUNTIME_NODES[-1]]
+                ),
+                "executor": {"type": "skill", "skill": "sop-runtime-provisioning", "webhook_route": "sop-runtime-provisioning"},
+                "inputs": {},
+                "outputs": {"report": f"raw/provision/{pipeline_id}/{node}.json"},
+                "ui": {"category": "runtime-management", "icon": "server"},
+            } for node in nodes],
+            "edges": [],
+        }
+        dag["edges"] = [
+            {"source": need, "target": node["id"]}
+            for node in dag["nodes"]
+            for need in node.get("needs", [])
+        ]
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "nodes").mkdir(exist_ok=True)
     write_json(run_dir / "context.json", {
@@ -1805,43 +1886,38 @@ def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
         "provision_request": mask_data(body),
     })
     write_json(run_dir / "dag.json", {
+        **dag,
         "sop_id": "runtime-management",
-        "workflow_id": action,
-        "nodes": [{
-            "id": node,
-            "title": node.replace("-", " ").title(),
-            "mode": "blocking",
-            "needs": [] if idx == 0 else [nodes[idx - 1]],
-            "executor": {
-                "type": "skill",
-                "skill": "sop-runtime-provisioning",
-                "webhook_route": "sop-runtime-provisioning",
-            },
-            "inputs": {},
-            "outputs": {"report": f"raw/provision/{pipeline_id}/{node}.json"},
-            "ui": {"category": "runtime", "icon": "server"},
-        } for idx, node in enumerate(nodes)],
-        "edges": [{"source": nodes[idx - 1], "target": node} for idx, node in enumerate(nodes) if idx > 0],
+        "workflow_id": "runtime-management",
+        "selected_action": action,
     })
-    for idx, node in enumerate(nodes):
+    dag_nodes = {node.get("id"): node for node in dag.get("nodes", [])}
+    for node in nodes:
+        config = dag_nodes.get(node, {})
+        status = node_status[node]
         write_json(run_dir / "nodes" / f"{node}.json", {
             "pipeline_id": pipeline_id,
             "node_id": node,
             "run_id": f"provision-{pipeline_id}",
-            "status": "waiting",
+            "status": status,
             "mode": "blocking",
-            "needs": [] if idx == 0 else [nodes[idx - 1]],
+            "needs": config.get("needs") or [],
+            "title": config.get("title", node),
+            "purpose": config.get("purpose", ""),
+            "branch": config.get("branch", ""),
+            "executor": config.get("executor") or {},
+            "retryable": status != "skipped",
             "started_at": "",
             "finished_at": "",
             "duration_s": 0,
             "attempt": 0,
-            "progress": 0,
-            "declared_inputs": {},
+            "progress": 100 if status == "skipped" else 0,
+            "declared_inputs": config.get("inputs") or {},
             "resolved_inputs": {},
-            "declared_outputs": {},
+            "declared_outputs": config.get("outputs") or {},
             "actual_outputs": {},
             "artifacts": [],
-            "validation": {"status": "pending", "missing_outputs": [], "unexpected_outputs": []},
+            "validation": {"status": "skipped" if status == "skipped" else "pending", "missing_outputs": [], "unexpected_outputs": []},
             "error": "",
             "updated_at": now,
         })
@@ -1849,7 +1925,7 @@ def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
         "pipeline_id": pipeline_id,
         "execution_id": pipeline_id,
         "sop_id": "runtime-management",
-        "workflow_id": action,
+        "workflow_id": "runtime-management",
         "repo": sop.get("repo", ""),
         "status": "running",
         "source_type": action,
@@ -2225,6 +2301,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         execution_summary(sop, payload) if payload else {"detail": "Execution not found"},
                     )
                 if len(path) == 8 and path[4] == "executions" and path[6] == "nodes":
+                    if path[7] not in run_node_ids(sop, path[5]):
+                        return json_response(self, 404, {
+                            "detail": f"Node {path[7]!r} is not part of execution {path[5]!r}"
+                        })
                     data = node_runtime_detail(sop, path[5], path[7])
                     data["execution_id"] = data.get("pipeline_id", path[5])
                     data["instance_id"] = sop.get("instance_id") or sop.get("id", "")
@@ -2296,9 +2376,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(path) == 7 and path[3] == "runs" and path[5] == "events" and path[6] == "stream":
                     return self.stream_run_events(sop, path[4])
                 if len(path) == 7 and path[3] == "runs" and path[5] == "nodes":
+                    if path[6] not in run_node_ids(sop, path[4]):
+                        return json_response(self, 404, {
+                            "detail": f"Node {path[6]!r} is not part of run {path[4]!r}"
+                        })
                     data = node_runtime_detail(sop, path[4], path[6])
                     return json_response(self, 200, data)
                 if len(path) == 8 and path[3] == "runs" and path[5] == "nodes":
+                    if path[6] not in run_node_ids(sop, path[4]):
+                        return json_response(self, 404, {
+                            "detail": f"Node {path[6]!r} is not part of run {path[4]!r}"
+                        })
                     data = node_runtime_detail(sop, path[4], path[6])
                     section = path[7]
                     if section == "modules":
@@ -2344,6 +2432,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "detail": "Node plan not found"
                         })
                 if len(path) == 9 and path[3] == "runs" and path[5] == "nodes" and path[7] == "modules":
+                    if path[6] not in run_node_ids(sop, path[4]):
+                        return json_response(self, 404, {
+                            "detail": f"Node {path[6]!r} is not part of run {path[4]!r}"
+                        })
                     endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
                     data = node_module_detail(sop, path[6], path[8], endpoint, path[4])
                     return json_response(self, 200 if data else 404, data or {
@@ -2351,6 +2443,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     })
                 if len(path) == 7 and path[3] == "runs" and path[5] == "logs":
                     node_id_log = path[6]
+                    if node_id_log not in run_node_ids(sop, path[4]):
+                        return json_response(self, 404, {
+                            "detail": f"Node {node_id_log!r} is not part of run {path[4]!r}"
+                        })
                     node_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / path[4] / "nodes" / f"{node_id_log}.json"
                     node = read_json(node_file) or {}
                     log_file = Path(sop["wiki_local_path"]) / "logs" / "stage-events" / f"{node.get('run_id', '')}.jsonl"

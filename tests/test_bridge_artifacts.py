@@ -360,6 +360,13 @@ class ArtifactResolutionTest(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/executions/pipe-1", timeout=3) as response:
                 execution = json.loads(response.read())
             self.assertEqual(execution["execution_id"], "pipe-1")
+            with urllib.request.urlopen(f"{base}/executions/pipe-1/nodes/wiki-build", timeout=3) as response:
+                node = json.loads(response.read())
+            self.assertEqual(node["execution_id"], "pipe-1")
+            self.assertEqual(node["instance_id"], "test")
+            with self.assertRaises(urllib.error.HTTPError) as missing_node:
+                urllib.request.urlopen(f"{base}/executions/pipe-1/nodes/not-in-run", timeout=3)
+            self.assertEqual(missing_node.exception.code, 404)
         server.shutdown()
         server.server_close()
 
@@ -427,9 +434,18 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertNotIn("secret-test-key", context_text)
         run = json.loads((self.wiki / "raw/pipeline-runs/create-runtime-test/run.json").read_text())
         self.assertEqual(run["sop_id"], "runtime-management")
-        self.assertEqual(run["workflow_id"], "create-runtime")
+        self.assertEqual(run["workflow_id"], "runtime-management")
+        self.assertEqual(run["nodes"]["parse-create-runtime-request"], "waiting")
+        self.assertEqual(run["nodes"]["parse-delete-runtime-request"], "skipped")
         dag = json.loads((self.wiki / "raw/pipeline-runs/create-runtime-test/dag.json").read_text())
-        self.assertIn("parse-ssh-request", [node["id"] for node in dag["nodes"]])
+        node_ids = [node["id"] for node in dag["nodes"]]
+        self.assertIn("action-router", node_ids)
+        self.assertIn("parse-create-runtime-request", node_ids)
+        self.assertIn("parse-delete-runtime-request", node_ids)
+        self.assertIn("management-summary", node_ids)
+        skipped_state = json.loads((self.wiki / "raw/pipeline-runs/create-runtime-test/nodes/parse-delete-runtime-request.json").read_text())
+        self.assertEqual(skipped_state["status"], "skipped")
+        self.assertEqual(skipped_state["progress"], 100)
 
     def test_run_routes_prefer_runtime_index(self):
         run_file = self.wiki / "raw/pipeline-runs/pipe-1/run.json"
