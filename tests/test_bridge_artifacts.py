@@ -230,6 +230,31 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(merged["SOP_UI_URL"], "https://sop-ui.example")
         self.assertIn("CLOUDFLARE_API_KEY", merged["_management_config_injected"])
 
+    def test_runtime_management_config_injects_target_ssh_defaults(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path):
+            changed = bridge.save_runtime_management_config({
+                "RUNTIME_TARGET_SSH_COMMAND": "ssh -i ~/.ssh/id_ed25519 user@34.29.222.183",
+                "RUNTIME_TARGET_PRIVATE_KEY": "target-private-key",
+                "RUNTIME_TARGET_RUNTIME_ID": "runtime-34-29-222-183",
+            })
+            preview = bridge.runtime_management_config_preview(sop)
+            merged = bridge.inject_runtime_management_config({"action": "delete-runtime"})
+
+        by_key = {item["key"]: item for item in preview["items"]}
+        self.assertEqual(sorted(changed.keys()), [
+            "RUNTIME_TARGET_PRIVATE_KEY",
+            "RUNTIME_TARGET_RUNTIME_ID",
+            "RUNTIME_TARGET_SSH_COMMAND",
+        ])
+        self.assertEqual(by_key["RUNTIME_TARGET_SSH_COMMAND"]["source"], "management_config")
+        self.assertTrue(by_key["RUNTIME_TARGET_PRIVATE_KEY"]["secret"])
+        self.assertEqual(merged["ssh_command"], "ssh -i ~/.ssh/id_ed25519 user@34.29.222.183")
+        self.assertEqual(merged["private_key"], "target-private-key")
+        self.assertEqual(merged["runtime_id"], "runtime-34-29-222-183")
+        self.assertIn("ssh_command", merged["_management_config_injected"])
+
     def test_runtime_management_config_initializes_from_current_runtime(self):
         env_file = self.wiki / ".agent-brain-plugins.env"
         env_file.write_text(

@@ -97,6 +97,13 @@ RUNTIME_CAPABILITY_ENV = {
     "TUNNEL_API": ["tunnel_api_url"],
     "SOP_UI_URL": ["sop_ui_url"],
 }
+RUNTIME_MANAGEMENT_REQUEST_DEFAULTS = {
+    "RUNTIME_TARGET_SSH_COMMAND": ["ssh_command"],
+    "RUNTIME_TARGET_PRIVATE_KEY": ["private_key", "ssh_private_key", "ssh_private_key_content"],
+    "RUNTIME_TARGET_PRIVATE_KEY_B64": ["private_key_b64", "ssh_private_key_b64"],
+    "RUNTIME_TARGET_RUNTIME_ID": ["runtime_id"],
+    "RUNTIME_TARGET_CHANNEL_URL": ["channel_url"],
+}
 RUNTIME_REQUIRED_ENV = {
     "GITHUB_TOKEN",
     "DEEPSEEK_API_KEY",
@@ -104,6 +111,11 @@ RUNTIME_REQUIRED_ENV = {
     "NOTEBOOKLM_BRIDGE_TOKEN",
     "CLOUDFLARE_API_KEY",
     "CF_API_KEY",
+}
+RUNTIME_MANAGEMENT_REQUIRED_DEFAULTS = {
+    "RUNTIME_TARGET_SSH_COMMAND",
+    "RUNTIME_TARGET_PRIVATE_KEY",
+    "RUNTIME_TARGET_PRIVATE_KEY_B64",
 }
 RUNTIME_CONFIG_CATEGORIES = {
     "GITHUB_TOKEN": "github",
@@ -136,6 +148,11 @@ RUNTIME_CONFIG_CATEGORIES = {
     "CF_API_KEY": "cloudflare",
     "TUNNEL_API": "cloudflare",
     "SOP_UI_URL": "runtime",
+    "RUNTIME_TARGET_SSH_COMMAND": "target",
+    "RUNTIME_TARGET_PRIVATE_KEY": "target",
+    "RUNTIME_TARGET_PRIVATE_KEY_B64": "target",
+    "RUNTIME_TARGET_RUNTIME_ID": "target",
+    "RUNTIME_TARGET_CHANNEL_URL": "target",
 }
 
 
@@ -267,7 +284,7 @@ def runtime_config_inheritance_preview(sop):
     env_file_values = read_env_file_values(env_file)
     management_values = read_runtime_management_config_values()
     items = []
-    for key, aliases in RUNTIME_CAPABILITY_ENV.items():
+    for key, aliases in {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}.items():
         source = "missing"
         raw_value = ""
         matched_key = ""
@@ -300,7 +317,7 @@ def runtime_config_inheritance_preview(sop):
             "present": bool(raw_value),
             "masked_value": display_config_value(key, raw_value),
             "secret": is_secret_key(key),
-            "required": key in RUNTIME_REQUIRED_ENV,
+            "required": key in RUNTIME_REQUIRED_ENV or key in RUNTIME_MANAGEMENT_REQUIRED_DEFAULTS,
             "category": RUNTIME_CONFIG_CATEGORIES.get(key, "runtime"),
         })
     return {
@@ -332,7 +349,7 @@ def runtime_management_config_preview(sop):
     data = read_runtime_management_config()
     values = data.get("values", {})
     items = []
-    for key, aliases in RUNTIME_CAPABILITY_ENV.items():
+    for key, aliases in {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}.items():
         matched_key = next((candidate for candidate in [key, *aliases] if values.get(candidate)), "")
         raw_value = values.get(matched_key, "") if matched_key else ""
         items.append({
@@ -343,7 +360,7 @@ def runtime_management_config_preview(sop):
             "present": bool(raw_value),
             "masked_value": display_config_value(key, raw_value),
             "secret": is_secret_key(key),
-            "required": key in RUNTIME_REQUIRED_ENV,
+            "required": key in RUNTIME_REQUIRED_ENV or key in RUNTIME_MANAGEMENT_REQUIRED_DEFAULTS,
             "category": RUNTIME_CONFIG_CATEGORIES.get(key, "runtime"),
         })
     return {
@@ -372,8 +389,9 @@ def is_runtime_management_authorized(handler):
 
 def save_runtime_management_config(values):
     current = read_runtime_management_config_values()
-    allowed_keys = {key for key in RUNTIME_CAPABILITY_ENV}
-    for aliases in RUNTIME_CAPABILITY_ENV.values():
+    config_sources = {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}
+    allowed_keys = {key for key in config_sources}
+    for aliases in config_sources.values():
         allowed_keys.update(aliases)
     changed = {}
     for key, value in (values or {}).items():
@@ -394,7 +412,7 @@ def current_runtime_inheritable_values(overwrite=False):
     env_file_values = read_env_file_values(env_file)
     current = read_runtime_management_config_values()
     values = {}
-    for key, aliases in RUNTIME_CAPABILITY_ENV.items():
+    for key, aliases in {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}.items():
         if not overwrite and any(current.get(candidate) for candidate in [key, *aliases]):
             continue
         candidate_keys = [key, *aliases]
@@ -442,6 +460,15 @@ def inject_runtime_management_config(body):
             if value:
                 merged[env_key] = value
                 injected.append(env_key)
+                break
+    for default_key, request_keys in RUNTIME_MANAGEMENT_REQUEST_DEFAULTS.items():
+        if any(merged.get(candidate) not in {None, ""} for candidate in request_keys):
+            continue
+        for candidate in [default_key, *request_keys]:
+            value = values.get(candidate)
+            if value:
+                merged[request_keys[0]] = value
+                injected.append(request_keys[0])
                 break
     if injected:
         merged["_management_config_injected"] = sorted(set(injected))
