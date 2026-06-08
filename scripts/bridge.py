@@ -1987,6 +1987,8 @@ def trigger_runtime_management(sop, body):
         "--request-file",
         str(request_file),
     ]
+    if body.get("dry_run"):
+        command.append("--dry-run")
     with open(log_file, "ab") as stream:
         subprocess.Popen(command, env=env, stdout=stream, stderr=subprocess.STDOUT, close_fds=True)
     return 202, {

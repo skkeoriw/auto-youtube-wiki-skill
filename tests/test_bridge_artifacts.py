@@ -419,12 +419,14 @@ class ArtifactResolutionTest(unittest.TestCase):
                     "ssh_command": "ssh -i ~/.ssh/id_ed25519 user@34.29.222.183",
                     "private_key": "secret-test-key",
                     "github_token": "secret-token",
+                    "dry_run": True,
                     "pipeline_id": "create-runtime-test",
                 })
 
         self.assertEqual(status, 202)
         self.assertEqual(result["pipeline_id"], "create-runtime-test")
         popen.assert_called_once()
+        self.assertIn("--dry-run", popen.call_args.args[0])
         request_file = self.wiki / ".sop/secrets/create-runtime-test/request.json"
         self.assertTrue(request_file.exists())
         self.assertEqual(oct(request_file.stat().st_mode & 0o777), "0o600")
