@@ -176,9 +176,9 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
             "RUNTIME_ID=youtube-wiki-test",
             "UI_URL=https://sop-ui-prototype.example.com",
             "AUTO_DOMAIN_SOURCE_MODE=managed",
-            "AUTO_DOMAIN_SOURCE_REPO=https://github.com/skkeoriw/auto-domain-cli.git",
+            "AUTO_DOMAIN_SOURCE_REPO=https://github.com/ChangfengHU/auto-domain-cli.git",
             "AUTO_DOMAIN_SOURCE_REF=main",
-            "AUTO_DOMAIN_SOURCE_COMMIT=8738556",
+            "AUTO_DOMAIN_SOURCE_COMMIT=1d4d9aa",
             fn,
             "build_metadata",
         ])
@@ -191,9 +191,9 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
         self.assertEqual(metadata["supported_sop_types"], ["runtime-provisioning", "youtube-research-wiki"])
         self.assertEqual(metadata["auto_domain_source"], {
             "mode": "managed",
-            "repo": "https://github.com/skkeoriw/auto-domain-cli.git",
+            "repo": "https://github.com/ChangfengHU/auto-domain-cli.git",
             "ref": "main",
-            "commit": "8738556",
+            "commit": "1d4d9aa",
         })
 
     def test_verify_runtime_channel_invokes_public_verifier_with_contract(self):
@@ -223,8 +223,8 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
                 "PORT=18121",
                 "UI_URL=https://sop-ui-prototype.example.com",
                 "AUTO_DOMAIN_SOURCE_MODE=managed",
-                "AUTO_DOMAIN_SOURCE_REPO=https://github.com/skkeoriw/auto-domain-cli.git",
-                "AUTO_DOMAIN_SOURCE_COMMIT=8738556",
+                "AUTO_DOMAIN_SOURCE_REPO=https://github.com/ChangfengHU/auto-domain-cli.git",
+                "AUTO_DOMAIN_SOURCE_COMMIT=1d4d9aa",
                 fn,
                 "verify_runtime_channel",
             ])
@@ -240,8 +240,8 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
                 "--expect-ui-url=https://sop-ui-prototype.example.com",
                 "--expect-port=18121",
                 "--expect-auto-domain-source-mode=managed",
-                "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
-                "--expect-auto-domain-source-commit=8738556",
+                "--expect-auto-domain-source-repo=https://github.com/ChangfengHU/auto-domain-cli.git",
+                "--expect-auto-domain-source-commit=1d4d9aa",
             ])
 
 

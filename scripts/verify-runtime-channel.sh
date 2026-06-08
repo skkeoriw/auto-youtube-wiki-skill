@@ -41,9 +41,9 @@ Usage:
     [--expect-port=18121] \
     [--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc] \
     [--expect-auto-domain-source-mode=managed] \
-    [--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git] \
+    [--expect-auto-domain-source-repo=https://github.com/ChangfengHU/auto-domain-cli.git] \
     [--expect-auto-domain-source-ref=main] \
-    [--expect-auto-domain-source-commit=8738556] \
+    [--expect-auto-domain-source-commit=1d4d9aa] \
     [--expect-sop-type=runtime-provisioning] \
     [--expect-sop-type=youtube-research-wiki]
 

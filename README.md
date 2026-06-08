@@ -66,7 +66,7 @@ Skill/CLI 命令以 JSON metadata 写入 tunnel-admin。
 Runtime 通道注册默认使用受控的 managed auto-domain 源码：
 
 ```text
-https://github.com/skkeoriw/auto-domain-cli.git#main
+https://github.com/ChangfengHU/auto-domain-cli.git#main
 ```
 
 `setup-service.sh` 每次创建 tunnel 前都会同步该源码缓存。如果缓存目录不是

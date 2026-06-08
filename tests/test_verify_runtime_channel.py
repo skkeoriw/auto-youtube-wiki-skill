@@ -26,9 +26,9 @@ class RuntimeChannelHandler(BaseHTTPRequestHandler):
         "supported_sop_types": ["runtime-provisioning", "youtube-research-wiki"],
         "auto_domain_source": {
             "mode": "managed",
-            "repo": "https://github.com/skkeoriw/auto-domain-cli.git",
+            "repo": "https://github.com/ChangfengHU/auto-domain-cli.git",
             "ref": "main",
-            "commit": "8738556",
+            "commit": "1d4d9aa",
         },
     }
     metadata_override = None
@@ -129,9 +129,9 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
                 "--expect-port=18121",
                 "--expect-ui-url=https://sop-ui-prototype.chxyka.ccwu.cc",
                 "--expect-auto-domain-source-mode=managed",
-                "--expect-auto-domain-source-repo=https://github.com/skkeoriw/auto-domain-cli.git",
+                "--expect-auto-domain-source-repo=https://github.com/ChangfengHU/auto-domain-cli.git",
                 "--expect-auto-domain-source-ref=main",
-                "--expect-auto-domain-source-commit=8738556",
+                "--expect-auto-domain-source-commit=1d4d9aa",
                 "--expect-sop-type=runtime-provisioning",
                 "--expect-sop-type=youtube-research-wiki",
             ],
@@ -144,7 +144,7 @@ class VerifyRuntimeChannelTest(unittest.TestCase):
         self.assertIn("[runtime-channel] ok: youtube-wiki-test", result.stdout)
         self.assertIn("repo: skkeoriw/wiki-test", result.stdout)
         self.assertIn("ui_url: https://sop-ui-prototype.chxyka.ccwu.cc", result.stdout)
-        self.assertIn("auto_domain_source: managed https://github.com/skkeoriw/auto-domain-cli.git@8738556", result.stdout)
+        self.assertIn("auto_domain_source: managed https://github.com/ChangfengHU/auto-domain-cli.git@1d4d9aa", result.stdout)
         self.assertIn("supported_sop_types: runtime-provisioning, youtube-research-wiki", result.stdout)
 
     def test_verify_runtime_channel_rejects_truncated_metadata(self):
