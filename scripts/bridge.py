@@ -16,6 +16,10 @@ import yaml
 PORT = int(os.environ.get("BRIDGE_PORT", "18789"))
 SCRIPT = os.environ.get("BRIDGE_SCRIPT", "")
 REGISTRY_PATH = Path(os.environ.get("SOP_REGISTRY_PATH", str(Path.home() / ".sop" / "registry.json"))).expanduser()
+RUNTIME_MANAGEMENT_CONFIG_PATH = Path(os.environ.get(
+    "SOP_RUNTIME_MANAGEMENT_CONFIG_PATH",
+    str(Path.home() / ".sop" / "runtime-management" / "config.json"),
+)).expanduser()
 SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5"))
 SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
@@ -261,6 +265,7 @@ def runtime_config_group_status(items):
 def runtime_config_inheritance_preview(sop):
     env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
     env_file_values = read_env_file_values(env_file)
+    management_values = read_runtime_management_config_values()
     items = []
     for key, aliases in RUNTIME_CAPABILITY_ENV.items():
         source = "missing"
@@ -273,6 +278,13 @@ def runtime_config_inheritance_preview(sop):
                 raw_value = os.environ.get(candidate, "")
                 matched_key = candidate
                 break
+        if not raw_value:
+            for candidate in candidate_keys:
+                if candidate in management_values and management_values.get(candidate, "") != "":
+                    source = "management_config"
+                    raw_value = management_values.get(candidate, "")
+                    matched_key = candidate
+                    break
         if not raw_value:
             for candidate in candidate_keys:
                 if candidate in env_file_values and env_file_values.get(candidate, "") != "":
@@ -299,6 +311,111 @@ def runtime_config_inheritance_preview(sop):
         "note": "Secret-like values are masked; field names, source and presence are always shown.",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def read_runtime_management_config():
+    data = read_json(RUNTIME_MANAGEMENT_CONFIG_PATH)
+    if not isinstance(data, dict):
+        return {"values": {}, "updated_at": ""}
+    values = data.get("values") if isinstance(data.get("values"), dict) else {}
+    return {
+        "values": {str(k): str(v) for k, v in values.items() if v not in {None, ""}},
+        "updated_at": str(data.get("updated_at") or ""),
+    }
+
+
+def read_runtime_management_config_values():
+    return read_runtime_management_config().get("values", {})
+
+
+def runtime_management_config_preview(sop):
+    data = read_runtime_management_config()
+    values = data.get("values", {})
+    items = []
+    for key, aliases in RUNTIME_CAPABILITY_ENV.items():
+        matched_key = next((candidate for candidate in [key, *aliases] if values.get(candidate)), "")
+        raw_value = values.get(matched_key, "") if matched_key else ""
+        items.append({
+            "key": key,
+            "aliases": aliases,
+            "matched_key": matched_key,
+            "source": "management_config" if raw_value else "missing",
+            "present": bool(raw_value),
+            "masked_value": display_config_value(key, raw_value),
+            "secret": is_secret_key(key),
+            "required": key in RUNTIME_REQUIRED_ENV,
+            "category": RUNTIME_CONFIG_CATEGORIES.get(key, "runtime"),
+        })
+    return {
+        "instance_id": sop.get("instance_id") or sop.get("id", "runtime-management"),
+        "config_path": str(RUNTIME_MANAGEMENT_CONFIG_PATH),
+        "items": items,
+        "groups": runtime_config_group_status(items),
+        "updated_at": data.get("updated_at", ""),
+        "note": "Raw saved values are never returned by this API.",
+    }
+
+
+def runtime_management_auth_token():
+    return os.environ.get("SOP_MANAGEMENT_TOKEN") or os.environ.get("HERMES_WEBHOOK_TOKEN") or ""
+
+
+def is_runtime_management_authorized(handler):
+    expected = runtime_management_auth_token()
+    if not expected:
+        return False
+    header = handler.headers.get("Authorization", "")
+    if header.lower().startswith("bearer "):
+        return header.split(" ", 1)[1].strip() == expected
+    return False
+
+
+def save_runtime_management_config(values):
+    current = read_runtime_management_config_values()
+    allowed_keys = {key for key in RUNTIME_CAPABILITY_ENV}
+    for aliases in RUNTIME_CAPABILITY_ENV.values():
+        allowed_keys.update(aliases)
+    changed = {}
+    for key, value in (values or {}).items():
+        normalized_key = str(key).strip()
+        if normalized_key not in allowed_keys:
+            continue
+        text = str(value).strip()
+        if text:
+            current[normalized_key] = text
+            changed[normalized_key] = text
+    payload = {"values": current, "updated_at": datetime.now(timezone.utc).isoformat()}
+    write_json(RUNTIME_MANAGEMENT_CONFIG_PATH, payload, mode=0o600)
+    return changed
+
+
+def request_has_runtime_config(body, env_key, aliases):
+    for key in [env_key, env_key.lower(), *aliases]:
+        if body.get(key) not in {None, ""}:
+            return True
+    return False
+
+
+def inject_runtime_management_config(body):
+    values = read_runtime_management_config_values()
+    if not values:
+        return body
+    merged = {**body}
+    injected = []
+    for env_key, aliases in RUNTIME_CAPABILITY_ENV.items():
+        if request_has_runtime_config(merged, env_key, aliases):
+            continue
+        if os.environ.get(env_key):
+            continue
+        for candidate in [env_key, *aliases]:
+            value = values.get(candidate)
+            if value:
+                merged[env_key] = value
+                injected.append(env_key)
+                break
+    if injected:
+        merged["_management_config_injected"] = sorted(set(injected))
+    return merged
 
 
 def run_workspace(sop, pipeline_id):
@@ -2115,6 +2232,7 @@ def trigger_runtime_management(sop, body):
     action = str(body.get("management_action") or body.get("action") or "create-runtime")
     if action not in {"create-runtime", "delete-runtime"}:
         return 400, {"status": "error", "message": "action must be create-runtime or delete-runtime"}
+    body = inject_runtime_management_config(body)
     now_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     pipeline_id = str(body.get("pipeline_id") or f"{action}-{now_token}")
     wiki = Path(sop["wiki_local_path"])
@@ -2484,6 +2602,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
                         return json_response(self, 404, {"detail": "Runtime inheritance preview is only available for runtime-management"})
                     return json_response(self, 200, runtime_config_inheritance_preview(sop))
+                if len(path) == 5 and path[3] == "config" and path[4] == "management":
+                    if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
+                        return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
+                    return json_response(self, 200, runtime_management_config_preview(sop))
                 if len(path) == 4 and path[3] == "dag":
                     return json_response(self, 200, sop_dag(sop))
                 if len(path) == 4 and path[3] == "runs":
@@ -2751,6 +2873,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = {}
 
         path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+
+        # POST /api/sop/{instance}/config/management  → save server-side runtime management defaults
+        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "config" and path[4] == "management":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
+                return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
+            if not is_runtime_management_authorized(self):
+                return json_response(self, 401, {"detail": "Management token is required"})
+            values = data.get("values") if isinstance(data.get("values"), dict) else data
+            changed = save_runtime_management_config(values)
+            return json_response(self, 200, {
+                "status": "saved",
+                "changed_keys": sorted(changed.keys()),
+                "config": runtime_management_config_preview(sop),
+            })
 
         # POST /api/sop/{instance}/runs  → trigger
         if len(path) == 4 and path[:2] == ["api", "sop"] and path[3] == "runs":

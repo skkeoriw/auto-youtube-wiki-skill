@@ -207,6 +207,29 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(by_key["WIKI_VERTEX_MODEL"]["masked_value"], "gemini-1.5-pro")
         self.assertEqual(by_key["SOP_UI_URL"]["source"], "missing")
 
+    def test_runtime_management_config_is_inherited_and_injected(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path), patch.dict(os.environ, {
+            "CLOUDFLARE_API_KEY": "",
+            "SOP_UI_URL": "",
+        }, clear=False):
+            changed = bridge.save_runtime_management_config({
+                "CLOUDFLARE_API_KEY": "cloudflare-secret-value",
+                "SOP_UI_URL": "https://sop-ui.example",
+            })
+            preview = bridge.runtime_config_inheritance_preview(sop)
+            merged = bridge.inject_runtime_management_config({"action": "create-runtime"})
+
+        by_key = {item["key"]: item for item in preview["items"]}
+        self.assertEqual(sorted(changed.keys()), ["CLOUDFLARE_API_KEY", "SOP_UI_URL"])
+        self.assertEqual(by_key["CLOUDFLARE_API_KEY"]["source"], "management_config")
+        self.assertEqual(by_key["CLOUDFLARE_API_KEY"]["masked_value"], "clo***lue")
+        self.assertEqual(by_key["SOP_UI_URL"]["masked_value"], "https://sop-ui.example")
+        self.assertEqual(merged["CLOUDFLARE_API_KEY"], "cloudflare-secret-value")
+        self.assertEqual(merged["SOP_UI_URL"], "https://sop-ui.example")
+        self.assertIn("CLOUDFLARE_API_KEY", merged["_management_config_injected"])
+
     def test_indexed_artifact_preview_is_backfilled(self):
         artifact = {
             "id": "indexed-1",
