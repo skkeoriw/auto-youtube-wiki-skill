@@ -45,6 +45,7 @@ Options:
   --sop-ui-url=https://...            SOP UI URL
   --repo-version-check                check remote Runtime repo versions through SSH
   --repo-target=name|user|host|key    runtime repo SSH target; can be repeated
+  --repo-target=name|user|host||ENV   use sshpass with password from ENV
   --repair-control-plane              call /admin/health?repair=1 before runtime checks
   --strict-inventory                  fail if tunnel-admin exposes extra SOP Runtime channels
   --no-inventory                      skip tunnel-admin Runtime inventory check

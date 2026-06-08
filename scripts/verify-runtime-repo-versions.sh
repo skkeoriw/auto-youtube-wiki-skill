@@ -17,6 +17,7 @@ This is read-only and does not trigger workflow execution.
 
 Options:
   --target=name|user|host|key_path    runtime SSH target; can be repeated
+  --target=name|user|host||PASS_ENV   use sshpass with password from PASS_ENV
   --agent-repo=https://...            expected agent-brain-plugins origin
   --skill-repo=https://...            expected auto-youtube-wiki-skill origin
   --expect-agent-commit=abcdef0       expected agent commit; default GitHub main
@@ -46,7 +47,9 @@ TARGETS_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$
 
 python3 - "$TARGETS_JSON" "$AGENT_REPO" "$SKILL_REPO" "$EXPECT_AGENT_COMMIT" "$EXPECT_SKILL_COMMIT" <<'PY'
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -93,12 +96,13 @@ def normalize_origin(origin):
 
 def parse_target(value):
     parts = value.split("|")
-    if len(parts) != 4:
-        fail(f"invalid --target value, expected name|user|host|key_path: {value!r}")
-    name, user, host, key_path = [part.strip() for part in parts]
+    if len(parts) not in {4, 5}:
+        fail(f"invalid --target value, expected name|user|host|key_path[|password_env]: {value!r}")
+    name, user, host, key_path = [part.strip() for part in parts[:4]]
+    password_env = parts[4].strip() if len(parts) == 5 else ""
     if not name or not user or not host:
         fail(f"invalid --target value: {value!r}")
-    return name, user, host, key_path
+    return name, user, host, key_path, password_env
 
 
 def parse_kv(text):
@@ -110,7 +114,7 @@ def parse_kv(text):
     return data
 
 
-def ssh_query(user, host, key_path):
+def ssh_query(user, host, key_path, password_env):
     script = r'''
 set -e
 printf 'agent_origin=%s\n' "$(git -C "$HOME/agent-brain-plugins" remote get-url origin)"
@@ -120,11 +124,22 @@ printf 'skill_origin=%s\n' "$(git -C "$HOME/auto-youtube-wiki-skill" remote get-
 printf 'skill_branch=%s\n' "$(git -C "$HOME/auto-youtube-wiki-skill" rev-parse --abbrev-ref HEAD)"
 printf 'skill_commit=%s\n' "$(git -C "$HOME/auto-youtube-wiki-skill" rev-parse --short HEAD)"
 '''
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]
+    env = None
+    if password_env:
+        password = os.environ.get(password_env)
+        if not password:
+            fail(f"password env var is empty or missing for {user}@{host}: {password_env}")
+        if not shutil.which("sshpass"):
+            fail("sshpass is required when --target includes password_env")
+        cmd = ["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=no"]
+        env = os.environ.copy()
+        env["SSHPASS"] = password
+    else:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]
     if key_path:
         cmd.extend(["-i", key_path])
     cmd.extend([f"{user}@{host}", "bash", "-lc", script])
-    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    return subprocess.run(cmd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
 
 
 if not targets:
@@ -135,8 +150,8 @@ expected_skill = short_commit(expect_skill) or ls_remote(skill_repo)
 failures = []
 
 for raw in targets:
-    name, user, host, key_path = parse_target(raw)
-    result = ssh_query(user, host, key_path)
+    name, user, host, key_path, password_env = parse_target(raw)
+    result = ssh_query(user, host, key_path, password_env)
     if result.returncode != 0:
         failures.append(f"{name}: ssh failed: {result.stderr[:300]}")
         continue

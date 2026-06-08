@@ -34,6 +34,17 @@ class VerifyRuntimeRepoVersionsTest(unittest.TestCase):
         ssh.chmod(0o755)
         return bin_dir
 
+    def fake_sshpass(self, bin_dir: Path):
+        sshpass = bin_dir / "sshpass"
+        sshpass.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [ -z \"$SSHPASS\" ]; then echo 'missing SSHPASS' >&2; exit 9; fi\n"
+            "if [ \"$1\" = '-e' ]; then shift; fi\n"
+            "exec \"$@\"\n",
+            encoding="utf-8",
+        )
+        sshpass.chmod(0o755)
+
     def run_script(self, bin_dir: Path, *args: str):
         env = os.environ.copy()
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
@@ -70,6 +81,54 @@ class VerifyRuntimeRepoVersionsTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("agent_commit_ok", result.stderr)
         self.assertIn("old0000/abc1234", result.stderr)
+
+    def test_verify_runtime_repo_versions_supports_password_env_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self.fake_ssh(Path(tmp))
+            self.fake_sshpass(bin_dir)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["RUNTIME_TEST_PASSWORD"] = "secret-for-test"
+            result = subprocess.run(
+                [
+                    str(VERIFY_SCRIPT),
+                    "--target=runtime-a|user|host||RUNTIME_TEST_PASSWORD",
+                    "--expect-agent-commit=abc1234",
+                    "--expect-skill-commit=def5678",
+                ],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[runtime-repos] ok: runtime-a", result.stdout)
+        self.assertNotIn("secret-for-test", result.stdout)
+        self.assertNotIn("secret-for-test", result.stderr)
+
+    def test_verify_runtime_repo_versions_rejects_missing_password_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self.fake_ssh(Path(tmp))
+            self.fake_sshpass(bin_dir)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env.pop("RUNTIME_TEST_PASSWORD", None)
+            result = subprocess.run(
+                [
+                    str(VERIFY_SCRIPT),
+                    "--target=runtime-a|user|host||RUNTIME_TEST_PASSWORD",
+                    "--expect-agent-commit=abc1234",
+                    "--expect-skill-commit=def5678",
+                ],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("password env var is empty or missing", result.stderr)
 
 
 if __name__ == "__main__":
