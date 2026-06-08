@@ -60,7 +60,7 @@ RUNTIME_MANAGEMENT_NODES = [
     RUNTIME_MANAGEMENT_SUMMARY_NODE,
 ]
 
-SECRET_KEYS = {"password", "token", "secret", "credential", "private_key", "ssh_private_key", "private_key_content"}
+SECRET_KEYS = {"password", "token", "key", "secret", "credential", "private_key", "ssh_private_key", "private_key_content"}
 RUNTIME_CAPABILITY_ENV = {
     "GITHUB_TOKEN": ["github_token", "repo_token"],
     "DEEPSEEK_API_KEY": ["deepseek_api_key", "hermes_deepseek_api_key"],
