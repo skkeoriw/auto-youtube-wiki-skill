@@ -250,6 +250,20 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertNotIn("retry", [node["id"] for node in dag["nodes"]])
         self.assertFalse(any(edge["target"] == "retry" for edge in dag["edges"]))
 
+    def test_root_health_route_supports_auto_domain_local_check(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "runtime_info", return_value={"runtime_id": "test-runtime"}):
+            thread.start()
+            with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=3) as response:
+                data = json.loads(response.read())
+        server.shutdown()
+        server.server_close()
+
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["service"], "sop-bridge")
+        self.assertEqual(data["runtime"]["runtime_id"], "test-runtime")
+
     def test_node_registry_and_actions_routes(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

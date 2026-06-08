@@ -2189,6 +2189,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = [unquote(p) for p in parsed.path.strip("/").split("/") if p]
         query = parse_qs(parsed.query)
         try:
+            if path == []:
+                return json_response(self, 200, {"status": "ok", "service": "sop-bridge", "runtime": runtime_info()})
             if path == ["api", "sop"]:
                 return json_response(self, 200, sop_manifest())
             if path == ["api", "sop", "runtime"]:
