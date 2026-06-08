@@ -43,7 +43,7 @@ Usage:
     [--expect-auto-domain-source-mode=managed] \
     [--expect-auto-domain-source-repo=https://github.com/ChangfengHU/auto-domain-cli.git] \
     [--expect-auto-domain-source-ref=main] \
-    [--expect-auto-domain-source-commit=1d4d9aa] \
+    [--expect-auto-domain-source-commit=<short_sha>] \
     [--expect-sop-type=runtime-provisioning] \
     [--expect-sop-type=youtube-research-wiki]
 
