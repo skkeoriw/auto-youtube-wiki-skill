@@ -230,6 +230,31 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(merged["SOP_UI_URL"], "https://sop-ui.example")
         self.assertIn("CLOUDFLARE_API_KEY", merged["_management_config_injected"])
 
+    def test_runtime_management_config_initializes_from_current_runtime(self):
+        env_file = self.wiki / ".agent-brain-plugins.env"
+        env_file.write_text(
+            "GITHUB_TOKEN=test-token-from-env-file\n"
+            "NOTEBOOKLM_BRIDGE_URL=https://bridge.example\n"
+            "CLOUDFLARE_API_KEY=cloudflare-from-env-file\n",
+            encoding="utf-8",
+        )
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path), patch.dict(os.environ, {
+            "YOUTUBE_WIKI_ENV_FILE": str(env_file),
+            "GITHUB_TOKEN": "",
+            "NOTEBOOKLM_BRIDGE_URL": "",
+            "CLOUDFLARE_API_KEY": "",
+        }, clear=False):
+            changed = bridge.initialize_runtime_management_config()
+            preview = bridge.runtime_management_config_preview({"id": "runtime-management"})
+
+        by_key = {item["key"]: item for item in preview["items"]}
+        self.assertIn("GITHUB_TOKEN", changed)
+        self.assertIn("CLOUDFLARE_API_KEY", changed)
+        self.assertEqual(by_key["NOTEBOOKLM_BRIDGE_URL"]["masked_value"], "https://bridge.example")
+        self.assertEqual(by_key["CLOUDFLARE_API_KEY"]["masked_value"], "clo***ile")
+        self.assertNotIn("cloudflare-from-env-file", json.dumps(preview))
+
     def test_indexed_artifact_preview_is_backfilled(self):
         artifact = {
             "id": "indexed-1",

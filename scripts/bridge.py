@@ -389,6 +389,36 @@ def save_runtime_management_config(values):
     return changed
 
 
+def current_runtime_inheritable_values(overwrite=False):
+    env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
+    env_file_values = read_env_file_values(env_file)
+    current = read_runtime_management_config_values()
+    values = {}
+    for key, aliases in RUNTIME_CAPABILITY_ENV.items():
+        if not overwrite and any(current.get(candidate) for candidate in [key, *aliases]):
+            continue
+        candidate_keys = [key, *aliases]
+        raw_value = ""
+        for candidate in candidate_keys:
+            if os.environ.get(candidate):
+                raw_value = os.environ.get(candidate, "")
+                break
+        if not raw_value:
+            for candidate in candidate_keys:
+                if env_file_values.get(candidate):
+                    raw_value = env_file_values.get(candidate, "")
+                    break
+        if raw_value:
+            values[key] = raw_value
+    return values
+
+
+def initialize_runtime_management_config(overwrite=False):
+    values = current_runtime_inheritable_values(overwrite=overwrite)
+    changed = save_runtime_management_config(values)
+    return changed
+
+
 def request_has_runtime_config(body, env_key, aliases):
     for key in [env_key, env_key.lower(), *aliases]:
         if body.get(key) not in {None, ""}:
@@ -2873,6 +2903,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = {}
 
         path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+
+        # POST /api/sop/{instance}/config/management/init  → copy current runtime env/env_file into server-side defaults
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "config" and path[4] == "management" and path[5] == "init":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
+                return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
+            if not is_runtime_management_authorized(self):
+                return json_response(self, 401, {"detail": "Management token is required"})
+            changed = initialize_runtime_management_config(overwrite=bool(data.get("overwrite")))
+            return json_response(self, 200, {
+                "status": "initialized",
+                "changed_keys": sorted(changed.keys()),
+                "config": runtime_management_config_preview(sop),
+            })
 
         # POST /api/sop/{instance}/config/management  → save server-side runtime management defaults
         if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "config" and path[4] == "management":
