@@ -100,7 +100,7 @@ metadata = {
     "channel_name": name,
     "channel_url": endpoint,
     "spi_base_url": f"{endpoint.rstrip('/')}/api/sop",
-    "supported_sop_types": ["runtime-provisioning", "youtube-research-wiki"],
+    "supported_sop_types": ["runtime-management", "runtime-provisioning", "youtube-research-wiki"],
     "ui_url": ui_url,
     "endpoint_url": endpoint,
     "wiki_repo": repo,

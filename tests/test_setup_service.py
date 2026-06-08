@@ -188,7 +188,7 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
         self.assertEqual(metadata["type"], "sop-runtime")
         self.assertEqual(metadata["runtime_id"], "youtube-wiki-test")
         self.assertEqual(metadata["ui_url"], "https://sop-ui-prototype.example.com")
-        self.assertEqual(metadata["supported_sop_types"], ["runtime-provisioning", "youtube-research-wiki"])
+        self.assertEqual(metadata["supported_sop_types"], ["runtime-management", "runtime-provisioning", "youtube-research-wiki"])
         self.assertEqual(metadata["auto_domain_source"], {
             "mode": "managed",
             "repo": "https://github.com/ChangfengHU/auto-domain-cli.git",

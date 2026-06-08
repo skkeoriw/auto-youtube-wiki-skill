@@ -379,6 +379,44 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertTrue(root_ctx["test_overrides"]["force_notebooklm_fallback"])
         self.assertTrue(run_ctx["test_overrides"]["force_notebooklm_fallback"])
 
+    def test_runtime_management_trigger_writes_secret_request_and_run_workspace(self):
+        plugin_root = self.wiki / "plugin-root"
+        runner = plugin_root / "youtube-wiki/infrastructure/provision_runtime.py"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        sop = {
+            "id": "runtime-management",
+            "sop_type": "runtime-management",
+            "repo": "skkeoriw/runtime-management",
+            "wiki_local_path": str(self.wiki),
+        }
+
+        with patch.dict(os.environ, {"AGENT_BRAIN_PLUGINS_PATH": str(plugin_root)}):
+            with patch.object(bridge.subprocess, "Popen") as popen:
+                status, result = bridge.trigger_sop(sop, {
+                    "action": "create-runtime",
+                    "ssh_command": "ssh -i ~/.ssh/id_ed25519 user@34.29.222.183",
+                    "private_key": "secret-test-key",
+                    "github_token": "secret-token",
+                    "pipeline_id": "create-runtime-test",
+                })
+
+        self.assertEqual(status, 202)
+        self.assertEqual(result["pipeline_id"], "create-runtime-test")
+        popen.assert_called_once()
+        request_file = self.wiki / ".sop/secrets/create-runtime-test/request.json"
+        self.assertTrue(request_file.exists())
+        self.assertEqual(oct(request_file.stat().st_mode & 0o777), "0o600")
+        request_data = json.loads(request_file.read_text())
+        self.assertEqual(request_data["private_key"], "secret-test-key")
+        context_text = (self.wiki / "raw/pipeline-runs/create-runtime-test/context.json").read_text()
+        self.assertNotIn("secret-test-key", context_text)
+        run = json.loads((self.wiki / "raw/pipeline-runs/create-runtime-test/run.json").read_text())
+        self.assertEqual(run["sop_id"], "runtime-management")
+        self.assertEqual(run["workflow_id"], "create-runtime")
+        dag = json.loads((self.wiki / "raw/pipeline-runs/create-runtime-test/dag.json").read_text())
+        self.assertIn("parse-ssh-request", [node["id"] for node in dag["nodes"]])
+
     def test_run_routes_prefer_runtime_index(self):
         run_file = self.wiki / "raw/pipeline-runs/pipe-1/run.json"
         run = json.loads(run_file.read_text(encoding="utf-8"))

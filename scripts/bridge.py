@@ -4,6 +4,7 @@ import importlib.util
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -19,6 +20,32 @@ SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5
 SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
 _RUN_INDEX_CLASS = None
+
+CREATE_RUNTIME_NODES = [
+    "parse-ssh-request",
+    "ssh-preflight",
+    "infer-runtime-plan",
+    "install-base-deps",
+    "clone-runtime-repos",
+    "write-runtime-config",
+    "init-runtime-registry",
+    "start-runtime-bridge",
+    "register-channel",
+    "verify-runtime-visible",
+    "runtime-provision-summary",
+]
+
+DELETE_RUNTIME_NODES = [
+    "parse-runtime-delete-request",
+    "resolve-runtime-target",
+    "safety-check",
+    "stop-runtime-services",
+    "disable-channel",
+    "verify-runtime-removed",
+    "delete-summary",
+]
+
+SECRET_KEYS = {"password", "token", "secret", "credential", "private_key", "ssh_private_key", "private_key_content"}
 
 
 def json_response(handler, status, data):
@@ -62,6 +89,37 @@ def read_json(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def write_json(path, data, mode=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if mode is not None:
+        path.chmod(mode)
+
+
+def mask_value(value):
+    if value in {None, ""}:
+        return value
+    text = str(value)
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:3]}***{text[-3:]}"
+
+
+def mask_data(value):
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            key_l = str(key).lower()
+            if any(secret in key_l for secret in SECRET_KEYS):
+                result[key] = mask_value(item) if item else item
+            else:
+                result[key] = mask_data(item)
+        return result
+    if isinstance(value, list):
+        return [mask_data(item) for item in value]
+    return value
 
 
 def read_yaml(path):
@@ -1277,6 +1335,35 @@ def sop_from_instance(runtime, instance):
     }
 
 
+def plugin_root():
+    return Path(os.environ.get("AGENT_BRAIN_PLUGINS_PATH", str(Path.home() / "agent-brain-plugins"))).expanduser()
+
+
+def ensure_runtime_management_sop(runtime):
+    template = plugin_root() / "youtube-wiki" / "templates" / "runtime-management-sop"
+    if not (template / "sop.yaml").exists():
+        return None
+    workspace = Path(os.environ.get("RUNTIME_MANAGEMENT_WORKSPACE", str(wiki_base() / "runtime-management"))).expanduser()
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(template, workspace, dirs_exist_ok=True)
+        store_cls = run_index_class()
+        if store_cls:
+            store_cls(workspace).initialize()
+    except Exception:
+        return None
+    instance = {
+        "instance_id": "runtime-management",
+        "sop_type": "runtime-management",
+        "repo": "skkeoriw/runtime-management",
+        "local_path": str(workspace),
+        "enabled": True,
+        "created_at": runtime.get("created_at", ""),
+        "updated_at": runtime.get("updated_at", ""),
+    }
+    return sop_from_instance(runtime, instance)
+
+
 def load_sops():
     registry = read_registry()
     sops = []
@@ -1286,6 +1373,10 @@ def load_sops():
         sop = sop_from_instance(registry, instance)
         if sop:
             sops.append(sop)
+    if not any(sop.get("instance_id") == "runtime-management" for sop in sops):
+        management = ensure_runtime_management_sop(registry)
+        if management:
+            sops.insert(0, management)
     return sops
 
 
@@ -1695,7 +1786,142 @@ def run_artifact_candidates(sop, pipeline_id):
     return candidates
 
 
+def runtime_management_nodes(action):
+    return DELETE_RUNTIME_NODES if action == "delete-runtime" else CREATE_RUNTIME_NODES
+
+
+def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
+    wiki = Path(sop["wiki_local_path"])
+    run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+    now = _now_iso_utc()
+    nodes = runtime_management_nodes(action)
+    node_status = {node: "waiting" for node in nodes}
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "nodes").mkdir(exist_ok=True)
+    write_json(run_dir / "context.json", {
+        "pipeline_id": pipeline_id,
+        "management_action": action,
+        "provision_request": mask_data(body),
+    })
+    write_json(run_dir / "dag.json", {
+        "sop_id": "runtime-management",
+        "workflow_id": action,
+        "nodes": [{
+            "id": node,
+            "title": node.replace("-", " ").title(),
+            "mode": "blocking",
+            "needs": [] if idx == 0 else [nodes[idx - 1]],
+            "executor": {
+                "type": "skill",
+                "skill": "sop-runtime-provisioning",
+                "webhook_route": "sop-runtime-provisioning",
+            },
+            "inputs": {},
+            "outputs": {"report": f"raw/provision/{pipeline_id}/{node}.json"},
+            "ui": {"category": "runtime", "icon": "server"},
+        } for idx, node in enumerate(nodes)],
+        "edges": [{"source": nodes[idx - 1], "target": node} for idx, node in enumerate(nodes) if idx > 0],
+    })
+    for idx, node in enumerate(nodes):
+        write_json(run_dir / "nodes" / f"{node}.json", {
+            "pipeline_id": pipeline_id,
+            "node_id": node,
+            "run_id": f"provision-{pipeline_id}",
+            "status": "waiting",
+            "mode": "blocking",
+            "needs": [] if idx == 0 else [nodes[idx - 1]],
+            "started_at": "",
+            "finished_at": "",
+            "duration_s": 0,
+            "attempt": 0,
+            "progress": 0,
+            "declared_inputs": {},
+            "resolved_inputs": {},
+            "declared_outputs": {},
+            "actual_outputs": {},
+            "artifacts": [],
+            "validation": {"status": "pending", "missing_outputs": [], "unexpected_outputs": []},
+            "error": "",
+            "updated_at": now,
+        })
+    run = {
+        "pipeline_id": pipeline_id,
+        "execution_id": pipeline_id,
+        "sop_id": "runtime-management",
+        "workflow_id": action,
+        "repo": sop.get("repo", ""),
+        "status": "running",
+        "source_type": action,
+        "source_url": str(body.get("channel_url") or body.get("target_host") or ""),
+        "input": mask_data({
+            "action": action,
+            "runtime_id": body.get("runtime_id", ""),
+            "target_host": body.get("target_host", ""),
+            "ssh_command": body.get("ssh_command", ""),
+        }),
+        "nodes": node_status,
+        "started_at": now,
+        "updated_at": now,
+    }
+    write_json(run_dir / "run.json", run)
+    _append_run_event(run_dir, "pipeline_started", sequence=1, pipeline_id=pipeline_id, data={"action": action})
+    store = run_index_store(sop, create=True)
+    if store:
+        try:
+            store.upsert_execution(run)
+        except Exception:
+            pass
+
+
+def trigger_runtime_management(sop, body):
+    action = str(body.get("management_action") or body.get("action") or "create-runtime")
+    if action not in {"create-runtime", "delete-runtime"}:
+        return 400, {"status": "error", "message": "action must be create-runtime or delete-runtime"}
+    now_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    pipeline_id = str(body.get("pipeline_id") or f"{action}-{now_token}")
+    wiki = Path(sop["wiki_local_path"])
+    secret_dir = wiki / ".sop" / "secrets" / pipeline_id
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        secret_dir.chmod(0o700)
+    except OSError:
+        pass
+    request_body = {**body, "management_action": action}
+    request_file = secret_dir / "request.json"
+    write_json(request_file, request_body, mode=0o600)
+    create_runtime_management_workspace_run(sop, pipeline_id, action, request_body)
+
+    runner = plugin_root() / "youtube-wiki" / "infrastructure" / "provision_runtime.py"
+    if not runner.exists():
+        return 500, {"status": "error", "message": "provision_runtime.py not found"}
+    log_dir = wiki / "logs" / "pipeline-runs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{pipeline_id}.log"
+    env = {**os.environ, "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"}
+    command = [
+        "python3",
+        str(runner),
+        "--wiki",
+        str(wiki),
+        "--pipeline-id",
+        pipeline_id,
+        "--node",
+        "all",
+        "--request-file",
+        str(request_file),
+    ]
+    with open(log_file, "ab") as stream:
+        subprocess.Popen(command, env=env, stdout=stream, stderr=subprocess.STDOUT, close_fds=True)
+    return 202, {
+        "status": "triggered",
+        "pipeline_id": pipeline_id,
+        "status_url": f"/api/sop/{sop['id']}/runs/{pipeline_id}",
+    }
+
+
 def trigger_sop(sop, body):
+    if sop.get("sop_type") == "runtime-management" or sop.get("id") == "runtime-management":
+        return trigger_runtime_management(sop, body)
     repo = body.get("repo") or sop.get("repo")
     input_data = body.get("input") if isinstance(body.get("input"), dict) else {}
     url = input_data.get("url") or body.get("url")
