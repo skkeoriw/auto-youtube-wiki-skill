@@ -2911,9 +2911,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return json_response(self, 404, {"detail": "SOP not found"})
             if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
                 return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
-            if not is_runtime_management_authorized(self):
-                return json_response(self, 401, {"detail": "Management token is required"})
-            changed = initialize_runtime_management_config(overwrite=bool(data.get("overwrite")))
+            overwrite = bool(data.get("overwrite"))
+            if overwrite and not is_runtime_management_authorized(self):
+                return json_response(self, 401, {"detail": "Management token is required for overwrite initialization"})
+            changed = initialize_runtime_management_config(overwrite=overwrite)
             return json_response(self, 200, {
                 "status": "initialized",
                 "changed_keys": sorted(changed.keys()),
