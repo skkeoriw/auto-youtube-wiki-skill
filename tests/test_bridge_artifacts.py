@@ -380,6 +380,13 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertTrue(run_ctx["test_overrides"]["force_notebooklm_fallback"])
 
     def test_run_routes_prefer_runtime_index(self):
+        run_file = self.wiki / "raw/pipeline-runs/pipe-1/run.json"
+        run = json.loads(run_file.read_text(encoding="utf-8"))
+        run["status"] = "running"
+        run["nodes"]["wiki-build"] = "running"
+        run["updated_at"] = "2026-06-05T00:03:00Z"
+        run_file.write_text(json.dumps(run), encoding="utf-8")
+
         cls = bridge.run_index_class()
         self.assertIsNotNone(cls)
         store = cls(self.wiki)

@@ -113,6 +113,36 @@ def run_index_store(sop, create=False):
     return None
 
 
+def indexed_run_is_stale(sop, pipeline_id, indexed):
+    """Return true when workspace evidence is newer than the SQLite run index."""
+    if not indexed:
+        return False
+    run_file = run_workspace(sop, pipeline_id) / "run.json"
+    workspace = read_json(run_file)
+    if not isinstance(workspace, dict):
+        return False
+
+    indexed_status = str(indexed.get("status") or "")
+    workspace_status = str(workspace.get("status") or "")
+    terminal_statuses = {"done", "failed", "cancelled"}
+    if workspace_status in terminal_statuses and indexed_status not in terminal_statuses:
+        return True
+
+    indexed_updated = str(indexed.get("updated_at") or "")
+    workspace_updated = str(workspace.get("updated_at") or "")
+    if workspace_updated and indexed_updated and workspace_updated > indexed_updated:
+        return True
+
+    workspace_nodes = workspace.get("nodes") if isinstance(workspace.get("nodes"), dict) else {}
+    indexed_nodes = indexed.get("nodes") if isinstance(indexed.get("nodes"), dict) else {}
+    for node_id, workspace_node_status in workspace_nodes.items():
+        indexed_node_status = indexed_nodes.get(node_id)
+        if str(workspace_node_status) in terminal_statuses and str(indexed_node_status) == "running":
+            return True
+
+    return False
+
+
 def indexed_run(sop, pipeline_id, rebuild=True):
     store = run_index_store(sop, create=rebuild)
     if not store:
@@ -120,6 +150,11 @@ def indexed_run(sop, pipeline_id, rebuild=True):
     try:
         data = store.get_run(pipeline_id)
         if data:
+            if rebuild and indexed_run_is_stale(sop, pipeline_id, data):
+                if store.rebuild_from_workspace(pipeline_id, sop):
+                    rebuilt = store.get_run(pipeline_id)
+                    if rebuilt:
+                        return rebuilt
             return data
         if rebuild and store.rebuild_from_workspace(pipeline_id, sop):
             return store.get_run(pipeline_id)
