@@ -131,6 +131,39 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("preview", detail["artifacts"][0])
         self.assertEqual(detail["capabilities"]["git"]["commit"], "abc123")
         self.assertEqual(detail["plan"]["max_pages"], 40)
+        self.assertIn("definition", detail)
+        self.assertIn("inputs", detail)
+        self.assertIn("actions", detail)
+        self.assertIn("outputs", detail)
+        self.assertIn("troubleshooting", detail)
+        self.assertEqual(detail["definition"]["title"], "Wiki Build")
+        self.assertEqual(detail["inputs"]["resolved"]["reports"], ["frozen-report.md"])
+        self.assertIn("pages", detail["outputs"]["artifact_explanations"])
+        self.assertTrue(detail["troubleshooting"]["failure_hints"])
+
+    def test_runtime_management_node_explanation_fallback(self):
+        (self.wiki / "raw/pipeline-runs/pipe-1/nodes/clone-runtime-repos.json").write_text(
+            json.dumps({
+                "pipeline_id": "pipe-1",
+                "node_id": "clone-runtime-repos",
+                "status": "done",
+                "title": "Clone Runtime Repos",
+                "purpose": "Clone or fast-forward repos",
+                "declared_inputs": {"github_token": "env/request secret"},
+                "resolved_inputs": {"runtime_id": "runtime-34-29-222-183"},
+                "declared_outputs": {"repo_checkout_report": "raw/provision/pipe-1/repo_checkout_report.json"},
+                "actual_outputs": {},
+                "validation": {"status": "passed"},
+            }),
+            encoding="utf-8",
+        )
+        self.sop["nodes"]["clone-runtime-repos"] = {"title": "Clone Runtime Repos", "outputs": {}}
+        detail = bridge.node_runtime_detail(self.sop, "pipe-1", "clone-runtime-repos")
+
+        self.assertEqual(detail["definition"]["title_zh"], "拉取 Runtime 仓库")
+        self.assertIn("GitHub", " ".join(detail["troubleshooting"]["failure_hints"]))
+        self.assertEqual(detail["inputs"]["secrets"][0]["key"], "github_token")
+        self.assertIn("repo_checkout_report", detail["outputs"]["artifact_explanations"])
 
     def test_missing_outputs_are_reported(self):
         (self.wiki / "index.md").unlink()

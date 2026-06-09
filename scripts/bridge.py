@@ -155,6 +155,32 @@ RUNTIME_CONFIG_CATEGORIES = {
     "RUNTIME_TARGET_CHANNEL_URL": "target",
 }
 
+RUNTIME_NODE_EXPLAIN = {
+    "management-request-validate": ("校验管理请求", "校验创建/删除 Runtime 的请求，并把敏感信息转为 run-scoped secret 引用。", ["识别管理动作", "解析 Runtime、通道、SSH 和 instance 输入", "写入脱敏请求与上下文"], ["缺少 SSH 或 private key 时检查 Runtime Management 默认配置。"]),
+    "action-router": ("选择执行分支", "根据 action 选择创建或删除分支，并把未选择分支标记为 skipped。", ["读取 action", "选择 create/delete 分支", "生成 active/skipped 节点列表"], ["action 只能是 create-runtime 或 delete-runtime。"]),
+    "parse-create-runtime-request": ("解析创建 Runtime 请求", "整理目标机器、Runtime 身份、默认 instance 和 secret 引用。", ["解析 SSH command", "生成 runtime_id/channel_url", "确认 runtime-management instance"], ["runtime_id 应使用 runtime-ip 形式。"]),
+    "ssh-preflight": ("SSH 预检", "验证目标机器是否可登录、用户和基础环境是否满足初始化要求。", ["登录目标机器", "读取系统信息", "检查磁盘和权限"], ["SSH 失败时确认 authorized_keys 和 key 权限。"]),
+    "infer-runtime-plan": ("推断初始化计划", "生成 Runtime 初始化计划，并检查 channel/runtime 是否冲突或可幂等收敛。", ["查询 tunnel-admin", "检查 client_ip", "生成 create-new/converge-existing 计划"], ["同名 channel 属于其他 IP 时必须换名或先删除。"]),
+    "install-base-deps": ("安装基础依赖", "安装或确认 git、curl、python3、node 等 Runtime 必需命令。", ["识别包管理器", "安装依赖", "输出命令版本"], ["包安装失败时检查网络和 sudo 权限。"]),
+    "clone-runtime-repos": ("拉取 Runtime 仓库", "在目标机器 clone 或 fast-forward SOP Core 与 Skill CLI 仓库。", ["配置 Git 凭据", "更新 agent-brain-plugins", "更新 auto-youtube-wiki-skill", "校验关键文件"], ["GitHub clone 失败时检查 GITHUB_TOKEN 权限。", "origin mismatch 表示目标目录已有错误仓库。"]),
+    "write-runtime-config": ("写入 Runtime 配置", "把继承配置和目标 Runtime 身份写入目标机器环境文件。", ["合并管理配置", "写入 env 文件", "校验必需配置"], ["配置缺失时先到 Settings 初始化管理配置。"]),
+    "init-runtime-registry": ("初始化 Registry", "初始化 registry、runtime-management workspace 和 run index。", ["创建 registry", "写入 enabled instance", "初始化 run index"], ["registry 不存在时检查 init-new-machine 输出。"]),
+    "start-runtime-bridge": ("启动 Runtime Bridge", "启动目标 SOP SPI bridge，并验证本地 /api/sop。", ["停止旧进程", "启动 bridge", "检查本地 SPI"], ["本地 SPI 不通时查看 bridge log。"]),
+    "register-channel": ("注册公网通道", "通过 auto-domain 注册公网 channel，并验证 metadata 与 UI discovery。", ["注册 channel", "写入 metadata", "验证公网 SPI/CORS/UI"], ["tunnel inactive 时检查 auto-domain 和 Cloudflare 配置。"]),
+    "verify-runtime-visible": ("验证 Runtime 可见", "确认新 Runtime 公网可访问并暴露 runtime-management instance。", ["请求公网 /api/sop", "确认 runtime_id", "确认 instance"], ["不可见时按 bridge、tunnel、metadata 顺序排查。"]),
+    "parse-delete-runtime-request": ("解析删除 Runtime 请求", "整理删除目标、SSH 信息、force 策略和 secret 引用。", ["解析 runtime_id/channel", "继承 SSH target", "写入删除上下文"], ["删除目标不明确时确认 runtime_id 或默认目标。"]),
+    "resolve-runtime-target": ("解析删除目标", "从 tunnel-admin 查找目标 Runtime，确定删除对象和注册状态。", ["查询 tunnel-admin", "匹配 channel/runtime", "读取 metadata"], ["找不到目标时确认 runtime_id；force 可继续清理本地残留。"]),
+    "safety-check": ("删除安全检查", "删除前检查目标 Runtime 是否有运行中的 executions。", ["查询 runs", "识别 running", "根据 force 决策"], ["存在 running execution 时不要普通删除。"]),
+    "stop-runtime-services": ("停止 Runtime 服务", "停止目标机器 bridge 和 auto-domain 相关进程。", ["停止 bridge", "停止 channel 进程", "避免杀掉当前 SSH"], ["remaining_processes 不为空时继续清理服务残留。"]),
+    "unregister-channel": ("反注册公网通道", "从 tunnel-admin 删除目标 Runtime 的公网 channel。", ["调用 tunnel delete API", "删除 metadata", "记录响应"], ["反注册失败时检查 TUNNEL_API 和权限。"]),
+    "cleanup-runtime-services": ("清理服务残留", "清理 Runtime、Hermes、agent、auto-domain 服务和进程残留。", ["二次停止服务", "清理标记和缓存", "复查进程端口"], ["remaining_ports 不为空时目标仍有服务监听。"]),
+    "cleanup-runtime-files": ("清理 Runtime 文件", "删除 create-runtime 创建的仓库、配置、registry、workspace、缓存和 secret 文件。", ["删除仓库", "删除 env/registry/workspace", "删除缓存", "记录残留路径"], ["remaining_paths 不为空时说明没有清理干净。"]),
+    "verify-local-clean": ("验证本地清理干净", "确认目标机器没有 Runtime 文件、进程、端口和 Hermes/agent 残留。", ["检查路径", "检查进程", "检查端口"], ["任何 remaining_* 不为空都不能认为删除干净。"]),
+    "verify-channel-removed": ("验证通道已移除", "确认 tunnel-admin 不再把目标 channel 标记为 active/local ok。", ["查询 tunnel-admin", "确认 channel 非 active", "记录状态"], ["tunnel 仍 active 说明反注册未生效。"]),
+    "verify-runtime-removed": ("验证 Runtime 已删除", "综合验证公网 SPI 不可用、tunnel 不活跃、本地清理通过。", ["请求公网 SPI", "复核 tunnel", "合并本地和通道验证"], ["公网 502 但 tunnel 仍 active 不能算删除成功。"]),
+    "management-summary": ("生成管理摘要", "汇总 create/delete 分支结果，形成可交接执行结论。", ["读取分支报告", "计算最终 status", "写入 summary"], ["摘要失败通常说明前置分支报告缺失。"]),
+}
+
 
 def json_response(handler, status, data):
     body = json.dumps(data, ensure_ascii=False, indent=2).encode()
@@ -720,6 +746,137 @@ def normalized_contract(value, direction):
     return result
 
 
+def node_explain_metadata(node_id, title="", purpose=""):
+    item = RUNTIME_NODE_EXPLAIN.get(node_id)
+    if item:
+        title_zh, purpose_zh, actions, hints = item
+        return {
+            "title_zh": title_zh,
+            "purpose_zh": purpose_zh,
+            "actions": actions,
+            "failure_hints": hints,
+        }
+    return {
+        "title_zh": title or node_id,
+        "purpose_zh": purpose or "该节点暂未配置中文说明，系统会继续展示现有运行状态、输入、输出和产物。",
+        "actions": ["该节点暂未配置执行步骤说明。"],
+        "failure_hints": ["查看 error、validation、artifacts 和 raw log 定位失败原因。"],
+    }
+
+
+def input_groups_from_contract(declared_inputs):
+    business, environment, secrets = [], [], []
+    for key, spec in (declared_inputs or {}).items():
+        text = f"{key} {spec}".lower()
+        item = {"key": key, "source": spec}
+        if any(secret in text for secret in SECRET_KEYS):
+            secrets.append({**item, "secret": True})
+        elif any(word in text for word in ["env", "config", "github", "cloudflare", "vertex", "gemini", "notebooklm", "telegram", "token"]):
+            environment.append(item)
+        else:
+            business.append(item)
+    return business, environment, secrets
+
+
+def artifact_explanations_from_outputs(node_id, declared_outputs):
+    explain = {}
+    for key in (declared_outputs or {}):
+        if key == "report":
+            explain[key] = "本节点执行摘要、状态和校验结果。"
+        elif key == "repo_checkout_report":
+            explain[key] = "仓库 checkout 结果，包括 origin、branch、commit、stdout/stderr。"
+        elif key.endswith("_report"):
+            explain[key] = "该节点的结构化检查报告。"
+        elif key in {"masked_request", "provision_context"}:
+            explain[key] = "Runtime Management 的脱敏请求或共享上下文。"
+        else:
+            explain[key] = f"{node_id} 节点输出 {key}。"
+    return explain
+
+
+def key_results_from_node_detail(detail):
+    results = []
+
+    def add(key, value, label=None):
+        if value is None or value == "" or value == []:
+            return
+        results.append({"key": key, "label": label or key.replace("_", " ").title(), "value": mask_data(value)})
+
+    stdout = str(detail.get("stdout") or (detail.get("detail") or {}).get("stdout") or "")
+    for line in stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"agent_commit", "skill_commit", "agent_branch", "skill_branch", "agent_origin", "skill_origin"}:
+            add(key, value)
+    for key in [
+        "runtime_id", "channel_url", "target_host", "plan_mode", "repos_ready",
+        "required_commands_ok", "registry_valid", "runtime_id_match", "local_spi_ok",
+        "public_spi_ok", "cors_ok", "channel_registered", "runtime_management_visible",
+        "deleted", "services_stopped", "services_removed", "local_clean_ok",
+        "channel_removed_ok", "tunnel_still_active",
+    ]:
+        add(key, detail.get(key))
+    plan = detail.get("plan") if isinstance(detail.get("plan"), dict) else {}
+    add("plan_mode", plan.get("plan_mode"))
+    add("conflicts", plan.get("conflicts"))
+    for key in ["remaining_paths", "remaining_processes", "remaining_ports"]:
+        if isinstance(detail.get(key), list):
+            add(key, len(detail.get(key)))
+    return results[:12]
+
+
+def ensure_node_explanation(detail):
+    node_id = str(detail.get("node_id") or "")
+    title = str(detail.get("title") or node_id)
+    purpose = str(detail.get("purpose") or "")
+    declared_inputs = detail.get("declared_inputs") if isinstance(detail.get("declared_inputs"), dict) else {}
+    resolved_inputs = detail.get("resolved_inputs") if isinstance(detail.get("resolved_inputs"), dict) else {}
+    declared_outputs = detail.get("declared_outputs") if isinstance(detail.get("declared_outputs"), dict) else {}
+    actual_outputs = detail.get("actual_outputs") if isinstance(detail.get("actual_outputs"), dict) else {}
+    validation = detail.get("validation") if isinstance(detail.get("validation"), dict) else {}
+    meta = node_explain_metadata(node_id, title, purpose)
+    business, environment, secrets = input_groups_from_contract(declared_inputs)
+    definition = detail.get("definition") if isinstance(detail.get("definition"), dict) else {}
+    inputs = detail.get("inputs") if isinstance(detail.get("inputs"), dict) else {}
+    outputs = detail.get("outputs") if isinstance(detail.get("outputs"), dict) else {}
+    troubleshooting = detail.get("troubleshooting") if isinstance(detail.get("troubleshooting"), dict) else {}
+    return {
+        **detail,
+        "definition": {
+            "title": title,
+            "title_zh": definition.get("title_zh") or meta["title_zh"],
+            "purpose": purpose,
+            "purpose_zh": definition.get("purpose_zh") or meta["purpose_zh"],
+            "branch": detail.get("branch", ""),
+            "executor": detail.get("executor", {}),
+            "retryable": detail.get("retryable", True),
+            **definition,
+        },
+        "inputs": {
+            "declared": declared_inputs,
+            "resolved": resolved_inputs,
+            "business": inputs.get("business") or business,
+            "environment": inputs.get("environment") or environment,
+            "secrets": inputs.get("secrets") or secrets,
+        },
+        "actions": detail.get("actions") if isinstance(detail.get("actions"), list) and detail.get("actions") else meta["actions"],
+        "outputs": {
+            "declared": declared_outputs,
+            "actual": actual_outputs,
+            "artifact_explanations": outputs.get("artifact_explanations") or artifact_explanations_from_outputs(node_id, declared_outputs),
+            "key_results": outputs.get("key_results") or key_results_from_node_detail(detail),
+        },
+        "troubleshooting": {
+            "failure_hints": troubleshooting.get("failure_hints") or ([detail.get("manual_fix_hint")] if detail.get("manual_fix_hint") else meta["failure_hints"]),
+            "retryable": detail.get("retryable", True),
+            "safe_to_retry": detail.get("retryable", True),
+            "error": detail.get("error", ""),
+            "validation": validation,
+        },
+    }
+
+
 def context_output_paths(node_id, output_name, context):
     if node_id == "youtube-fetch" and output_name == "metadata_file":
         return [context.get("stage_b_fetch", {}).get("meta_file", "")]
@@ -794,11 +951,11 @@ def node_runtime_detail(sop, pipeline_id, node_id):
     config = (sop.get("nodes") or {}).get(node_id) or run_dag_node_config(sop, pipeline_id, node_id) or {}
     context = run_context(sop, pipeline_id)
 
-    declared_inputs = normalized_contract(config.get("inputs", state.get("inputs", {})), "input")
-    optional_inputs = normalized_contract(config.get("optional_inputs", state.get("optional_inputs", {})), "input")
+    declared_inputs = normalized_contract(config.get("inputs") or state.get("inputs") or state.get("declared_inputs") or {}, "input")
+    optional_inputs = normalized_contract(config.get("optional_inputs") or state.get("optional_inputs") or {}, "input")
     for spec in optional_inputs.values():
         spec["required"] = False
-    declared_outputs = normalized_contract(config.get("outputs", state.get("outputs", {})), "output")
+    declared_outputs = normalized_contract(config.get("outputs") or state.get("outputs") or state.get("declared_outputs") or {}, "output")
 
     has_recorded_outputs = isinstance(state.get("actual_outputs"), dict)
     actual_outputs = dict(state.get("actual_outputs")) if has_recorded_outputs else {}
@@ -912,7 +1069,7 @@ def node_runtime_detail(sop, pipeline_id, node_id):
                 })
         except Exception:
             pass
-    return detail
+    return ensure_node_explanation(detail)
 
 
 def node_static_config(sop, node_id):
@@ -1968,6 +2125,21 @@ def sop_dag(sop):
             "title": node.get("title", node_id),
             "purpose": node.get("purpose", static.get("purpose", "")),
             "branch": node.get("branch", static.get("branch", "")),
+            "definition": {
+                "title": node.get("title", node_id),
+                "title_zh": node_explain_metadata(node_id, node.get("title", node_id), node.get("purpose", static.get("purpose", "")))["title_zh"],
+                "purpose": node.get("purpose", static.get("purpose", "")),
+                "purpose_zh": node_explain_metadata(node_id, node.get("title", node_id), node.get("purpose", static.get("purpose", "")))["purpose_zh"],
+                "branch": node.get("branch", static.get("branch", "")),
+                "executor": static.get("executor") or {},
+                "retryable": True,
+            },
+            "actions": node_explain_metadata(node_id, node.get("title", node_id), node.get("purpose", static.get("purpose", "")))["actions"],
+            "troubleshooting": {
+                "failure_hints": node_explain_metadata(node_id, node.get("title", node_id), node.get("purpose", static.get("purpose", "")))["failure_hints"],
+                "retryable": True,
+                "safe_to_retry": True,
+            },
             "mode": node.get("mode", "blocking"),
             "webhook_route": node.get("webhook_route", node.get("route", "")),
             "needs": node.get("needs") or [],
