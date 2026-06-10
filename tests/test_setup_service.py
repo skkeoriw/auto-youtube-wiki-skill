@@ -179,6 +179,8 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
             "AUTO_DOMAIN_SOURCE_REPO=https://github.com/ChangfengHU/auto-domain-cli.git",
             "AUTO_DOMAIN_SOURCE_REF=main",
             "AUTO_DOMAIN_SOURCE_COMMIT=1d4d9aa",
+            "export WEBHOOK_PUBLIC_HOST=hermes-youtube-wiki-test.example.com",
+            "export HERMES_SMOKE_ROUTE=sop-runtime-hermes-smoke",
             fn,
             "build_metadata",
         ])
@@ -195,6 +197,12 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
             "ref": "main",
             "commit": "1d4d9aa",
         })
+        self.assertEqual(
+            metadata["hermes_webhook_url"],
+            "https://hermes-youtube-wiki-test.example.com/webhooks/sop-runtime-hermes-smoke",
+        )
+        self.assertEqual(metadata["hermes_smoke_route"], "sop-runtime-hermes-smoke")
+        self.assertEqual(metadata["webhook_public_host"], "hermes-youtube-wiki-test.example.com")
 
     def test_verify_runtime_channel_invokes_public_verifier_with_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -3,6 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_FILE="${YOUTUBE_WIKI_ENV_FILE:-$HOME/.agent-brain-plugins.env}"
+
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
 
 PORT="18121"
 NAME="${YOUTUBE_WIKI_PUBLIC_NAME:-youtube-wiki}"
@@ -10,6 +18,7 @@ ENDPOINT=""
 REPO="${WIKI_GITHUB_REPO:-}"
 RUNTIME_ID="${YOUTUBE_WIKI_RUNTIME_ID:-youtube-wiki}"
 UI_URL="${SOP_UI_URL:-https://sop-ui-prototype.chxyka.ccwu.cc}"
+HERMES_SMOKE_ROUTE="${HERMES_SMOKE_ROUTE:-sop-runtime-hermes-smoke}"
 AUTO_DOMAIN_SERVER="${AUTO_DOMAIN_SERVER:-wss://tunnel-api.chxyka.ccwu.cc}"
 AUTO_DOMAIN_ZONE_NAME="${AUTO_DOMAIN_ZONE_NAME:-chxyka.ccwu.cc}"
 AUTO_DOMAIN_WORKER_SCRIPT="${AUTO_DOMAIN_WORKER_SCRIPT:-auto-domain-tunnel}"
@@ -80,7 +89,7 @@ METADATA=""
 build_metadata() {
   python3 - "$NAME" "$ENDPOINT" "$REPO" "$RUNTIME_ID" "$UI_URL" \
     "$AUTO_DOMAIN_SOURCE_MODE" "$AUTO_DOMAIN_SOURCE_REPO" "$AUTO_DOMAIN_SOURCE_REF" "$AUTO_DOMAIN_SOURCE_COMMIT" <<'PY'
-import json, sys
+import json, os, sys
 
 (
     name,
@@ -109,6 +118,21 @@ metadata = {
     "status_command": f"bash <(curl -fsSL https://skill.vyibc.com/youtube-wiki.sh) --endpoint={endpoint} --mode=status --repo={repo} --pipeline-id='<pipeline_id>'",
     "list_command": f"bash <(curl -fsSL https://skill.vyibc.com/youtube-wiki.sh) --endpoint={endpoint} --mode=list",
 }
+smoke_route = os.environ.get("HERMES_SMOKE_ROUTE", "sop-runtime-hermes-smoke").strip() or "sop-runtime-hermes-smoke"
+hermes_url = os.environ.get("HERMES_WEBHOOK_URL", "").strip().rstrip("/")
+hermes_host = os.environ.get("WEBHOOK_PUBLIC_HOST", "").strip().strip("/")
+if hermes_url or hermes_host:
+    if hermes_url:
+        if not hermes_url.startswith(("http://", "https://")):
+            hermes_url = f"https://{hermes_url}"
+        webhook_url = hermes_url if "/webhooks/" in hermes_url else f"{hermes_url}/webhooks/{smoke_route}"
+    else:
+        webhook_url = f"https://{hermes_host}/webhooks/{smoke_route}"
+    metadata["hermes_webhook_url"] = webhook_url
+    metadata["hermes_smoke_route"] = smoke_route
+    metadata["webhook_public_host"] = hermes_host or hermes_url.split("//", 1)[-1].split("/", 1)[0]
+if os.environ.get("HERMES_WEBHOOK_PORT"):
+    metadata["hermes_webhook_port"] = os.environ["HERMES_WEBHOOK_PORT"]
 if source_mode:
     metadata["auto_domain_source"] = {
         "mode": source_mode,
