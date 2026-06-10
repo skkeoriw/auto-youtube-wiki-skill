@@ -56,11 +56,34 @@ DELETE_RUNTIME_NODES = [
     "verify-runtime-removed",
 ]
 
+CREATE_INSTANCE_NODES = [
+    "parse-create-instance-request",
+    "prepare-instance-workspace",
+    "upsert-instance-registry",
+    "verify-instance-visible",
+]
+
+DELETE_INSTANCE_NODES = [
+    "parse-delete-instance-request",
+    "safety-check-instance",
+    "remove-instance-registry",
+    "cleanup-instance-files",
+    "verify-instance-removed",
+]
+
 RUNTIME_MANAGEMENT_SUMMARY_NODE = "management-summary"
+RUNTIME_MANAGEMENT_ACTIONS = {
+    "create-runtime",
+    "delete-runtime",
+    "create-instance",
+    "delete-instance",
+}
 RUNTIME_MANAGEMENT_NODES = [
     *RUNTIME_MANAGEMENT_COMMON_NODES,
     *CREATE_RUNTIME_NODES,
     *DELETE_RUNTIME_NODES,
+    *CREATE_INSTANCE_NODES,
+    *DELETE_INSTANCE_NODES,
     RUNTIME_MANAGEMENT_SUMMARY_NODE,
 ]
 
@@ -156,8 +179,8 @@ RUNTIME_CONFIG_CATEGORIES = {
 }
 
 RUNTIME_NODE_EXPLAIN = {
-    "management-request-validate": ("校验管理请求", "校验创建/删除 Runtime 的请求，并把敏感信息转为 run-scoped secret 引用。", ["识别管理动作", "解析 Runtime、通道、SSH 和 instance 输入", "写入脱敏请求与上下文"], ["缺少 SSH 或 private key 时检查 Runtime Management 默认配置。"]),
-    "action-router": ("选择执行分支", "根据 action 选择创建或删除分支，并把未选择分支标记为 skipped。", ["读取 action", "选择 create/delete 分支", "生成 active/skipped 节点列表"], ["action 只能是 create-runtime 或 delete-runtime。"]),
+    "management-request-validate": ("校验管理请求", "校验创建/删除 Runtime 或 Instance 的请求，并把敏感信息转为 run-scoped secret 引用。", ["识别管理动作", "解析 Runtime、通道、SSH 和 instance 输入", "写入脱敏请求与上下文"], ["缺少 SSH 或 private key 时检查 Runtime Management 默认配置。"]),
+    "action-router": ("选择执行分支", "根据 action 选择 Runtime/Instance 创建或删除分支，并把未选择分支标记为 skipped。", ["读取 action", "选择 create/delete runtime/instance 分支", "生成 active/skipped 节点列表"], ["action 只能是 create-runtime、delete-runtime、create-instance 或 delete-instance。"]),
     "parse-create-runtime-request": ("解析创建 Runtime 请求", "整理目标机器、Runtime 身份、默认 instance 和 secret 引用。", ["解析 SSH command", "生成 runtime_id/channel_url", "确认 runtime-management instance"], ["runtime_id 应使用 runtime-ip 形式。"]),
     "ssh-preflight": ("SSH 预检", "验证目标机器是否可登录、用户和基础环境是否满足初始化要求。", ["登录目标机器", "读取系统信息", "检查磁盘和权限"], ["SSH 失败时确认 authorized_keys 和 key 权限。"]),
     "infer-runtime-plan": ("推断初始化计划", "生成 Runtime 初始化计划，并检查 channel/runtime 是否冲突或可幂等收敛。", ["查询 tunnel-admin", "检查 client_ip", "生成 create-new/converge-existing 计划"], ["同名 channel 属于其他 IP 时必须换名或先删除。"]),
@@ -178,7 +201,16 @@ RUNTIME_NODE_EXPLAIN = {
     "verify-local-clean": ("验证本地清理干净", "确认目标机器没有 Runtime 文件、进程、端口和 Hermes/agent 残留。", ["检查路径", "检查进程", "检查端口"], ["任何 remaining_* 不为空都不能认为删除干净。"]),
     "verify-channel-removed": ("验证通道已移除", "确认 tunnel-admin 不再把目标 channel 标记为 active/local ok。", ["查询 tunnel-admin", "确认 channel 非 active", "记录状态"], ["tunnel 仍 active 说明反注册未生效。"]),
     "verify-runtime-removed": ("验证 Runtime 已删除", "综合验证公网 SPI 不可用、tunnel 不活跃、本地清理通过。", ["请求公网 SPI", "复核 tunnel", "合并本地和通道验证"], ["公网 502 但 tunnel 仍 active 不能算删除成功。"]),
-    "management-summary": ("生成管理摘要", "汇总 create/delete 分支结果，形成可交接执行结论。", ["读取分支报告", "计算最终 status", "写入 summary"], ["摘要失败通常说明前置分支报告缺失。"]),
+    "parse-create-instance-request": ("解析创建 Instance 请求", "标准化 instance_id、repo、sop_type 和目标 Runtime SSH 上下文。", ["读取 create-instance 请求", "继承 Runtime 连接配置", "写入 instance 创建上下文"], ["instance_id/repo 为空时无法创建业务实例。"]),
+    "prepare-instance-workspace": ("准备 Instance 工作区", "在目标 Runtime 上创建或收敛该 Instance 的独立工作目录。", ["创建 workspace", "准备 repo/raw/artifacts/runs 目录", "记录路径"], ["workspace 路径冲突时检查 instance_id 和 repo 名称。"]),
+    "upsert-instance-registry": ("注册 Instance", "把 Instance 写入 Runtime registry，并保持可重复执行。", ["更新 registry", "确认 enabled 状态", "记录 registry 报告"], ["registry 无法写入时检查目标机器 ~/.sop 权限。"]),
+    "verify-instance-visible": ("验证 Instance 可见", "确认 Runtime SPI 已能发现新增 Instance。", ["请求 /api/sop", "匹配 instance_id", "记录可见性"], ["Instance 不可见时检查 bridge 是否重载 registry。"]),
+    "parse-delete-instance-request": ("解析删除 Instance 请求", "定位要删除的 Instance、workspace、repo 和 force 策略。", ["读取 delete-instance 请求", "继承 Runtime 连接配置", "写入删除上下文"], ["runtime-management 是受保护管理实例，不能当作业务 Instance 删除。"]),
+    "safety-check-instance": ("检查 Instance 运行中任务", "删除前检查该 Instance 是否还有 running/pending executions。", ["查询 runs", "识别运行中任务", "根据 force 决策"], ["存在运行中任务时普通删除应停止。"]),
+    "remove-instance-registry": ("移除 Instance Registry", "从 Runtime registry 中移除目标 Instance。", ["读取 registry", "删除 instance 条目", "写回 registry"], ["registry 仍包含目标 instance 时删除不能算完成。"]),
+    "cleanup-instance-files": ("清理 Instance 文件", "删除该 Instance 的 workspace、repo、run 记录和产物索引，不影响 Runtime。", ["删除 workspace", "检查残留路径", "记录清理报告"], ["remaining_paths 不为空说明还有残留。"]),
+    "verify-instance-removed": ("验证 Instance 已删除", "确认 SPI 不再暴露该 Instance 且工作区已清理。", ["请求 /api/sop", "检查 workspace", "合并删除结论"], ["只删 registry 不删 workspace 不算清理干净。"]),
+    "management-summary": ("生成管理摘要", "汇总 Runtime/Instance create/delete 分支结果，形成可交接执行结论。", ["读取分支报告", "计算最终 status", "写入 summary"], ["摘要失败通常说明前置分支报告缺失。"]),
 }
 
 
@@ -2348,7 +2380,28 @@ def runtime_management_nodes(action):
 def runtime_management_active_nodes(action):
     if action == "delete-runtime":
         return {*RUNTIME_MANAGEMENT_COMMON_NODES, *DELETE_RUNTIME_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
-    return {*RUNTIME_MANAGEMENT_COMMON_NODES, *CREATE_RUNTIME_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
+    if action == "create-runtime":
+        return {*RUNTIME_MANAGEMENT_COMMON_NODES, *CREATE_RUNTIME_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
+    if action == "create-instance":
+        return {*RUNTIME_MANAGEMENT_COMMON_NODES, *CREATE_INSTANCE_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
+    if action == "delete-instance":
+        return {*RUNTIME_MANAGEMENT_COMMON_NODES, *DELETE_INSTANCE_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
+    return {*RUNTIME_MANAGEMENT_COMMON_NODES, RUNTIME_MANAGEMENT_SUMMARY_NODE}
+
+
+def runtime_management_node_needs(node):
+    if node == RUNTIME_MANAGEMENT_COMMON_NODES[0]:
+        return []
+    if node == "action-router":
+        return ["management-request-validate"]
+    for branch_nodes in (CREATE_RUNTIME_NODES, DELETE_RUNTIME_NODES, CREATE_INSTANCE_NODES, DELETE_INSTANCE_NODES):
+        if node == branch_nodes[0]:
+            return ["action-router"]
+        if node in branch_nodes:
+            return [branch_nodes[branch_nodes.index(node) - 1]]
+    if node == RUNTIME_MANAGEMENT_SUMMARY_NODE:
+        return [CREATE_RUNTIME_NODES[-1], DELETE_RUNTIME_NODES[-1], CREATE_INSTANCE_NODES[-1], DELETE_INSTANCE_NODES[-1]]
+    return []
 
 
 def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
@@ -2366,13 +2419,7 @@ def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
                 "id": node,
                 "title": node.replace("-", " ").title(),
                 "mode": "blocking",
-                "needs": [] if node == RUNTIME_MANAGEMENT_COMMON_NODES[0] else (
-                    ["management-request-validate"] if node == "action-router"
-                    else ["action-router"] if node in {CREATE_RUNTIME_NODES[0], DELETE_RUNTIME_NODES[0]}
-                    else [CREATE_RUNTIME_NODES[CREATE_RUNTIME_NODES.index(node) - 1]] if node in CREATE_RUNTIME_NODES
-                    else [DELETE_RUNTIME_NODES[DELETE_RUNTIME_NODES.index(node) - 1]] if node in DELETE_RUNTIME_NODES
-                    else [CREATE_RUNTIME_NODES[-1], DELETE_RUNTIME_NODES[-1]]
-                ),
+                "needs": runtime_management_node_needs(node),
                 "executor": {"type": "skill", "skill": "sop-runtime-provisioning", "webhook_route": "sop-runtime-provisioning"},
                 "inputs": {},
                 "outputs": {"report": f"raw/provision/{pipeline_id}/{node}.json"},
@@ -2459,8 +2506,8 @@ def create_runtime_management_workspace_run(sop, pipeline_id, action, body):
 
 def trigger_runtime_management(sop, body):
     action = str(body.get("management_action") or body.get("action") or "create-runtime")
-    if action not in {"create-runtime", "delete-runtime"}:
-        return 400, {"status": "error", "message": "action must be create-runtime or delete-runtime"}
+    if action not in RUNTIME_MANAGEMENT_ACTIONS:
+        return 400, {"status": "error", "message": "action must be create-runtime, delete-runtime, create-instance, or delete-instance"}
     body = inject_runtime_management_config(body)
     now_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     pipeline_id = str(body.get("pipeline_id") or f"{action}-{now_token}")

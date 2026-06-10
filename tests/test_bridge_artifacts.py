@@ -583,6 +583,53 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(skipped_state["status"], "skipped")
         self.assertEqual(skipped_state["progress"], 100)
 
+    def test_runtime_management_create_instance_uses_instance_branch(self):
+        plugin_root = self.wiki / "plugin-root"
+        runner = plugin_root / "youtube-wiki/infrastructure/provision_runtime.py"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        sop = {
+            "id": "runtime-management",
+            "sop_type": "runtime-management",
+            "repo": "skkeoriw/runtime-management",
+            "wiki_local_path": str(self.wiki),
+        }
+
+        with patch.dict(os.environ, {"AGENT_BRAIN_PLUGINS_PATH": str(plugin_root)}):
+            with patch.object(bridge.subprocess, "Popen") as popen:
+                status, result = bridge.trigger_sop(sop, {
+                    "action": "create-instance",
+                    "runtime_id": "runtime-34-29-222-183",
+                    "channel_url": "https://runtime-34-29-222-183.chxyka.ccwu.cc",
+                    "ssh_command": "ssh -i ~/.ssh/id_ed25519 user@34.29.222.183",
+                    "private_key": "secret-test-key",
+                    "github_token": "secret-token",
+                    "instance_id": "wiki-sop-new-instance",
+                    "repo": "skkeoriw/wiki-sop-new-instance",
+                    "dry_run": True,
+                    "pipeline_id": "create-instance-test",
+                })
+
+        self.assertEqual(status, 202)
+        self.assertEqual(result["pipeline_id"], "create-instance-test")
+        popen.assert_called_once()
+        request_data = json.loads((self.wiki / ".sop/secrets/create-instance-test/request.json").read_text())
+        self.assertEqual(request_data["action"], "create-instance")
+        self.assertEqual(request_data["instance_id"], "wiki-sop-new-instance")
+        context_text = (self.wiki / "raw/pipeline-runs/create-instance-test/context.json").read_text()
+        self.assertNotIn("secret-test-key", context_text)
+        run = json.loads((self.wiki / "raw/pipeline-runs/create-instance-test/run.json").read_text())
+        self.assertEqual(run["nodes"]["parse-create-instance-request"], "waiting")
+        self.assertEqual(run["nodes"]["prepare-instance-workspace"], "waiting")
+        self.assertEqual(run["nodes"]["parse-create-runtime-request"], "skipped")
+        self.assertEqual(run["nodes"]["parse-delete-instance-request"], "skipped")
+        dag = json.loads((self.wiki / "raw/pipeline-runs/create-instance-test/dag.json").read_text())
+        summary = next(node for node in dag["nodes"] if node["id"] == "management-summary")
+        self.assertIn("verify-runtime-visible", summary["needs"])
+        self.assertIn("verify-runtime-removed", summary["needs"])
+        self.assertIn("verify-instance-visible", summary["needs"])
+        self.assertIn("verify-instance-removed", summary["needs"])
+
     def test_run_routes_prefer_runtime_index(self):
         run_file = self.wiki / "raw/pipeline-runs/pipe-1/run.json"
         run = json.loads(run_file.read_text(encoding="utf-8"))
