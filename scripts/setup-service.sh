@@ -19,6 +19,9 @@ REPO="${WIKI_GITHUB_REPO:-}"
 RUNTIME_ID="${YOUTUBE_WIKI_RUNTIME_ID:-youtube-wiki}"
 UI_URL="${SOP_UI_URL:-https://sop-ui-prototype.chxyka.ccwu.cc}"
 HERMES_SMOKE_ROUTE="${HERMES_SMOKE_ROUTE:-sop-runtime-hermes-smoke}"
+HERMES_WEBHOOK_PORT="${HERMES_WEBHOOK_PORT:-8644}"
+HERMES_PUBLIC_NAME="${HERMES_PUBLIC_NAME:-}"
+HERMES_TUNNEL_ENABLED="${HERMES_TUNNEL_ENABLED:-1}"
 AUTO_DOMAIN_SERVER="${AUTO_DOMAIN_SERVER:-wss://tunnel-api.chxyka.ccwu.cc}"
 AUTO_DOMAIN_ZONE_NAME="${AUTO_DOMAIN_ZONE_NAME:-chxyka.ccwu.cc}"
 AUTO_DOMAIN_WORKER_SCRIPT="${AUTO_DOMAIN_WORKER_SCRIPT:-auto-domain-tunnel}"
@@ -64,6 +67,41 @@ command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "node is required" >&2; exit 1; }
 command -v npm >/dev/null 2>&1 || { echo "npm is required" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
+
+host_from_url() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+raw = (sys.argv[1] or "").strip().strip("/")
+if not raw:
+    raise SystemExit(0)
+parsed = urllib.parse.urlparse(raw if "://" in raw else f"https://{raw}")
+print((parsed.hostname or raw.split("/", 1)[0]).strip())
+PY
+}
+
+WEBHOOK_PUBLIC_HOST="$(host_from_url "${WEBHOOK_PUBLIC_HOST:-}")"
+if [ -z "$WEBHOOK_PUBLIC_HOST" ] && [ -n "${HERMES_WEBHOOK_URL:-}" ]; then
+  WEBHOOK_PUBLIC_HOST="$(host_from_url "$HERMES_WEBHOOK_URL")"
+fi
+if [ -z "$HERMES_PUBLIC_NAME" ] && [ -n "$WEBHOOK_PUBLIC_HOST" ]; then
+  suffix=".${AUTO_DOMAIN_ZONE_NAME}"
+  if [ "${WEBHOOK_PUBLIC_HOST%"$suffix"}" != "$WEBHOOK_PUBLIC_HOST" ]; then
+    HERMES_PUBLIC_NAME="${WEBHOOK_PUBLIC_HOST%"$suffix"}"
+  fi
+fi
+if [ -z "$HERMES_PUBLIC_NAME" ]; then
+  HERMES_PUBLIC_NAME="hermes-${NAME}"
+fi
+if [ -z "$WEBHOOK_PUBLIC_HOST" ]; then
+  WEBHOOK_PUBLIC_HOST="${HERMES_PUBLIC_NAME}.${AUTO_DOMAIN_ZONE_NAME}"
+fi
+if [ -z "${HERMES_WEBHOOK_URL:-}" ]; then
+  HERMES_WEBHOOK_URL="https://${WEBHOOK_PUBLIC_HOST}"
+fi
+HERMES_ENDPOINT="https://${WEBHOOK_PUBLIC_HOST}"
+export HERMES_SMOKE_ROUTE HERMES_WEBHOOK_PORT WEBHOOK_PUBLIC_HOST HERMES_WEBHOOK_URL
 
 if [ -n "${CF_API_KEY:-${CLOUDFLARE_API_KEY:-}}" ] && [ -n "${CF_EMAIL:-${CLOUDFLARE_EMAIL:-}}" ]; then
   bash "$SCRIPT_DIR/ensure-cloudflare-tunnel-routes.sh" \
@@ -133,6 +171,51 @@ if hermes_url or hermes_host:
     metadata["webhook_public_host"] = hermes_host or hermes_url.split("//", 1)[-1].split("/", 1)[0]
 if os.environ.get("HERMES_WEBHOOK_PORT"):
     metadata["hermes_webhook_port"] = os.environ["HERMES_WEBHOOK_PORT"]
+if source_mode:
+    metadata["auto_domain_source"] = {
+        "mode": source_mode,
+        "repo": source_repo,
+        "ref": source_ref,
+        "commit": source_commit,
+    }
+print(json.dumps(metadata, ensure_ascii=False))
+PY
+}
+
+build_hermes_metadata() {
+  python3 - "$HERMES_PUBLIC_NAME" "$HERMES_ENDPOINT" "$NAME" "$ENDPOINT" "$RUNTIME_ID" "$UI_URL" "$HERMES_WEBHOOK_PORT" \
+    "$AUTO_DOMAIN_SOURCE_MODE" "$AUTO_DOMAIN_SOURCE_REPO" "$AUTO_DOMAIN_SOURCE_REF" "$AUTO_DOMAIN_SOURCE_COMMIT" <<'PY'
+import json, os, sys
+
+(
+    hermes_name,
+    hermes_endpoint,
+    runtime_name,
+    runtime_endpoint,
+    runtime_id,
+    ui_url,
+    hermes_port,
+    source_mode,
+    source_repo,
+    source_ref,
+    source_commit,
+) = sys.argv[1:]
+smoke_route = os.environ.get("HERMES_SMOKE_ROUTE", "sop-runtime-hermes-smoke").strip().strip("/") or "sop-runtime-hermes-smoke"
+endpoint = hermes_endpoint.rstrip("/")
+metadata = {
+    "title": f"{runtime_name} Hermes",
+    "type": "sop-runtime-hermes",
+    "runtime_id": runtime_id,
+    "channel_name": hermes_name,
+    "channel_url": endpoint,
+    "endpoint_url": endpoint,
+    "webhook_public_host": os.environ.get("WEBHOOK_PUBLIC_HOST", "").strip(),
+    "hermes_webhook_url": f"{endpoint}/webhooks/{smoke_route}",
+    "hermes_smoke_route": smoke_route,
+    "hermes_webhook_port": hermes_port,
+    "spi_base_url": f"{runtime_endpoint.rstrip('/')}/api/sop",
+    "ui_url": ui_url,
+}
 if source_mode:
     metadata["auto_domain_source"] = {
         "mode": source_mode,
@@ -270,6 +353,58 @@ verify_runtime_channel() {
   return 1
 }
 
+start_managed_channel() {
+  local channel_name="$1"
+  local channel_port="$2"
+  local channel_metadata="$3"
+  local channel_dir="$HOME/.auto-domain-$channel_name"
+
+  mkdir -p "$channel_dir"
+  printf '%s\n' '{"name":"auto-domain-youtube-wiki","private":true,"dependencies":{"ws":"^8.18.0"}}' > "$channel_dir/package.json"
+  (cd "$channel_dir" && npm install --silent --prefer-offline)
+
+  if [ -f "$channel_dir/agent.pid" ] && kill -0 "$(cat "$channel_dir/agent.pid")" 2>/dev/null; then
+    kill "$(cat "$channel_dir/agent.pid")" || true
+    sleep 1
+  fi
+  : > "$channel_dir/agent.log"
+
+  (
+    cd "$channel_dir"
+    NODE_PATH="$channel_dir/node_modules${NODE_PATH:+:$NODE_PATH}" setsid node "$AUTO_DOMAIN_AGENT_JS" \
+      --port="$channel_port" \
+      --name="$channel_name" \
+      --replace \
+      --metadata="$channel_metadata" \
+      --server="$AUTO_DOMAIN_SERVER" \
+      >> agent.log 2>&1 < /dev/null &
+    echo $! > agent.pid
+  )
+}
+
+wait_managed_channel() {
+  local channel_name="$1"
+  local channel_dir="$HOME/.auto-domain-$channel_name"
+  local ready_text="$2"
+
+  for _ in $(seq 1 30); do
+    if grep -q "Public URL" "$channel_dir/agent.log" 2>/dev/null; then
+      echo "$ready_text"
+      echo "Logs: $channel_dir/agent.log"
+      return 0
+    fi
+    if ! kill -0 "$(cat "$channel_dir/agent.pid")" 2>/dev/null; then
+      tail -80 "$channel_dir/agent.log" >&2 || true
+      return 1
+    fi
+    sleep 1
+  done
+
+  tail -80 "$channel_dir/agent.log" >&2 || true
+  echo "timed out waiting for public channel: $channel_name" >&2
+  return 1
+}
+
 fix_agent_ws_host() {
   local file="$1"
   [ -f "$file" ] || return 0
@@ -326,6 +461,8 @@ PY
 
 cleanup_auto_domain "--name=$NAME"
 cleanup_auto_domain "agent.js .*--name=$NAME"
+cleanup_auto_domain "--name=$HERMES_PUBLIC_NAME"
+cleanup_auto_domain "agent.js .*--name=$HERMES_PUBLIC_NAME"
 
 if [ "$AUTO_DOMAIN_ALLOW_LOCAL_RUNNER" = "1" ] && [ -f "$AUTO_DOMAIN_SCRIPT" ] && auto_domain_script_supports_safe_metadata "$AUTO_DOMAIN_SCRIPT"; then
   AUTO_DOMAIN_SOURCE_MODE="local-runner"
@@ -384,44 +521,17 @@ AUTO_DOMAIN_SOURCE_REPO="$AUTO_DOMAIN_REPO"
 AUTO_DOMAIN_SOURCE_REF="$AUTO_DOMAIN_REF"
 AUTO_DOMAIN_SOURCE_COMMIT="$(git -C "$AUTO_DOMAIN_SOURCE_DIR" rev-parse --short HEAD 2>/dev/null || true)"
 METADATA="$(build_metadata)"
+HERMES_METADATA="$(build_hermes_metadata)"
 
-CHANNEL_DIR="$HOME/.auto-domain-$NAME"
-mkdir -p "$CHANNEL_DIR"
-printf '%s\n' '{"name":"auto-domain-youtube-wiki","private":true,"dependencies":{"ws":"^8.18.0"}}' > "$CHANNEL_DIR/package.json"
-(cd "$CHANNEL_DIR" && npm install --silent --prefer-offline)
-
-if [ -f "$CHANNEL_DIR/agent.pid" ] && kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 2>/dev/null; then
-  kill "$(cat "$CHANNEL_DIR/agent.pid")" || true
-  sleep 1
+start_managed_channel "$NAME" "$PORT" "$METADATA"
+if [ "$HERMES_TUNNEL_ENABLED" = "1" ]; then
+  start_managed_channel "$HERMES_PUBLIC_NAME" "$HERMES_WEBHOOK_PORT" "$HERMES_METADATA"
 fi
 
-(
-  cd "$CHANNEL_DIR"
-  NODE_PATH="$CHANNEL_DIR/node_modules${NODE_PATH:+:$NODE_PATH}" setsid node "$AUTO_DOMAIN_AGENT_JS" \
-    --port="$PORT" \
-    --name="$NAME" \
-    --replace \
-    --metadata="$METADATA" \
-    --server="$AUTO_DOMAIN_SERVER" \
-    >> agent.log 2>&1 < /dev/null &
-  echo $! > agent.pid
-)
-
-for _ in $(seq 1 30); do
-  if grep -q "Public URL" "$CHANNEL_DIR/agent.log" 2>/dev/null; then
-    echo "Public channel ready: $ENDPOINT"
-    echo "Logs: $CHANNEL_DIR/agent.log"
-    verify_public_channel
-    verify_runtime_channel
-    exit 0
-  fi
-  if ! kill -0 "$(cat "$CHANNEL_DIR/agent.pid")" 2>/dev/null; then
-    tail -80 "$CHANNEL_DIR/agent.log" >&2 || true
-    exit 1
-  fi
-  sleep 1
-done
-
-tail -80 "$CHANNEL_DIR/agent.log" >&2 || true
-echo "timed out waiting for public channel" >&2
-exit 1
+wait_managed_channel "$NAME" "Public channel ready: $ENDPOINT"
+if [ "$HERMES_TUNNEL_ENABLED" = "1" ]; then
+  wait_managed_channel "$HERMES_PUBLIC_NAME" "Hermes public channel ready: $HERMES_ENDPOINT"
+fi
+verify_public_channel
+verify_runtime_channel
+exit 0

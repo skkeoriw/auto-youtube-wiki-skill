@@ -16,8 +16,10 @@ SETUP_SERVICE = ROOT / "scripts" / "setup-service.sh"
 
 def _extract_shell_function(name):
     text = SETUP_SERVICE.read_text(encoding="utf-8")
-    if name == "build_metadata":
+    if name in {"build_metadata", "build_hermes_metadata"}:
         match = re.search(r"^build_metadata\(\) \{\n.*?^PY\n^\}\n", text, flags=re.M | re.S)
+        if name == "build_hermes_metadata":
+            match = re.search(r"^build_hermes_metadata\(\) \{\n.*?^PY\n^\}\n", text, flags=re.M | re.S)
         if not match:
             raise AssertionError(f"{name} function not found")
         return match.group(0)
@@ -162,6 +164,9 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
         self.assertIn("auto_domain_source", text)
         self.assertIn("prepare_auto_domain_source_agent", text)
         self.assertIn("verify_runtime_channel", text)
+        self.assertIn("build_hermes_metadata", text)
+        self.assertIn("start_managed_channel", text)
+        self.assertIn("sop-runtime-hermes", text)
         self.assertIn('setsid node "$AUTO_DOMAIN_AGENT_JS"', text)
         self.assertIn("local auto-domain-cli runner ignored", text)
         self.assertIn("using managed latest source instead", text)
@@ -203,6 +208,37 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
         )
         self.assertEqual(metadata["hermes_smoke_route"], "sop-runtime-hermes-smoke")
         self.assertEqual(metadata["webhook_public_host"], "hermes-youtube-wiki-test.example.com")
+
+    def test_build_hermes_metadata_contract(self):
+        fn = _extract_shell_function("build_hermes_metadata")
+        cmd = "\n".join([
+            "HERMES_PUBLIC_NAME=hermes-youtube-wiki-test",
+            "HERMES_ENDPOINT=https://hermes-youtube-wiki-test.example.com",
+            "NAME=youtube-wiki-test",
+            "ENDPOINT=https://youtube-wiki-test.example.com",
+            "RUNTIME_ID=youtube-wiki-test",
+            "UI_URL=https://sop-ui-prototype.example.com",
+            "HERMES_WEBHOOK_PORT=8644",
+            "AUTO_DOMAIN_SOURCE_MODE=managed",
+            "AUTO_DOMAIN_SOURCE_REPO=https://github.com/ChangfengHU/auto-domain-cli.git",
+            "AUTO_DOMAIN_SOURCE_REF=main",
+            "AUTO_DOMAIN_SOURCE_COMMIT=1d4d9aa",
+            "export WEBHOOK_PUBLIC_HOST=hermes-youtube-wiki-test.example.com",
+            "export HERMES_SMOKE_ROUTE=sop-runtime-hermes-smoke",
+            fn,
+            "build_hermes_metadata",
+        ])
+        result = _run(cmd)
+        metadata = json.loads(result.stdout)
+
+        self.assertEqual(metadata["type"], "sop-runtime-hermes")
+        self.assertEqual(metadata["runtime_id"], "youtube-wiki-test")
+        self.assertEqual(metadata["channel_name"], "hermes-youtube-wiki-test")
+        self.assertEqual(metadata["channel_url"], "https://hermes-youtube-wiki-test.example.com")
+        self.assertEqual(metadata["spi_base_url"], "https://youtube-wiki-test.example.com/api/sop")
+        self.assertEqual(metadata["hermes_webhook_url"], "https://hermes-youtube-wiki-test.example.com/webhooks/sop-runtime-hermes-smoke")
+        self.assertEqual(metadata["hermes_webhook_port"], "8644")
+        self.assertEqual(metadata["auto_domain_source"]["mode"], "managed")
 
     def test_verify_runtime_channel_invokes_public_verifier_with_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

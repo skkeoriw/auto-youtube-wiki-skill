@@ -1,5 +1,6 @@
 import http.server
 import hashlib
+import hmac
 import importlib.util
 import json
 import mimetypes
@@ -10,6 +11,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+import urllib.error
+import urllib.request
 
 import yaml
 
@@ -102,6 +105,7 @@ RUNTIME_CAPABILITY_ENV = {
     "HERMES_WEBHOOK_TOKEN": ["hermes_webhook_token"],
     "HERMES_WEBHOOK_PORT": ["hermes_webhook_port"],
     "HERMES_WEBHOOK_URL": ["hermes_webhook_url"],
+    "HERMES_SMOKE_ROUTE": ["hermes_smoke_route"],
     "WEBHOOK_PUBLIC_HOST": ["webhook_public_host", "hermes_public_host"],
     "NOTEBOOKLM_BRIDGE_URL": ["notebooklm_bridge_url"],
     "NOTEBOOKLM_BRIDGE_TOKEN": ["notebooklm_bridge_token"],
@@ -1975,6 +1979,117 @@ def runtime_info():
     }
 
 
+def hermes_smoke_route():
+    return (os.environ.get("HERMES_SMOKE_ROUTE") or "sop-runtime-hermes-smoke").strip().strip("/") or "sop-runtime-hermes-smoke"
+
+
+def hermes_webhook_url():
+    route = hermes_smoke_route()
+    raw = (
+        os.environ.get("HERMES_WEBHOOK_URL")
+        or os.environ.get("WEBHOOK_PUBLIC_HOST")
+        or os.environ.get("HERMES_PUBLIC_HOST")
+        or ""
+    ).strip().rstrip("/")
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    if "/webhooks/" in raw:
+        return raw
+    return f"{raw}/webhooks/{route}"
+
+
+def shell_quote_single(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def hermes_manual_curl(url, payload):
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return "\n".join([
+        f"body={shell_quote_single(body)}",
+        "sig=$(printf '%s' \"$body\" | openssl dgst -sha256 -hmac \"$HERMES_WEBHOOK_TOKEN\" -hex | sed 's/^.* //')",
+        "curl -sS -X POST \\",
+        f"  {shell_quote_single(url)} \\",
+        "  -H 'Content-Type: application/json' \\",
+        "  -H 'User-Agent: Mozilla/5.0 SOP-Runtime-Hermes-Smoke/1.0' \\",
+        "  -H \"X-Hub-Signature-256: sha256=$sig\" \\",
+        "  --data-binary \"$body\"",
+    ])
+
+
+def hermes_smoke_check(message):
+    target = hermes_webhook_url()
+    token = os.environ.get("HERMES_WEBHOOK_TOKEN", "")
+    info = runtime_info()
+    payload = {
+        "message": message or "你好 你是谁",
+        "runtime_id": info.get("runtime_id", ""),
+        "channel_url": info.get("channel_url", ""),
+        "spi_base_url": info.get("spi_base_url", ""),
+        "source": "sop-runtime-bridge",
+        "mode": "hermes-smoke-check",
+    }
+    base = {
+        "target_url": target,
+        "route": hermes_smoke_route(),
+        "curl": hermes_manual_curl(target or "https://<WEBHOOK_PUBLIC_HOST>/webhooks/sop-runtime-hermes-smoke", payload),
+        "token_present": bool(token),
+        "payload": payload,
+    }
+    if not target:
+        return 422, {
+            **base,
+            "ok": False,
+            "reason": "HERMES_WEBHOOK_URL or WEBHOOK_PUBLIC_HOST is not configured on this Runtime",
+        }
+    if not token:
+        return 422, {
+            **base,
+            "ok": False,
+            "reason": "HERMES_WEBHOOK_TOKEN is not configured on this Runtime",
+        }
+
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(token.encode("utf-8"), data, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0 SOP-Runtime-Hermes-Smoke/1.0",
+        "X-Hub-Signature-256": f"sha256={signature}",
+    }
+    started = time.monotonic()
+    http_status = 0
+    content_type = ""
+    response_body = ""
+    error = ""
+    try:
+        req = urllib.request.Request(target, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as response:
+            http_status = response.status
+            content_type = response.headers.get("content-type", "")
+            response_body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        http_status = exc.code
+        content_type = exc.headers.get("content-type", "")
+        response_body = exc.read().decode("utf-8", errors="replace")
+        error = f"HTTP {exc.code}"
+    except Exception as exc:
+        error = str(exc)
+    latency_ms = round((time.monotonic() - started) * 1000)
+    ok = http_status in {200, 201, 202, 204}
+    return (200 if ok else 502), {
+        **base,
+        "ok": ok,
+        "http_status": http_status,
+        "content_type": content_type,
+        "latency_ms": latency_ms,
+        "response": response_body,
+        "error": "" if ok else error or f"HTTP {http_status}",
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
 def workflow_binding(sop):
     sop_id = sop.get("id") or sop.get("instance_id", "")
     business_nodes = [
@@ -2781,12 +2896,16 @@ def retry_node(sop, pipeline_id, node_id):
                 "wiki_local_path": str(wiki),
                 "run_id": run_id,
                 "pipeline_id": pipeline_id,
-            }).encode()
+            }, separators=(",", ":")).encode()
             try:
+                signature = hmac.new(token.encode("utf-8"), payload, hashlib.sha256).hexdigest() if token else ""
+                headers = {"Content-Type": "application/json"}
+                if signature:
+                    headers["X-Hub-Signature-256"] = f"sha256={signature}"
                 req = _req.Request(
                     f"http://localhost:{port}/webhooks/{route}",
                     data=payload,
-                    headers={"Content-Type": "application/json", "X-GitLab-Token": token},
+                    headers=headers,
                 )
                 _req.urlopen(req, timeout=15)
                 launched = True
@@ -3149,6 +3268,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = {}
 
         path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+
+        # POST /api/sop/runtime/hermes-smoke  → server-side signed Hermes connectivity check.
+        if path == ["api", "sop", "runtime", "hermes-smoke"]:
+            status, result = hermes_smoke_check(str(data.get("message") or data.get("text") or data.get("prompt") or "你好 你是谁"))
+            return json_response(self, status, result)
 
         # POST /api/sop/{instance}/config/management/init  → copy current runtime env/env_file into server-side defaults
         if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "config" and path[4] == "management" and path[5] == "init":

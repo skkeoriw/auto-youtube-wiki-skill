@@ -398,6 +398,52 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(data["service"], "sop-bridge")
         self.assertEqual(data["runtime"]["runtime_id"], "test-runtime")
 
+    def test_hermes_smoke_check_uses_server_side_hmac_signature(self):
+        captured = {}
+
+        class FakeResponse:
+            status = 202
+            headers = {"content-type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"status":"accepted"}'
+
+        def fake_urlopen(request, timeout=0):
+            captured["request"] = request
+            captured["body"] = request.data
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with (
+            patch.dict(os.environ, {
+                "HERMES_WEBHOOK_URL": "https://hermes.example",
+                "HERMES_SMOKE_ROUTE": "sop-runtime-hermes-smoke",
+                "HERMES_WEBHOOK_TOKEN": "secret-token",
+            }, clear=False),
+            patch.object(bridge, "runtime_info", return_value={
+                "runtime_id": "runtime-test",
+                "channel_url": "https://runtime-test.example",
+                "spi_base_url": "https://runtime-test.example/api/sop",
+            }),
+            patch.object(bridge.urllib.request, "urlopen", side_effect=fake_urlopen),
+        ):
+            status, result = bridge.hermes_smoke_check("你好 你是谁")
+
+        req = captured["request"]
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["target_url"], "https://hermes.example/webhooks/sop-runtime-hermes-smoke")
+        self.assertIn("x-hub-signature-256", {key.lower(): value for key, value in req.headers.items()})
+        self.assertNotIn("secret-token", json.dumps(result, ensure_ascii=False))
+        self.assertIn("$HERMES_WEBHOOK_TOKEN", result["curl"])
+        self.assertEqual(captured["timeout"], 60)
+
     def test_node_registry_and_actions_routes(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
