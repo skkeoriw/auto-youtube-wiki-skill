@@ -728,20 +728,6 @@ def runtime_management_config_preview(sop):
     }
 
 
-def runtime_management_auth_token():
-    return os.environ.get("SOP_MANAGEMENT_TOKEN") or os.environ.get("HERMES_WEBHOOK_TOKEN") or ""
-
-
-def is_runtime_management_authorized(handler):
-    expected = runtime_management_auth_token()
-    if not expected:
-        return False
-    header = handler.headers.get("Authorization", "")
-    if header.lower().startswith("bearer "):
-        return header.split(" ", 1)[1].strip() == expected
-    return False
-
-
 def save_runtime_management_config(values):
     current = normalize_runtime_settings_values(read_runtime_management_config_values())
     allowed_keys = set(runtime_settings_alias_map())
@@ -3579,8 +3565,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
                 return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
             overwrite = bool(data.get("overwrite"))
-            if overwrite and not is_runtime_management_authorized(self):
-                return json_response(self, 401, {"detail": "Management token is required for overwrite initialization"})
             changed = initialize_runtime_management_config(overwrite=overwrite)
             return json_response(self, 200, {
                 "status": "initialized",
@@ -3595,8 +3579,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return json_response(self, 404, {"detail": "SOP not found"})
             if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
                 return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
-            if not is_runtime_management_authorized(self):
-                return json_response(self, 401, {"detail": "Management token is required"})
             values = data.get("values") if isinstance(data.get("values"), dict) else data
             changed = save_runtime_management_config(values)
             return json_response(self, 200, {

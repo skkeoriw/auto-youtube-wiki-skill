@@ -403,6 +403,33 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(data["values"]["CLOUDFLARE_API_KEY"], "seed-secret")
         self.assertEqual(data["backend"], "d1")
 
+    def test_runtime_management_config_save_does_not_require_authorization(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        responses = []
+
+        with (
+            patch.object(bridge, "find_sop", return_value={"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}),
+            patch.object(bridge, "save_runtime_management_config", return_value={"SOP_UI_URL": "https://sop-ui-prototype.chxyka.ccwu.cc"}) as save_mock,
+            patch.object(bridge, "runtime_management_config_preview", return_value={"backend": "d1", "items": []}),
+        ):
+            thread.start()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/runtime-management/config/management",
+                data=json.dumps({"values": {"SOP_UI_URL": "https://sop-ui-prototype.chxyka.ccwu.cc"}}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                responses.append((resp.status, json.loads(resp.read().decode("utf-8"))))
+        server.shutdown()
+        server.server_close()
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(responses[0][1]["status"], "saved")
+        self.assertEqual(save_mock.call_count, 1)
+        self.assertNotIn("Authorization", save_mock.call_args.kwargs)
+
     def test_indexed_artifact_preview_is_backfilled(self):
         artifact = {
             "id": "indexed-1",
