@@ -288,6 +288,29 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(merged["runtime_id"], "runtime-34-29-222-183")
         self.assertIn("ssh_command", merged["_management_config_injected"])
 
+    def test_runtime_management_config_accepts_global_repo_defaults(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path):
+            changed = bridge.save_runtime_management_config({
+                "GITHUB_CHANGFENGHU_TOKEN": "github-owner-token",
+                "GITHUB_SKKEORIW_TOKEN": "github-runtime-token",
+                "AGENT_REPO": "https://github.com/skkeoriw/agent-brain-plugins",
+                "AUTO_DOMAIN_REPO": "https://github.com/ChangfengHU/auto-domain-cli",
+                "AUTO_DOMAIN_TUNNEL_REPO": "https://github.com/ChangfengHU/cloudflare-youtube-pipeline/tree/main/auto-domain-tunnel",
+                "SKILL_PUBLISHER_REPO": "https://github.com/ChangfengHU/skill-publisher",
+            })
+            preview = bridge.runtime_management_config_preview(sop)
+            merged = bridge.inject_runtime_management_config({"action": "create-runtime"})
+
+        by_key = {item["key"]: item for item in preview["items"]}
+        self.assertIn("GITHUB_CHANGFENGHU_TOKEN", changed)
+        self.assertTrue(by_key["GITHUB_CHANGFENGHU_TOKEN"]["secret"])
+        self.assertEqual(by_key["AGENT_REPO"]["category"], "repo")
+        self.assertEqual(merged["agent_repo"], "https://github.com/skkeoriw/agent-brain-plugins")
+        self.assertEqual(merged["auto_domain_repo"], "https://github.com/ChangfengHU/auto-domain-cli")
+        self.assertNotIn("github-owner-token", json.dumps(preview))
+
     def test_runtime_management_config_initializes_from_current_runtime(self):
         env_file = self.wiki / ".agent-brain-plugins.env"
         env_file.write_text(
