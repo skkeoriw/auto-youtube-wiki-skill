@@ -2324,7 +2324,8 @@ def hermes_post_with_retry(target, data, headers, attempts=3, opener=None, sleep
             error = str(exc)
         if http_status in {200, 201, 202, 204}:
             break
-        transient_failure = http_status in {502, 503, 504} or "fetch failed" in response_body.lower() or "fetch failed" in error.lower()
+        retry_text = f"{response_body}\n{error}".lower()
+        transient_failure = http_status in {502, 503, 504} or "fetch failed" in retry_text or "tunnel offline" in retry_text
         if attempt < attempts and transient_failure:
             sleeper(1.5 * attempt)
             continue

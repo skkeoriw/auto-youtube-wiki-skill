@@ -637,6 +637,46 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertGreaterEqual(len(calls), 2)
 
+    def test_hermes_smoke_check_retries_tunnel_offline(self):
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, status, body):
+                self.status = status
+                self.headers = {"content-type": "application/json"}
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self._body
+
+        def fake_urlopen(request, timeout=0):
+            calls.append(request)
+            if len(calls) == 1:
+                return FakeResponse(502, b'{"error":"Tunnel offline"}')
+            return FakeResponse(202, b'{"status":"accepted"}')
+
+        http_status, content_type, response_body, error, attempts = bridge.hermes_post_with_retry(
+            "https://hermes.example/webhooks/sop-runtime-hermes-smoke",
+            b"{}",
+            {"Content-Type": "application/json"},
+            attempts=3,
+            opener=fake_urlopen,
+            sleeper=lambda _seconds: None,
+        )
+
+        self.assertEqual(http_status, 202)
+        self.assertEqual(content_type, "application/json")
+        self.assertEqual(response_body, '{"status":"accepted"}')
+        self.assertEqual(error, "")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(calls), 2)
+
     def test_node_registry_and_actions_routes(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
