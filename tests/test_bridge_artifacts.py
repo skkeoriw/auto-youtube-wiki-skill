@@ -580,6 +580,63 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("$HERMES_WEBHOOK_TOKEN", result["curl"])
         self.assertEqual(captured["timeout"], 60)
 
+    def test_hermes_smoke_check_retries_transient_502(self):
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, status, body):
+                self.status = status
+                self.headers = {"content-type": "application/json" if status == 202 else "text/plain"}
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self._body
+
+        def fake_urlopen(request, timeout=0):
+            calls.append(request)
+            if len(calls) == 1:
+                return FakeResponse(502, b"Local service error: fetch failed")
+            return FakeResponse(202, b'{"status":"accepted"}')
+
+        payload = {
+            "message": "你好 你是谁",
+            "runtime_id": "runtime-test",
+            "channel_url": "https://runtime-test.example",
+            "spi_base_url": "https://runtime-test.example/api/sop",
+            "source": "sop-runtime-bridge",
+            "mode": "hermes-smoke-check",
+        }
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        signature = bridge.hmac.new(b"secret-token", data, bridge.hashlib.sha256).hexdigest()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": "Mozilla/5.0 SOP-Runtime-Hermes-Smoke/1.0",
+            "X-Hub-Signature-256": f"sha256={signature}",
+        }
+
+        http_status, content_type, response_body, error, attempts = bridge.hermes_post_with_retry(
+            "https://hermes.example/webhooks/sop-runtime-hermes-smoke",
+            data,
+            headers,
+            attempts=3,
+            opener=fake_urlopen,
+            sleeper=lambda _seconds: None,
+        )
+
+        self.assertEqual(http_status, 202)
+        self.assertEqual(content_type, "application/json")
+        self.assertEqual(response_body, '{"status":"accepted"}')
+        self.assertEqual(error, "")
+        self.assertEqual(attempts, 2)
+        self.assertGreaterEqual(len(calls), 2)
+
     def test_node_registry_and_actions_routes(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

@@ -2296,6 +2296,42 @@ def hermes_manual_curl(url, payload):
     ])
 
 
+def hermes_post_with_retry(target, data, headers, attempts=3, opener=None, sleeper=None):
+    opener = opener or urllib.request.urlopen
+    sleeper = sleeper or time.sleep
+    http_status = 0
+    content_type = ""
+    response_body = ""
+    error = ""
+    attempts_used = 0
+    for attempt in range(1, attempts + 1):
+        attempts_used = attempt
+        try:
+            req = urllib.request.Request(target, data=data, headers=headers, method="POST")
+            with opener(req, timeout=60) as response:
+                http_status = response.status
+                content_type = response.headers.get("content-type", "")
+                response_body = response.read().decode("utf-8", errors="replace")
+                error = ""
+        except urllib.error.HTTPError as exc:
+            http_status = exc.code
+            content_type = exc.headers.get("content-type", "")
+            response_body = exc.read().decode("utf-8", errors="replace")
+            error = f"HTTP {exc.code}"
+        except Exception as exc:
+            http_status = 0
+            response_body = ""
+            error = str(exc)
+        if http_status in {200, 201, 202, 204}:
+            break
+        transient_failure = http_status in {502, 503, 504} or "fetch failed" in response_body.lower() or "fetch failed" in error.lower()
+        if attempt < attempts and transient_failure:
+            sleeper(1.5 * attempt)
+            continue
+        break
+    return http_status, content_type, response_body, error, attempts_used
+
+
 def hermes_smoke_check(message):
     target = hermes_webhook_url()
     token = os.environ.get("HERMES_WEBHOOK_TOKEN", "")
@@ -2337,28 +2373,13 @@ def hermes_smoke_check(message):
         "X-Hub-Signature-256": f"sha256={signature}",
     }
     started = time.monotonic()
-    http_status = 0
-    content_type = ""
-    response_body = ""
-    error = ""
-    try:
-        req = urllib.request.Request(target, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as response:
-            http_status = response.status
-            content_type = response.headers.get("content-type", "")
-            response_body = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        http_status = exc.code
-        content_type = exc.headers.get("content-type", "")
-        response_body = exc.read().decode("utf-8", errors="replace")
-        error = f"HTTP {exc.code}"
-    except Exception as exc:
-        error = str(exc)
+    http_status, content_type, response_body, error, attempts = hermes_post_with_retry(target, data, headers, attempts=3)
     latency_ms = round((time.monotonic() - started) * 1000)
     ok = http_status in {200, 201, 202, 204}
     return (200 if ok else 502), {
         **base,
         "ok": ok,
+        "attempts": attempts,
         "http_status": http_status,
         "content_type": content_type,
         "latency_ms": latency_ms,
