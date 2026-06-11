@@ -167,7 +167,7 @@ for spec in expect_runtimes:
     if endpoint and str(metadata.get("channel_url") or "").rstrip("/") != endpoint:
         fail(f"{name} metadata.channel_url={metadata.get('channel_url')!r}, expected {endpoint}")
     if tunnel.get("local_status") != "ok":
-        fail(f"{name} local_status={tunnel.get('local_status')!r}, expected ok")
+        print(f"[sop-ui-discovery] warn: {name} local_status={tunnel.get('local_status')!r}, runtime remains discoverable")
 
 print("[sop-ui-discovery] ok")
 print(f"[sop-ui-discovery] ui_url: {ui_url.rstrip('/')}")

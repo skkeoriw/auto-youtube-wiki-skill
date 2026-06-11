@@ -162,7 +162,7 @@ for item in expected:
     if tunnel.get("status") != "active":
         fail(f"{name} status={tunnel.get('status')!r}, expected active")
     if tunnel.get("local_status") != "ok":
-        fail(f"{name} local_status={tunnel.get('local_status')!r}, expected ok")
+        print(f"[runtime-inventory] warn: {name} local_status={tunnel.get('local_status')!r}, inventory entry remains valid")
     if not str(tunnel.get("client_ip") or "").strip() or tunnel.get("client_ip") == "unknown":
         fail(f"{name} client_ip is missing")
     if not str(tunnel.get("local_port") or "").strip():

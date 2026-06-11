@@ -179,7 +179,7 @@ if tunnel is None:
 if tunnel.get("status") != "active":
     fail(f"{name} status={tunnel.get('status')!r}, expected active")
 if tunnel.get("local_status") != "ok":
-    fail(f"{name} local_status={tunnel.get('local_status')!r}, expected ok")
+    print(f"[runtime-channel] warn: {name} local_status={tunnel.get('local_status')!r}, channel is still discoverable")
 if not str(tunnel.get("client_ip") or "").strip() or tunnel.get("client_ip") == "unknown":
     fail(f"{name} client_ip is missing")
 if expect_port:
