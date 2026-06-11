@@ -336,6 +336,73 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(by_key["CLOUDFLARE_API_KEY"]["masked_value"], "clo***ile")
         self.assertNotIn("cloudflare-from-env-file", json.dumps(preview))
 
+    def test_runtime_settings_d1_save_uses_cloudflare_raw_batch(self):
+        requests = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = json.dumps(payload).encode("utf-8")
+
+            def read(self):
+                return self.payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_urlopen(request, timeout=30):
+            body = json.loads(request.data.decode("utf-8"))
+            requests.append(body)
+            sql = body.get("sql", "")
+            if "SELECT key, value, category, secret, source, updated_at, updated_by, version" in sql:
+                return FakeResponse({
+                    "success": True,
+                    "result": [{
+                        "results": {
+                            "columns": ["key", "value", "category", "secret", "source", "updated_at", "updated_by", "version"],
+                            "rows": [["CLOUDFLARE_API_KEY", "old-secret", "cloudflare", 1, "management_config", "2026-01-01T00:00:00Z", "seed", 2]],
+                        }
+                    }],
+                })
+            return FakeResponse({"success": True, "result": [{"success": True}]})
+
+        with patch.object(bridge, "RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID", "acct"), \
+             patch.object(bridge, "RUNTIME_SETTINGS_D1_DATABASE_ID", "db"), \
+             patch.object(bridge, "runtime_settings_cloudflare_headers", return_value={"Authorization": "Bearer token"}), \
+             patch.object(bridge.urllib.request, "urlopen", side_effect=fake_urlopen):
+            changed = bridge.runtime_settings_d1_save({
+                "CLOUDFLARE_API_KEY": "new-secret",
+                "AGENT_REPO": "https://github.com/skkeoriw/agent-brain-plugins",
+            }, updated_by="unit-test")
+
+        self.assertEqual(sorted(changed.keys()), ["AGENT_REPO", "CLOUDFLARE_API_KEY"])
+        self.assertEqual(len(requests), 3)
+        self.assertIn("CREATE TABLE IF NOT EXISTS global_settings", requests[0]["sql"])
+        self.assertIn("SELECT key, value, category, secret, source, updated_at, updated_by, version", requests[1]["sql"])
+        self.assertIn("INSERT INTO global_settings", requests[2]["batch"][0]["sql"])
+        self.assertEqual(requests[2]["batch"][0]["params"][0], "CLOUDFLARE_API_KEY")
+        self.assertEqual(requests[2]["batch"][0]["params"][7], 3)
+        self.assertEqual(requests[2]["batch"][2]["params"][0], "AGENT_REPO")
+
+    def test_runtime_settings_load_bootstraps_d1_from_local_file(self):
+        calls = []
+
+        with patch.object(bridge, "RUNTIME_SETTINGS_BACKEND", "d1"), \
+             patch.object(bridge, "RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID", "acct"), \
+             patch.object(bridge, "RUNTIME_SETTINGS_D1_DATABASE_ID", "db"), \
+             patch.object(bridge, "runtime_settings_cloudflare_headers", return_value={"Authorization": "Bearer token"}), \
+             patch.object(bridge, "runtime_settings_load_from_file", return_value={"values": {"CLOUDFLARE_API_KEY": "seed-secret"}, "updated_at": "2026-01-01T00:00:00Z"}), \
+             patch.object(bridge, "runtime_settings_d1_has_rows", side_effect=[False, True]), \
+             patch.object(bridge, "runtime_settings_d1_save", side_effect=lambda values, updated_by="runtime-management": calls.append((values, updated_by)) or values), \
+             patch.object(bridge, "runtime_settings_d1_values", return_value={"CLOUDFLARE_API_KEY": "seed-secret"}):
+            data = bridge.runtime_settings_load()
+
+        self.assertEqual(calls, [({"CLOUDFLARE_API_KEY": "seed-secret"}, "bootstrap-from-file")])
+        self.assertEqual(data["values"]["CLOUDFLARE_API_KEY"], "seed-secret")
+        self.assertEqual(data["backend"], "d1")
+
     def test_indexed_artifact_preview_is_backfilled(self):
         artifact = {
             "id": "indexed-1",

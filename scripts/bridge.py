@@ -23,6 +23,15 @@ RUNTIME_MANAGEMENT_CONFIG_PATH = Path(os.environ.get(
     "SOP_RUNTIME_MANAGEMENT_CONFIG_PATH",
     str(Path.home() / ".sop" / "runtime-management" / "config.json"),
 )).expanduser()
+RUNTIME_SETTINGS_CLOUDFLARE_EMAIL = os.environ.get("RUNTIME_SETTINGS_CLOUDFLARE_EMAIL", os.environ.get("CLOUDFLARE_EMAIL", os.environ.get("CF_EMAIL", "")))
+RUNTIME_SETTINGS_CLOUDFLARE_API_KEY = os.environ.get("RUNTIME_SETTINGS_CLOUDFLARE_API_KEY", os.environ.get("CLOUDFLARE_API_KEY", os.environ.get("CF_API_KEY", "")))
+RUNTIME_SETTINGS_CLOUDFLARE_API_TOKEN = os.environ.get("RUNTIME_SETTINGS_CLOUDFLARE_API_TOKEN", os.environ.get("CLOUDFLARE_API_TOKEN", os.environ.get("CF_API_TOKEN", "")))
+RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID = os.environ.get("RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID", os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""))
+RUNTIME_SETTINGS_D1_DATABASE_ID = os.environ.get("RUNTIME_SETTINGS_D1_DATABASE_ID", os.environ.get("CLOUDFLARE_D1_DATABASE_ID", ""))
+RUNTIME_SETTINGS_D1_DATABASE_NAME = os.environ.get("RUNTIME_SETTINGS_D1_DATABASE_NAME", "runtime-settings-db")
+RUNTIME_SETTINGS_BACKEND = os.environ.get("RUNTIME_SETTINGS_BACKEND", "d1")
+RUNTIME_SETTINGS_D1_TABLE = "global_settings"
+RUNTIME_SETTINGS_D1_AUDIT_TABLE = "global_settings_audit"
 SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5"))
 SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
@@ -282,6 +291,275 @@ def write_json(path, data, mode=None):
         path.chmod(mode)
 
 
+def runtime_settings_cloudflare_headers():
+    if RUNTIME_SETTINGS_CLOUDFLARE_API_TOKEN:
+        return {"Authorization": f"Bearer {RUNTIME_SETTINGS_CLOUDFLARE_API_TOKEN}"}
+    if RUNTIME_SETTINGS_CLOUDFLARE_EMAIL and RUNTIME_SETTINGS_CLOUDFLARE_API_KEY:
+        return {
+            "X-Auth-Email": RUNTIME_SETTINGS_CLOUDFLARE_EMAIL,
+            "X-Auth-Key": RUNTIME_SETTINGS_CLOUDFLARE_API_KEY,
+        }
+    return {}
+
+
+def runtime_settings_d1_ready():
+    return bool(RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID and RUNTIME_SETTINGS_D1_DATABASE_ID and runtime_settings_cloudflare_headers())
+
+
+def runtime_settings_backend():
+    if str(RUNTIME_SETTINGS_BACKEND).lower() == "d1" and runtime_settings_d1_ready():
+        return "d1"
+    return "file"
+
+
+def runtime_settings_alias_map():
+    mapping = {}
+    for canonical, aliases in {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}.items():
+        mapping[canonical] = canonical
+        mapping[canonical.lower()] = canonical
+        for alias in aliases:
+            mapping[alias] = canonical
+            mapping[alias.lower()] = canonical
+    return mapping
+
+
+def normalize_runtime_settings_values(values):
+    aliases = runtime_settings_alias_map()
+    normalized = {}
+    for key, value in (values or {}).items():
+        canonical = aliases.get(str(key).strip(), str(key).strip())
+        text = "" if value is None else str(value).strip()
+        if text:
+            normalized[canonical] = text
+    return normalized
+
+
+def cloudflare_request(method, path, payload=None):
+    headers = runtime_settings_cloudflare_headers()
+    if not headers:
+        raise RuntimeError("Cloudflare credentials are not configured")
+    req_headers = {"Content-Type": "application/json", **headers}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4{path}",
+        data=data,
+        headers=req_headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Cloudflare API {method} {path} failed: HTTP {exc.code}: {raw[:500]}")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cloudflare API {method} {path} failed: {exc.reason}")
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Cloudflare API {method} {path} returned invalid JSON: {exc}")
+    if not body.get("success", True):
+        raise RuntimeError(f"Cloudflare API {method} {path} failed: {body.get('errors') or body}")
+    return body
+
+
+def runtime_settings_d1_raw(payload):
+    return cloudflare_request(
+        "POST",
+        f"/accounts/{RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID}/d1/database/{RUNTIME_SETTINGS_D1_DATABASE_ID}/raw",
+        payload,
+    )
+
+
+def runtime_settings_ensure_d1_schema():
+    if not runtime_settings_d1_ready():
+        return False
+    schema_sql = "; ".join([
+        f"""
+        CREATE TABLE IF NOT EXISTS {RUNTIME_SETTINGS_D1_TABLE} (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          category TEXT NOT NULL DEFAULT 'runtime',
+          secret INTEGER NOT NULL DEFAULT 0,
+          source TEXT NOT NULL DEFAULT 'management_config',
+          updated_at TEXT NOT NULL,
+          updated_by TEXT NOT NULL DEFAULT '',
+          version INTEGER NOT NULL DEFAULT 1
+        )
+        """.strip(),
+        f"CREATE INDEX IF NOT EXISTS idx_{RUNTIME_SETTINGS_D1_TABLE}_category ON {RUNTIME_SETTINGS_D1_TABLE}(category)",
+        f"""
+        CREATE TABLE IF NOT EXISTS {RUNTIME_SETTINGS_D1_AUDIT_TABLE} (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          category TEXT NOT NULL DEFAULT 'runtime',
+          secret INTEGER NOT NULL DEFAULT 0,
+          source TEXT NOT NULL DEFAULT 'management_config',
+          updated_at TEXT NOT NULL,
+          updated_by TEXT NOT NULL DEFAULT '',
+          version INTEGER NOT NULL DEFAULT 1
+        )
+        """.strip(),
+        f"CREATE INDEX IF NOT EXISTS idx_{RUNTIME_SETTINGS_D1_AUDIT_TABLE}_key ON {RUNTIME_SETTINGS_D1_AUDIT_TABLE}(key)",
+    ])
+    runtime_settings_d1_raw({"sql": schema_sql})
+    return True
+
+
+def runtime_settings_d1_rows():
+    if not runtime_settings_d1_ready():
+        return []
+    runtime_settings_ensure_d1_schema()
+    data = runtime_settings_d1_raw({
+        "sql": (
+            f"SELECT key, value, category, secret, source, updated_at, updated_by, version "
+            f"FROM {RUNTIME_SETTINGS_D1_TABLE} ORDER BY key"
+        ),
+    })
+    results = data.get("result") or []
+    if not results:
+        return []
+    rows = (results[0].get("results") or {}).get("rows") or []
+    columns = (results[0].get("results") or {}).get("columns") or []
+    items = []
+    for row in rows:
+        item = {}
+        for idx, column in enumerate(columns):
+            item[column] = row[idx] if idx < len(row) else None
+        items.append(item)
+    return items
+
+
+def runtime_settings_d1_values():
+    values, _updated_at = runtime_settings_d1_snapshot()
+    return values
+
+
+def runtime_settings_d1_snapshot():
+    values = {}
+    updated_at = ""
+    for row in runtime_settings_d1_rows():
+        key = str(row.get("key") or "").strip()
+        value = row.get("value")
+        if key and value not in {None, ""}:
+            values[key] = str(value)
+        row_updated_at = str(row.get("updated_at") or "")
+        if row_updated_at and row_updated_at > updated_at:
+            updated_at = row_updated_at
+    return values, updated_at
+
+
+def runtime_settings_d1_versions():
+    versions = {}
+    for row in runtime_settings_d1_rows():
+        key = str(row.get("key") or "").strip()
+        if key:
+            try:
+                versions[key] = int(row.get("version") or 0)
+            except Exception:
+                versions[key] = 0
+    return versions
+
+
+def runtime_settings_d1_save(values, updated_by="runtime-management"):
+    if not runtime_settings_d1_ready():
+        raise RuntimeError("D1 backend is not configured")
+    now = datetime.now(timezone.utc).isoformat()
+    versions = runtime_settings_d1_versions()
+    batch = []
+    changed = {}
+    for key, value in normalize_runtime_settings_values(values).items():
+        version = versions.get(key, 0) + 1
+        category = RUNTIME_CONFIG_CATEGORIES.get(key, "runtime")
+        secret = 1 if is_secret_key(key) else 0
+        batch.append({
+            "sql": (
+                f"INSERT INTO {RUNTIME_SETTINGS_D1_TABLE} "
+                "(key, value, category, secret, source, updated_at, updated_by, version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "value=excluded.value, "
+                "category=excluded.category, "
+                "secret=excluded.secret, "
+                "source=excluded.source, "
+                "updated_at=excluded.updated_at, "
+                "updated_by=excluded.updated_by, "
+                "version=excluded.version"
+            ),
+            "params": [key, value, category, secret, "management_config", now, updated_by, version],
+        })
+        batch.append({
+            "sql": (
+                f"INSERT INTO {RUNTIME_SETTINGS_D1_AUDIT_TABLE} "
+                "(key, value, category, secret, source, updated_at, updated_by, version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
+            "params": [key, value, category, secret, "management_config", now, updated_by, version],
+        })
+        changed[key] = value
+    if batch:
+        runtime_settings_d1_raw({"batch": batch})
+    return changed
+
+
+def runtime_settings_d1_has_rows():
+    if not runtime_settings_d1_ready():
+        return False
+    runtime_settings_ensure_d1_schema()
+    data = runtime_settings_d1_raw({
+        "sql": f"SELECT COUNT(*) AS count FROM {RUNTIME_SETTINGS_D1_TABLE}",
+    })
+    results = data.get("result") or []
+    if not results:
+        return False
+    rows = (results[0].get("results") or {}).get("rows") or []
+    return bool(rows and rows[0] and int(rows[0][0]) > 0)
+
+
+def runtime_settings_load_from_file():
+    data = read_json(RUNTIME_MANAGEMENT_CONFIG_PATH)
+    if not isinstance(data, dict):
+        return {"values": {}, "updated_at": ""}
+    values = data.get("values") if isinstance(data.get("values"), dict) else {}
+    return {
+        "values": normalize_runtime_settings_values(values),
+        "updated_at": str(data.get("updated_at") or ""),
+    }
+
+
+def runtime_settings_save_to_file(values, updated_at=None):
+    payload = {
+        "values": normalize_runtime_settings_values(values),
+        "updated_at": updated_at or datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(RUNTIME_MANAGEMENT_CONFIG_PATH, payload, mode=0o600)
+    return payload
+
+
+def runtime_settings_load():
+    backend = runtime_settings_backend()
+    file_data = runtime_settings_load_from_file()
+    if backend == "d1":
+        try:
+            if not runtime_settings_d1_has_rows() and file_data["values"]:
+                runtime_settings_d1_save(file_data["values"], updated_by="bootstrap-from-file")
+                return {
+                    "values": file_data["values"],
+                    "updated_at": file_data["updated_at"] or datetime.now(timezone.utc).isoformat(),
+                    "backend": "d1",
+                }
+            if runtime_settings_d1_has_rows():
+                values, updated_at = runtime_settings_d1_snapshot()
+                if values:
+                    return {"values": values, "updated_at": updated_at or datetime.now(timezone.utc).isoformat(), "backend": "d1"}
+        except Exception:
+            pass
+    return {**file_data, "backend": "file"}
+
+
 def mask_value(value):
     if value in {None, ""}:
         return value
@@ -407,14 +685,7 @@ def runtime_config_inheritance_preview(sop):
 
 
 def read_runtime_management_config():
-    data = read_json(RUNTIME_MANAGEMENT_CONFIG_PATH)
-    if not isinstance(data, dict):
-        return {"values": {}, "updated_at": ""}
-    values = data.get("values") if isinstance(data.get("values"), dict) else {}
-    return {
-        "values": {str(k): str(v) for k, v in values.items() if v not in {None, ""}},
-        "updated_at": str(data.get("updated_at") or ""),
-    }
+    return runtime_settings_load()
 
 
 def read_runtime_management_config_values():
@@ -424,6 +695,7 @@ def read_runtime_management_config_values():
 def runtime_management_config_preview(sop):
     data = read_runtime_management_config()
     values = data.get("values", {})
+    backend = data.get("backend", runtime_settings_backend())
     items = []
     for key, aliases in {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}.items():
         matched_key = next((candidate for candidate in [key, *aliases] if values.get(candidate)), "")
@@ -442,6 +714,13 @@ def runtime_management_config_preview(sop):
     return {
         "instance_id": sop.get("instance_id") or sop.get("id", "runtime-management"),
         "config_path": str(RUNTIME_MANAGEMENT_CONFIG_PATH),
+        "backend": backend,
+        "d1": {
+            "enabled": runtime_settings_d1_ready(),
+            "account_id": mask_value(RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID) if RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID else "",
+            "database_id": mask_value(RUNTIME_SETTINGS_D1_DATABASE_ID) if RUNTIME_SETTINGS_D1_DATABASE_ID else "",
+            "database_name": RUNTIME_SETTINGS_D1_DATABASE_NAME,
+        },
         "items": items,
         "groups": runtime_config_group_status(items),
         "updated_at": data.get("updated_at", ""),
@@ -464,14 +743,11 @@ def is_runtime_management_authorized(handler):
 
 
 def save_runtime_management_config(values):
-    current = read_runtime_management_config_values()
-    config_sources = {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}
-    allowed_keys = {key for key in config_sources}
-    for aliases in config_sources.values():
-        allowed_keys.update(aliases)
+    current = normalize_runtime_settings_values(read_runtime_management_config_values())
+    allowed_keys = set(runtime_settings_alias_map())
     changed = {}
     for key, value in (values or {}).items():
-        normalized_key = str(key).strip()
+        normalized_key = runtime_settings_alias_map().get(str(key).strip(), str(key).strip())
         if normalized_key not in allowed_keys:
             continue
         text = str(value).strip()
@@ -479,7 +755,14 @@ def save_runtime_management_config(values):
             current[normalized_key] = text
             changed[normalized_key] = text
     payload = {"values": current, "updated_at": datetime.now(timezone.utc).isoformat()}
-    write_json(RUNTIME_MANAGEMENT_CONFIG_PATH, payload, mode=0o600)
+    if runtime_settings_backend() == "d1":
+        try:
+            runtime_settings_d1_save(changed, updated_by="management-config-save")
+            payload = runtime_settings_save_to_file(current, payload["updated_at"])
+        except Exception:
+            write_json(RUNTIME_MANAGEMENT_CONFIG_PATH, payload, mode=0o600)
+    else:
+        write_json(RUNTIME_MANAGEMENT_CONFIG_PATH, payload, mode=0o600)
     return changed
 
 
