@@ -371,7 +371,9 @@ start_managed_channel() {
 
   (
     cd "$channel_dir"
-    NODE_PATH="$channel_dir/node_modules${NODE_PATH:+:$NODE_PATH}" setsid node "$AUTO_DOMAIN_AGENT_JS" \
+    NODE_PATH="$channel_dir/node_modules${NODE_PATH:+:$NODE_PATH}" \
+    AUTO_DOMAIN_LOCAL_HEALTH_PATH="${AUTO_DOMAIN_LOCAL_HEALTH_PATH:-/}" \
+    setsid node "$AUTO_DOMAIN_AGENT_JS" \
       --port="$channel_port" \
       --name="$channel_name" \
       --replace \
@@ -525,7 +527,7 @@ HERMES_METADATA="$(build_hermes_metadata)"
 
 start_managed_channel "$NAME" "$PORT" "$METADATA"
 if [ "$HERMES_TUNNEL_ENABLED" = "1" ]; then
-  start_managed_channel "$HERMES_PUBLIC_NAME" "$HERMES_WEBHOOK_PORT" "$HERMES_METADATA"
+  AUTO_DOMAIN_LOCAL_HEALTH_PATH="/health" start_managed_channel "$HERMES_PUBLIC_NAME" "$HERMES_WEBHOOK_PORT" "$HERMES_METADATA"
 fi
 
 wait_managed_channel "$NAME" "Public channel ready: $ENDPOINT"
