@@ -128,8 +128,6 @@ RUNTIME_CAPABILITY_ENV = {
     "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": ["youtube_research_workflow_token"],
     "CLOUDFLARE_EMAIL": ["cloudflare_email", "cf_email"],
     "CLOUDFLARE_API_KEY": ["cloudflare_api_key", "cf_api_key"],
-    "CF_EMAIL": ["cf_email", "cloudflare_email"],
-    "CF_API_KEY": ["cf_api_key", "cloudflare_api_key"],
     "TUNNEL_API": ["tunnel_api_url"],
     "SOP_UI_URL": ["sop_ui_url"],
 }
@@ -153,7 +151,6 @@ RUNTIME_REQUIRED_ENV = {
     "NOTEBOOKLM_BRIDGE_URL",
     "NOTEBOOKLM_BRIDGE_TOKEN",
     "CLOUDFLARE_API_KEY",
-    "CF_API_KEY",
 }
 RUNTIME_MANAGEMENT_REQUIRED_DEFAULTS = {
     "RUNTIME_TARGET_SSH_COMMAND",
@@ -187,8 +184,6 @@ RUNTIME_CONFIG_CATEGORIES = {
     "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "youtube",
     "CLOUDFLARE_EMAIL": "cloudflare",
     "CLOUDFLARE_API_KEY": "cloudflare",
-    "CF_EMAIL": "cloudflare",
-    "CF_API_KEY": "cloudflare",
     "TUNNEL_API": "cloudflare",
     "SOP_UI_URL": "runtime",
     "GITHUB_CHANGFENGHU_TOKEN": "github",
@@ -449,7 +444,7 @@ def runtime_settings_d1_snapshot():
         row_updated_at = str(row.get("updated_at") or "")
         if row_updated_at and row_updated_at > updated_at:
             updated_at = row_updated_at
-    return values, updated_at
+    return normalize_runtime_settings_values(values), updated_at
 
 
 def runtime_settings_d1_versions():

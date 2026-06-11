@@ -336,6 +336,25 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(by_key["CLOUDFLARE_API_KEY"]["masked_value"], "clo***ile")
         self.assertNotIn("cloudflare-from-env-file", json.dumps(preview))
 
+    def test_runtime_management_config_preview_uses_canonical_cloudflare_keys(self):
+        sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}
+        with patch.object(bridge, "read_runtime_management_config", return_value={
+            "values": {
+                "CLOUDFLARE_EMAIL": "cf@example.com",
+                "CLOUDFLARE_API_KEY": "cloudflare-secret",
+                "CF_EMAIL": "alias@example.com",
+                "CF_API_KEY": "alias-secret",
+            },
+            "updated_at": "2026-01-01T00:00:00Z",
+        }):
+            preview = bridge.runtime_management_config_preview(sop)
+
+        keys = [item["key"] for item in preview["items"]]
+        self.assertIn("CLOUDFLARE_EMAIL", keys)
+        self.assertIn("CLOUDFLARE_API_KEY", keys)
+        self.assertNotIn("CF_EMAIL", keys)
+        self.assertNotIn("CF_API_KEY", keys)
+
     def test_runtime_settings_d1_save_uses_cloudflare_raw_batch(self):
         requests = []
 
