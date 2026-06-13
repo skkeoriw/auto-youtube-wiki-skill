@@ -263,6 +263,25 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(merged["SOP_UI_URL"], "https://sop-ui.example")
         self.assertIn("CLOUDFLARE_API_KEY", merged["_management_config_injected"])
 
+    def test_runtime_management_config_save_cf_api_key_alias_is_canonicalized(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path), patch.dict(os.environ, {
+            "CF_API_KEY": "cf-alias-key",
+            "CLOUDFLARE_API_KEY": "",
+        }, clear=False):
+            changed = bridge.save_runtime_management_config({
+                "CF_API_KEY": "cf-alias-key",
+            })
+            preview = bridge.runtime_management_config_preview(sop)
+            merged = bridge.inject_runtime_management_config({"action": "create-runtime"})
+
+        by_key = {item["key"]: item for item in preview["items"]}
+        self.assertEqual(changed, {"CLOUDFLARE_API_KEY": "cf-alias-key"})
+        self.assertEqual(by_key["CLOUDFLARE_API_KEY"]["source"], "management_config")
+        self.assertNotIn("CF_API_KEY", [item["key"] for item in preview["items"]])
+        self.assertEqual(merged["CLOUDFLARE_API_KEY"], "cf-alias-key")
+
     def test_runtime_management_config_injects_target_ssh_defaults(self):
         config_path = self.wiki / ".sop/runtime-management/config.json"
         sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}

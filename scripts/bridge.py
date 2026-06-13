@@ -132,7 +132,7 @@ RUNTIME_CAPABILITY_ENV = {
     "YOUTUBE_RESEARCH_WORKFLOW_URL": ["youtube_research_workflow_url"],
     "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": ["youtube_research_workflow_token"],
     "CLOUDFLARE_EMAIL": ["cloudflare_email", "cf_email"],
-    "CLOUDFLARE_API_KEY": ["cloudflare_api_key", "cf_api_key"],
+    "CLOUDFLARE_API_KEY": ["cloudflare_api_key", "cf_api_key", "CF_API_KEY"],
     "TUNNEL_API": ["tunnel_api_url"],
     "SOP_UI_URL": ["sop_ui_url"],
 }
