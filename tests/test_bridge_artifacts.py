@@ -1054,7 +1054,10 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
-    def test_trigger_action_is_disabled(self):
+    def test_trigger_node_test_for_node_without_engine_contract_returns_404(self):
+        # Single-node test is only supported for nodes the provisioning engine
+        # classifies (runtime-management nodes). A youtube-research node like
+        # wiki-build has no engine contract, so trigger returns 404 (not 409).
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         with patch.object(bridge, "find_sop", return_value=self.sop):
@@ -1067,9 +1070,65 @@ class ArtifactResolutionTest(unittest.TestCase):
             )
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(request, timeout=3)
-            self.assertEqual(ctx.exception.code, 409)
+            self.assertEqual(ctx.exception.code, 404)
         server.shutdown()
         server.server_close()
+
+    @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
+    def test_node_contract_endpoint_returns_engine_contract(self):
+        # P3: run-less catalog contract endpoint serves the engine classification.
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/nodes/ssh-preflight/contract",
+                timeout=3,
+            ) as resp:
+                payload = json.loads(resp.read().decode())
+        server.shutdown()
+        server.server_close()
+        self.assertEqual(payload["node_id"], "ssh-preflight")
+        self.assertEqual(payload["contract"]["dep_class"], "independent")
+        self.assertTrue(payload["contract"]["testable_standalone"])
+
+    @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
+    def test_trigger_mutating_node_requires_confirm(self):
+        # P3 guard: a mutating node refuses to test without confirm_mutating.
+        code, result = bridge.trigger_node_test(
+            {"id": "runtime-management", "wiki_local_path": str(self.wiki)},
+            "clone-runtime-repos", {})
+        self.assertEqual(code, 409)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["side_effect"], "mutating")
+
+    @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
+    def test_trigger_artifact_node_requires_seed(self):
+        # P3 guard: an artifact_dependent node refuses to test without a seed run.
+        code, result = bridge.trigger_node_test(
+            {"id": "runtime-management", "wiki_local_path": str(self.wiki)},
+            "verify-runtime-removed", {})
+        self.assertEqual(code, 409)
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(result["artifact_deps"])
+
+    @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
+    def test_trigger_independent_node_spawns_isolated_test(self):
+        # P3 happy path: an independent read-only node triggers a nodetest run.
+        with patch.object(bridge, "subprocess") as sp, \
+                patch.object(bridge, "inject_runtime_management_config", side_effect=lambda b: b):
+            code, result = bridge.trigger_node_test(
+                {"id": "runtime-management", "wiki_local_path": str(self.wiki)},
+                "ssh-preflight",
+                {"request_overrides": {"action": "create-runtime", "target_host": "203.0.113.9"}})
+        self.assertEqual(code, 202)
+        self.assertEqual(result["mode"], "node-test")
+        self.assertTrue(result["pipeline_id"].startswith("nodetest-ssh-preflight-"))
+        self.assertTrue(sp.Popen.called)
+        # the engine was invoked with --test and the single node
+        argv = sp.Popen.call_args[0][0]
+        self.assertIn("--test", argv)
+        self.assertIn("ssh-preflight", argv)
 
     def test_sop_node_cli_is_http_client_and_requires_confirm_for_destructive_actions(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "sop-node.sh"

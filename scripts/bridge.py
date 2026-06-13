@@ -7,6 +7,7 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1477,7 +1478,12 @@ def classify_node(node_id, config, static):
     return "custom"
 
 
-def node_actions(instance_id, node_id):
+def node_actions(instance_id, node_id, classification=None):
+    classification = classification or {}
+    side_effect = classification.get("side_effect")
+    dep_class = classification.get("dep_class")
+    # Single-node test is enabled whenever the engine classifies the node.
+    trigger_enabled = bool(classification)
     return {
         "inspect": {
             "method": "GET",
@@ -1513,8 +1519,12 @@ def node_actions(instance_id, node_id):
             "method": "POST",
             "path": f"/api/sop/{instance_id}/nodes/{node_id}/actions/trigger",
             "requires_pipeline": False,
-            "destructive": True,
-            "enabled": False,
+            "destructive": side_effect == "mutating",
+            "enabled": trigger_enabled,
+            "dep_class": dep_class,
+            "side_effect": side_effect,
+            "requires_confirm": side_effect == "mutating",
+            "requires_seed": dep_class == "artifact_dependent",
         },
     }
 
@@ -1597,13 +1607,30 @@ def node_registry_item(sop, node_id, endpoint=""):
             "telegram": manifest_caps.get("telegram", {"enabled": (static.get("infra") or {}).get("tg_notify", True), "required": False}),
             "sse": {"enabled": True, "required": True},
         },
-        "actions": node_actions(instance_id, node_id),
+        "actions": node_actions(instance_id, node_id, node_classification_for(node_id)),
         "cli": node_cli_examples(endpoint or "{endpoint}", instance_id, node_id),
         "ui": static.get("ui") or {},
         "modules": node_modules(sop, node_id, endpoint),
         "editable": True,
         "publish_enabled": False,
+        "classification": node_classification_for(node_id),
         "missing_fields": validate_node_definition(node_id, config, static),
+    }
+
+
+def node_classification_for(node_id):
+    """Compact classification view (engine-sourced) for the asset center:
+    dep_class / side_effect / testable_standalone / deps. Empty dict if unknown."""
+    contract = provision_node_contract(node_id)
+    if not contract:
+        return {}
+    return {
+        "dep_class": contract.get("dep_class"),
+        "side_effect": contract.get("side_effect"),
+        "testable_standalone": contract.get("testable_standalone", False),
+        "request_inputs": contract.get("request_inputs") or [],
+        "artifact_deps": contract.get("artifact_deps") or [],
+        "state_preconditions": contract.get("state_preconditions") or [],
     }
 
 
@@ -2189,6 +2216,44 @@ def sop_from_instance(runtime, instance):
 
 def plugin_root():
     return Path(os.environ.get("AGENT_BRAIN_PLUGINS_PATH", str(Path.home() / "agent-brain-plugins"))).expanduser()
+
+
+_PROVISION_MODULE_CACHE = {}
+
+
+def provision_module():
+    """Import the engine module (provision_runtime.py) as the single source for
+    node execution/test metadata. Cached; returns None if unavailable."""
+    if "mod" in _PROVISION_MODULE_CACHE:
+        return _PROVISION_MODULE_CACHE["mod"]
+    mod = None
+    try:
+        runner = plugin_root() / "youtube-wiki" / "infrastructure" / "provision_runtime.py"
+        if runner.exists():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("provision_runtime_bridge", runner)
+            mod = importlib.util.module_from_spec(spec)
+            # Register before exec so @dataclass annotation resolution can find the module.
+            sys.modules[spec.name] = mod
+            spec.loader.exec_module(mod)
+    except Exception:
+        mod = None
+    _PROVISION_MODULE_CACHE["mod"] = mod
+    return mod
+
+
+def provision_node_contract(node_id):
+    """Return the engine node contract (incl. dep_class / side_effect /
+    request_inputs / artifact_deps / state_preconditions) or None."""
+    mod = provision_module()
+    if mod is None or not hasattr(mod, "node_contract"):
+        return None
+    try:
+        if node_id not in getattr(mod, "RUNTIME_MANAGEMENT_NODES", []):
+            return None
+        return mod.node_contract(node_id)
+    except Exception:
+        return None
 
 
 def ensure_runtime_management_sop(runtime):
@@ -2979,6 +3044,85 @@ def trigger_runtime_management(sop, body):
     }
 
 
+def trigger_node_test(sop, node_id, body):
+    """Single-node isolated test, callable run-less from the asset center or from
+    a Run's node panel. Reuses the engine's --test isolation + dependency guards.
+
+    body: {request_overrides:{...}, seed_from_run_id?, confirm_mutating?, dry_run?}
+    """
+    body = body if isinstance(body, dict) else {}
+    contract = provision_node_contract(node_id)
+    if contract is None:
+        return 404, {"status": "error", "message": f"No engine contract for node {node_id!r}"}
+    side_effect = contract.get("side_effect")
+    dep_class = contract.get("dep_class")
+    confirm = bool(body.get("confirm_mutating"))
+    seed_from = str(body.get("seed_from_run_id") or body.get("seed_from") or "")
+
+    # Guard 1: mutating nodes change the target machine — require explicit confirm.
+    if side_effect == "mutating" and not confirm:
+        return 409, {
+            "status": "blocked",
+            "node_id": node_id,
+            "reason": "mutating node requires confirm_mutating=true (test against a sandbox target)",
+            "side_effect": side_effect,
+            "dep_class": dep_class,
+        }
+    # Guard 2: artifact_dependent nodes read upstream reports — require a seed run.
+    if dep_class == "artifact_dependent" and not seed_from:
+        return 409, {
+            "status": "blocked",
+            "node_id": node_id,
+            "reason": "artifact_dependent node requires seed_from_run_id",
+            "artifact_deps": contract.get("artifact_deps"),
+        }
+
+    overrides = body.get("request_overrides") if isinstance(body.get("request_overrides"), dict) else {}
+    action = str(overrides.get("management_action") or overrides.get("action")
+                 or contract.get("branch") or "create-runtime")
+    if action not in RUNTIME_MANAGEMENT_ACTIONS:
+        action = "create-runtime"
+    request_body = inject_runtime_management_config({**overrides, "management_action": action, "action": action})
+
+    now_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    pipeline_id = f"nodetest-{node_id}-{now_token}"
+    wiki = Path(sop["wiki_local_path"])
+    secret_dir = wiki / ".sop" / "secrets" / pipeline_id
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        secret_dir.chmod(0o700)
+    except OSError:
+        pass
+    request_file = secret_dir / "request.json"
+    write_json(request_file, request_body, mode=0o600)
+
+    runner = plugin_root() / "youtube-wiki" / "infrastructure" / "provision_runtime.py"
+    if not runner.exists():
+        return 500, {"status": "error", "message": "provision_runtime.py not found"}
+    log_dir = wiki / "logs" / "pipeline-runs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{pipeline_id}.log"
+    env = {**os.environ, "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"}
+    command = ["python3", str(runner), "--wiki", str(wiki), "--pipeline-id", pipeline_id,
+               "--node", node_id, "--request-file", str(request_file), "--test"]
+    if seed_from:
+        command += ["--seed-from", seed_from]
+    if body.get("dry_run"):
+        command.append("--dry-run")
+    with open(log_file, "ab") as stream:
+        subprocess.Popen(command, env=env, stdout=stream, stderr=subprocess.STDOUT, close_fds=True)
+    return 202, {
+        "status": "triggered",
+        "mode": "node-test",
+        "node_id": node_id,
+        "pipeline_id": pipeline_id,
+        "namespace": "nodetest",
+        "dep_class": dep_class,
+        "side_effect": side_effect,
+        "report_path": f"raw/provision/nodetest/{pipeline_id}/{node_id}.json",
+    }
+
+
 def trigger_sop(sop, body):
     if sop.get("sop_type") == "runtime-management" or sop.get("id") == "runtime-management":
         return trigger_runtime_management(sop, body)
@@ -3192,6 +3336,22 @@ def retry_node(sop, pipeline_id, node_id):
             launched = True
         except Exception:
             pass
+
+    # Runtime-management nodes re-run through the provisioning engine with the
+    # original request context (reliable), NOT the context-less hermes webhook.
+    if not launched and (sop.get("sop_type") == "runtime-management" or sop.get("id") == "runtime-management"):
+        request_file = wiki / ".sop" / "secrets" / pipeline_id / "request.json"
+        runner = plugin_root() / "youtube-wiki" / "infrastructure" / "provision_runtime.py"
+        if request_file.exists() and runner.exists():
+            mgmt_env = {**os.environ, "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"}
+            command = ["python3", str(runner), "--wiki", str(wiki), "--pipeline-id", pipeline_id,
+                       "--node", node_id, "--request-file", str(request_file)]
+            try:
+                with open(log_path, "ab") as log:
+                    subprocess.Popen(command, env=mgmt_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                launched = True
+            except Exception:
+                pass
 
     if not launched:
         # Fallback: Hermes webhook
@@ -3491,6 +3651,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if cfg is None:
                         return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
                     return json_response(self, 200, cfg)
+                # GET /api/sop/{instance}/nodes/{node_id}/contract — run-less engine contract
+                if len(path) == 6 and path[3] == "nodes" and path[5] == "contract":
+                    contract = provision_node_contract(path[4])
+                    if contract is None:
+                        return json_response(self, 404, {"detail": f"No engine contract for node {path[4]!r}"})
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "node_id": path[4],
+                        "contract": contract,
+                    })
                 # GET /api/sop/{instance}/nodes/{node_id}/modules
                 if len(path) == 6 and path[3] == "nodes" and path[5] == "modules":
                     endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
@@ -3515,7 +3685,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return json_response(self, 200, {
                         "sop_id": sop.get("id", ""),
                         "node_id": path[4],
-                        "actions": node_actions(sop.get("id", ""), path[4]),
+                        "actions": node_actions(sop.get("id", ""), path[4], node_classification_for(path[4])),
                     })
             return text_response(self, 200, "ok")
         except Exception as exc:
@@ -3671,14 +3841,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             http_code = 404 if _status is None else 200
             return json_response(self, http_code, result)
 
-        # POST /api/sop/{instance}/nodes/{node_id}/actions/trigger
+        # POST /api/sop/{instance}/nodes/{node_id}/actions/trigger — single-node test
         if (len(path) == 7 and path[:2] == ["api", "sop"]
                 and path[3] == "nodes" and path[5] == "actions" and path[6] == "trigger"):
-            return json_response(self, 409, {
-                "status": "disabled",
-                "node_id": path[4],
-                "message": "Node trigger action is draft-only in this version",
-            })
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = trigger_node_test(sop, path[4], data)
+            return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/node-drafts
         if len(path) == 4 and path[:2] == ["api", "sop"] and path[3] == "node-drafts":
