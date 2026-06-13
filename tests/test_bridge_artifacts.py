@@ -1130,6 +1130,26 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("--test", argv)
         self.assertIn("ssh-preflight", argv)
 
+    def test_sync_runtime_management_definition_refreshes_stale_snapshot(self):
+        # Anti-historical-drift: a stale deployed sop.yaml must be re-synced from
+        # the authoritative template, so no frozen old workflow version lingers.
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = Path(tmp) / "plugins"
+            tpl_dir = plugin / "youtube-wiki" / "templates" / "runtime-management-sop"
+            tpl_dir.mkdir(parents=True)
+            (tpl_dir / "sop.yaml").write_text("name: runtime-management\nversion: '0.2'\nnodes:\n  a: {}\n  b: {}\n", encoding="utf-8")
+            workspace = Path(tmp) / "wiki" / "runtime-management"
+            workspace.mkdir(parents=True)
+            # deployed = stale single-node snapshot
+            (workspace / "sop.yaml").write_text("name: runtime-management\nversion: '0.1'\nnodes:\n  a: {}\n", encoding="utf-8")
+
+            with patch.object(bridge, "plugin_root", return_value=plugin):
+                bridge.sync_runtime_management_definition(str(workspace))
+
+            synced = (workspace / "sop.yaml").read_text(encoding="utf-8")
+            self.assertIn("b: {}", synced)         # now matches template (2 nodes)
+            self.assertIn("version: '0.2'", synced)
+
     def test_sop_node_cli_is_http_client_and_requires_confirm_for_destructive_actions(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "sop-node.sh"
         dry_run = subprocess.run(

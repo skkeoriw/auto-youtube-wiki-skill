@@ -2282,12 +2282,34 @@ def ensure_runtime_management_sop(runtime):
     return sop_from_instance(runtime, instance)
 
 
+def sync_runtime_management_definition(local_path):
+    """Keep the DEPLOYED runtime-management workflow definition in lockstep with
+    the authoritative template (agent-brain-plugins). Without this, the workspace
+    sop.yaml is a frozen snapshot taken when the instance was first registered —
+    any historical version (old single-workflow, missing branches/nodes) lingers
+    forever and is served to the DAG/UI/SPI even after the template is updated.
+    Idempotent: only rewrites when the template content actually differs."""
+    template = plugin_root() / "youtube-wiki" / "templates" / "runtime-management-sop" / "sop.yaml"
+    if not template.exists() or not local_path:
+        return
+    try:
+        dst = Path(local_path).expanduser() / "sop.yaml"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        latest = template.read_bytes()
+        if (not dst.exists()) or dst.read_bytes() != latest:
+            dst.write_bytes(latest)
+    except Exception:
+        pass
+
+
 def load_sops():
     registry = read_registry()
     sops = []
     for instance in registry.get("instances", []):
         if not isinstance(instance, dict) or not instance.get("enabled", True):
             continue
+        if instance.get("instance_id") == "runtime-management" or instance.get("sop_type") == "runtime-management":
+            sync_runtime_management_definition(instance.get("local_path"))
         sop = sop_from_instance(registry, instance)
         if sop:
             sops.append(sop)
