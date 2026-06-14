@@ -3108,14 +3108,17 @@ def trigger_node_test(sop, node_id, body):
     side_effect = contract.get("side_effect")
     dep_class = contract.get("dep_class")
     confirm = bool(body.get("confirm_mutating"))
+    dry_run = bool(body.get("dry_run"))
     seed_from = str(body.get("seed_from_run_id") or body.get("seed_from") or "")
+    wiki = Path(sop["wiki_local_path"])
 
-    # Guard 1: mutating nodes change the target machine — require explicit confirm.
-    if side_effect == "mutating" and not confirm:
+    # Guard 1: a *real* run of a mutating node changes the target machine — require
+    # explicit confirm. A dry-run only simulates, so it does NOT need confirm.
+    if side_effect == "mutating" and not confirm and not dry_run:
         return 409, {
             "status": "blocked",
             "node_id": node_id,
-            "reason": "mutating node requires confirm_mutating=true (test against a sandbox target)",
+            "reason": "mutating node requires confirm_mutating=true for a real run (dry_run is exempt)",
             "side_effect": side_effect,
             "dep_class": dep_class,
         }
@@ -3128,16 +3131,24 @@ def trigger_node_test(sop, node_id, body):
             "artifact_deps": contract.get("artifact_deps"),
         }
 
+    # Base the request on an existing run's frozen request (target_host / ssh_command
+    # / private_key_b64 / prior config) when from_run_id is given — so a node like
+    # configure-hermes-model can reach the runtime that run created. request_overrides
+    # (e.g. a new key) win over the base; management config fills any remaining gaps.
+    from_run = re.sub(r"[^A-Za-z0-9._-]", "", str(body.get("from_run_id") or ""))
+    base = {}
+    if from_run:
+        base = read_json(wiki / ".sop" / "secrets" / from_run / "request.json") or {}
     overrides = body.get("request_overrides") if isinstance(body.get("request_overrides"), dict) else {}
     action = str(overrides.get("management_action") or overrides.get("action")
+                 or base.get("management_action") or base.get("action")
                  or contract.get("branch") or "create-runtime")
     if action not in RUNTIME_MANAGEMENT_ACTIONS:
         action = "create-runtime"
-    request_body = inject_runtime_management_config({**overrides, "management_action": action, "action": action})
+    request_body = inject_runtime_management_config({**base, **overrides, "management_action": action, "action": action})
 
     now_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     pipeline_id = f"nodetest-{node_id}-{now_token}"
-    wiki = Path(sop["wiki_local_path"])
     secret_dir = wiki / ".sop" / "secrets" / pipeline_id
     secret_dir.mkdir(parents=True, exist_ok=True)
     try:

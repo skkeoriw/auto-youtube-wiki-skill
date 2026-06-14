@@ -1169,6 +1169,33 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIsNone(bridge.read_node_test_result(sop, "ssh-preflight", "create-runtime-20260612T222204"))
         self.assertIsNone(bridge.read_node_test_result(sop, "ssh-preflight", "../../etc"))
 
+    @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
+    def test_dry_run_mutating_bypasses_confirm_and_from_run_id_merges_base(self):
+        run_id = "create-runtime-FROMRUN"
+        reqf = self.wiki / ".sop" / "secrets" / run_id / "request.json"
+        reqf.parent.mkdir(parents=True, exist_ok=True)
+        reqf.write_text(json.dumps({
+            "action": "create-runtime", "ssh_command": "ssh runtime@203.0.113.9",
+            "private_key_b64": "BASE64KEY", "runtime_id": "r1",
+        }), encoding="utf-8")
+        sop = {"id": "runtime-management", "wiki_local_path": str(self.wiki)}
+        with patch.object(bridge, "subprocess") as sp, \
+                patch.object(bridge, "inject_runtime_management_config", side_effect=lambda b: b):
+            # mutating node + dry_run + NO confirm -> allowed (dry-run exempt from confirm)
+            code, result = bridge.trigger_node_test(sop, "configure-hermes-model", {
+                "dry_run": True, "from_run_id": run_id,
+                "request_overrides": {"hermes_openai_api_key": "newkey"},
+            })
+        self.assertEqual(code, 202)
+        argv = sp.Popen.call_args[0][0]
+        self.assertIn("--dry-run", argv)
+        self.assertIn("configure-hermes-model", argv)
+        written = json.loads(next((self.wiki / ".sop" / "secrets").glob(
+            "nodetest-configure-hermes-model-*/request.json")).read_text())
+        self.assertEqual(written["ssh_command"], "ssh runtime@203.0.113.9")   # from base run
+        self.assertEqual(written["private_key_b64"], "BASE64KEY")             # from base run
+        self.assertEqual(written["hermes_openai_api_key"], "newkey")          # override wins
+
     def test_mask_value_handles_list_under_secret_named_key(self):
         # A secret-named field (contains "key") can hold a list, e.g. updated_keys.
         # mask_value must recurse, not crash on the unhashable membership test.
