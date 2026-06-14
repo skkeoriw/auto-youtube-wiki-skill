@@ -1150,6 +1150,25 @@ class ArtifactResolutionTest(unittest.TestCase):
             self.assertIn("b: {}", synced)         # now matches template (2 nodes)
             self.assertIn("version: '0.2'", synced)
 
+    def test_read_node_test_result_pending_then_terminal_and_guards_namespace(self):
+        sop = {"id": "runtime-management", "wiki_local_path": str(self.wiki)}
+        pid = "nodetest-ssh-preflight-20260614T000000"
+        # before the report exists -> pending
+        pending = bridge.read_node_test_result(sop, "ssh-preflight", pid)
+        self.assertEqual(pending["status"], "running")
+        self.assertTrue(pending["pending"])
+        # write a terminal report into the nodetest namespace
+        rpt = self.wiki / "raw" / "provision" / "nodetest" / pid / "ssh-preflight.json"
+        rpt.parent.mkdir(parents=True, exist_ok=True)
+        rpt.write_text(json.dumps({"node_id": "ssh-preflight", "status": "done",
+                                   "detail": {"ssh_ok": True, "disk_ok": True, "stdout": "host\nuser"}}), encoding="utf-8")
+        done = bridge.read_node_test_result(sop, "ssh-preflight", pid)
+        self.assertEqual(done["status"], "done")
+        self.assertTrue(done["detail"]["ssh_ok"])
+        # non-nodetest pipeline ids are rejected (no reading real runs / traversal)
+        self.assertIsNone(bridge.read_node_test_result(sop, "ssh-preflight", "create-runtime-20260612T222204"))
+        self.assertIsNone(bridge.read_node_test_result(sop, "ssh-preflight", "../../etc"))
+
     def test_sop_node_cli_is_http_client_and_requires_confirm_for_destructive_actions(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "sop-node.sh"
         dry_run = subprocess.run(

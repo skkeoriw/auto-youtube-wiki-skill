@@ -5,6 +5,7 @@ import importlib.util
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -3066,6 +3067,30 @@ def trigger_runtime_management(sop, body):
     }
 
 
+def read_node_test_result(sop, node_id, pipeline_id):
+    """Read back the report of an isolated single-node test (nodetest namespace).
+    Returns {status: 'running', pending: True} until the report appears, then the
+    terminal report with detail (e.g. ssh_ok / stdout / disk_ok / reason)."""
+    # Security: only the nodetest namespace, no path traversal.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "", pipeline_id or "")
+    if not safe.startswith("nodetest-"):
+        return None
+    wiki = Path(sop["wiki_local_path"])
+    report = read_json(wiki / "raw" / "provision" / "nodetest" / safe / f"{node_id}.json")
+    if not report:
+        return {"pipeline_id": safe, "node_id": node_id, "status": "running", "pending": True}
+    return {
+        "pipeline_id": safe,
+        "node_id": node_id,
+        "status": report.get("status"),
+        "started_at": report.get("started_at"),
+        "finished_at": report.get("finished_at"),
+        "reason": report.get("reason"),
+        "manual_fix_hint": report.get("manual_fix_hint"),
+        "detail": mask_data(report.get("detail") or {}),
+    }
+
+
 def trigger_node_test(sop, node_id, body):
     """Single-node isolated test, callable run-less from the asset center or from
     a Run's node panel. Reuses the engine's --test isolation + dependency guards.
@@ -3683,6 +3708,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "node_id": path[4],
                         "contract": contract,
                     })
+                # GET /api/sop/{instance}/nodes/{node_id}/test-result/{pipeline_id}
+                if len(path) == 7 and path[3] == "nodes" and path[5] == "test-result":
+                    result = read_node_test_result(sop, path[4], path[6])
+                    if result is None:
+                        return json_response(self, 400, {"detail": "invalid nodetest pipeline_id"})
+                    return json_response(self, 200, result)
                 # GET /api/sop/{instance}/nodes/{node_id}/modules
                 if len(path) == 6 and path[3] == "nodes" and path[5] == "modules":
                     endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
