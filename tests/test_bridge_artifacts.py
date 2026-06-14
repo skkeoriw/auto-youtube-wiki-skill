@@ -1169,6 +1169,15 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIsNone(bridge.read_node_test_result(sop, "ssh-preflight", "create-runtime-20260612T222204"))
         self.assertIsNone(bridge.read_node_test_result(sop, "ssh-preflight", "../../etc"))
 
+    def test_mask_value_handles_list_under_secret_named_key(self):
+        # A secret-named field (contains "key") can hold a list, e.g. updated_keys.
+        # mask_value must recurse, not crash on the unhashable membership test.
+        self.assertEqual(bridge.mask_value(["HERMES_MODEL", "HERMES_OPENAI_API_KEY"]),
+                         ["HERMES_MODEL", "HERMES_OPENAI_API_KEY"])
+        masked = bridge.mask_data({"updated_keys": ["HERMES_MODEL"], "api_key": "supersecretvalue"})
+        self.assertEqual(masked["updated_keys"], ["HERMES_MODEL"])
+        self.assertNotEqual(masked["api_key"], "supersecretvalue")
+
     def test_sop_node_cli_is_http_client_and_requires_confirm_for_destructive_actions(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "sop-node.sh"
         dry_run = subprocess.run(

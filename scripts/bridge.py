@@ -569,8 +569,12 @@ def runtime_settings_load():
 
 
 def mask_value(value):
-    if value in {None, ""}:
+    if value is None or value == "":
         return value
+    if isinstance(value, (list, dict)):
+        # A secret-named field can still hold a list/dict (e.g. updated_keys);
+        # recurse rather than crash on the unhashable membership test below.
+        return mask_data(value)
     text = str(value)
     if len(text) <= 8:
         return "***"
