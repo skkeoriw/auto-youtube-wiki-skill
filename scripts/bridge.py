@@ -38,6 +38,8 @@ SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5
 SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
 _RUN_INDEX_CLASS = None
+_SOP_READ_CACHE = {}
+_SOP_READ_CACHE_TTL_SECONDS = float(os.environ.get("SOP_READ_CACHE_TTL_SECONDS", "3"))
 
 RUNTIME_MANAGEMENT_COMMON_NODES = [
     "management-request-validate",
@@ -2549,21 +2551,8 @@ def instance_summary(sop, include_latest=True):
     sop_id = sop.get("id") or sop.get("instance_id", "")
     instance_id = sop.get("instance_id") or sop_id
     store = run_index_store(sop)
-    runs = []
-    if include_latest:
-        try:
-            runs = (store.list_runs(limit=1) if store else []) or []
-        except Exception:
-            runs = []
-        if not runs:
-            run_files_found = run_files(sop)
-            if run_files_found:
-                run = read_json(run_files_found[0]) or {}
-                if run and not run.get("pipeline_id"):
-                    run["pipeline_id"] = run_files_found[0].parent.name
-                if run:
-                    runs = [run_summary(sop, run)]
-    latest = execution_summary(sop, runs[0]) if runs else None
+    latest_data = latest_execution_for_instance(sop) if include_latest else None
+    latest = execution_summary(sop, latest_data) if latest_data else None
     artifact_count = int((latest or {}).get("artifact_count") or 0)
     page_count = int((latest or {}).get("page_count") or 0)
     run_index_path = ""
@@ -2607,10 +2596,35 @@ def count_executions(sop):
     store = run_index_store(sop)
     if store:
         try:
+            if hasattr(store, "count_runs"):
+                return store.count_runs()
             return len(store.list_runs(limit=200))
         except Exception:
             pass
     return len(run_files(sop))
+
+
+def latest_execution_for_instance(sop):
+    store = run_index_store(sop)
+    if store:
+        try:
+            if hasattr(store, "latest_run_summary"):
+                latest = store.latest_run_summary()
+                if latest:
+                    return latest
+            runs = store.list_runs(limit=1)
+            if runs:
+                return runs[0]
+        except Exception:
+            pass
+    run_files_found = run_files(sop)
+    if run_files_found:
+        run = read_json(run_files_found[0]) or {}
+        if run and not run.get("pipeline_id"):
+            run["pipeline_id"] = run_files_found[0].parent.name
+        if run:
+            return run_summary(sop, run)
+    return None
 
 
 def instance_capabilities(sop):
@@ -2681,6 +2695,98 @@ def sop_instances():
     }
 
 
+def query_value(query, key, default=""):
+    value = (query or {}).get(key)
+    if isinstance(value, list):
+        return str(value[0]) if value else default
+    return str(value) if value is not None else default
+
+
+def cached_read(cache_key, loader, ttl=None):
+    ttl = _SOP_READ_CACHE_TTL_SECONDS if ttl is None else ttl
+    now = time.time()
+    cached = _SOP_READ_CACHE.get(cache_key)
+    if cached and now - cached.get("ts", 0) <= ttl:
+        return cached.get("value")
+    value = loader()
+    _SOP_READ_CACHE[cache_key] = {"ts": now, "value": value}
+    if len(_SOP_READ_CACHE) > 64:
+        for key, item in list(_SOP_READ_CACHE.items()):
+            if now - item.get("ts", 0) > ttl:
+                _SOP_READ_CACHE.pop(key, None)
+    return value
+
+
+def query_int(query, key, default, minimum=1, maximum=200):
+    try:
+        value = int(query_value(query, key, str(default)) or default)
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def page_params(query, default_page_size=50):
+    page = query_int(query, "page", 1, 1, 100000)
+    page_size = query_int(query, "page_size", query_int(query, "limit", default_page_size), 1, 200)
+    offset = (page - 1) * page_size
+    return page, page_size, offset
+
+
+def page_meta(page, page_size, total):
+    total = int(total or 0)
+    page_count = max(1, (total + page_size - 1) // page_size) if page_size else 1
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "page_count": page_count,
+        "has_next": page < page_count,
+        "has_prev": page > 1,
+    }
+
+
+def filter_instance_summaries(instances, query):
+    q = query_value(query, "q").lower()
+    status_filter = query_value(query, "status")
+    sort = query_value(query, "sort", "updated_at")
+    order = query_value(query, "order", "desc").lower()
+    items = []
+    for item in instances:
+        if status_filter and item.get("status") != status_filter:
+            continue
+        haystack = " ".join(str(item.get(key) or "") for key in (
+            "id", "instance_id", "title", "description", "sop_type", "repo", "runtime_id"
+        )).lower()
+        if q and q not in haystack:
+            continue
+        items.append(item)
+    sort_key = sort if sort in {"id", "instance_id", "title", "status", "created_at", "updated_at", "execution_count"} else "updated_at"
+    reverse = order != "asc"
+    return sorted(items, key=lambda item: str(item.get(sort_key) or ""), reverse=reverse)
+
+
+def sop_instances_v1(query=None):
+    query = query or {}
+    runtime = runtime_info()
+    registry = read_registry()
+    all_instances = [instance_summary(sop) for sop in load_sops()]
+    filtered = filter_instance_summaries(all_instances, query)
+    page, page_size, offset = page_params(query, 50)
+    items = filtered[offset:offset + page_size]
+    return {
+        "runtime_id": runtime["runtime_id"],
+        "runtime": runtime,
+        "channel": {
+            "name": registry.get("channel_name", ""),
+            "url": registry.get("channel_url", ""),
+            "spi_base_url": registry.get("spi_base_url", ""),
+        },
+        "instances": items,
+        "data": items,
+        "page": page_meta(page, page_size, len(filtered)),
+    }
+
+
 def sop_dag(sop):
     sop_id = sop.get("id") or sop.get("instance_id", "")
     nodes = []
@@ -2744,24 +2850,60 @@ def sop_runs(sop, query=None):
     sop_id = sop.get("id") or sop.get("instance_id", "")
     instance_id = sop.get("instance_id") or sop_id
     query = query or {}
-    try:
-        limit = max(1, min(200, int((query.get("limit") or ["80"])[0])))
-    except Exception:
-        limit = 80
-    status_filter = (query.get("status") or [""])[0]
+    page, page_size, offset = page_params(query, 80)
+    status_filter = query_value(query, "status")
+    q = query_value(query, "q")
+    action = query_value(query, "action")
+    source_type = query_value(query, "source_type")
+    failed_node = query_value(query, "failed_node")
+    date_from = query_value(query, "from") or query_value(query, "date_from")
+    date_to = query_value(query, "to") or query_value(query, "date_to")
+    sort = query_value(query, "sort", "updated_at")
+    order = query_value(query, "order", "desc")
     runs = []
     seen = set()
+    total = 0
     store = run_index_store(sop)
     if store:
         try:
-            for data in store.list_runs(limit=limit, status=status_filter):
+            if hasattr(store, "count_runs"):
+                total = store.count_runs(status_filter, q, action, source_type, failed_node, date_from, date_to)
+            used_summary_store = hasattr(store, "list_run_summaries")
+            if used_summary_store:
+                store_runs = store.list_run_summaries(
+                    limit=page_size,
+                    offset=offset,
+                    status=status_filter,
+                    q=q,
+                    action=action,
+                    source_type=source_type,
+                    failed_node=failed_node,
+                    date_from=date_from,
+                    date_to=date_to,
+                    sort=sort,
+                    order=order,
+                )
+            else:
+                store_runs = store.list_runs(limit=page_size, status=status_filter)
+            for data in store_runs:
                 runs.append(execution_summary(sop, data))
                 seen.add(data.get("pipeline_id"))
-                if len(runs) >= limit:
-                    return {"sop_id": sop_id, "instance_id": instance_id, "executions": runs, "runs": runs}
+            if runs or used_summary_store:
+                if not total:
+                    total = len(runs)
+                return {
+                    "sop_id": sop_id,
+                    "instance_id": instance_id,
+                    "executions": runs,
+                    "runs": runs,
+                    "data": runs,
+                    "page": page_meta(page, page_size, total),
+                }
         except Exception:
             runs = []
             seen = set()
+            total = 0
+    fallback_runs = []
     for run_file in run_files(sop):
         data = read_json(run_file)
         if not data:
@@ -2772,10 +2914,113 @@ def sop_runs(sop, query=None):
         if data.get("pipeline_id") in seen:
             continue
         if not status_filter or data.get("status") == status_filter:
-            runs.append(execution_summary(sop, run_summary(sop, data)))
-        if len(runs) >= limit:
-            break
-    return {"sop_id": sop_id, "instance_id": instance_id, "executions": runs, "runs": runs}
+            summary = execution_summary(sop, run_summary(sop, data))
+            haystack = " ".join(str(summary.get(key) or "") for key in (
+                "pipeline_id", "execution_id", "status", "source_url", "source_type", "failed_node"
+            )).lower()
+            if q and q.lower() not in haystack:
+                continue
+            fallback_runs.append(summary)
+    total = len(fallback_runs)
+    runs = fallback_runs[offset:offset + page_size]
+    return {
+        "sop_id": sop_id,
+        "instance_id": instance_id,
+        "executions": runs,
+        "runs": runs,
+        "data": runs,
+        "page": page_meta(page, page_size, total),
+    }
+
+
+def sop_run_detail(sop, pipeline_id):
+    run_file = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / pipeline_id / "run.json"
+    data = read_json(run_file)
+    if data and not data.get("pipeline_id"):
+        data["pipeline_id"] = pipeline_id
+    store = run_index_store(sop)
+    indexed = None
+    if store:
+        try:
+            if hasattr(store, "get_run_detail"):
+                indexed = store.get_run_detail(pipeline_id)
+            else:
+                indexed = store.get_run(pipeline_id)
+        except Exception:
+            indexed = None
+    payload = indexed or indexed_run(sop, pipeline_id, rebuild=bool(data)) or (run_summary(sop, data) if data else None)
+    return execution_summary(sop, payload) if payload else None
+
+
+def sop_run_nodes(sop, pipeline_id):
+    detail = sop_run_detail(sop, pipeline_id) or {}
+    nodes = detail.get("nodes") if isinstance(detail.get("nodes"), dict) else {}
+    states = detail.get("node_states") if isinstance(detail.get("node_states"), dict) else {}
+    items = []
+    for node_id, node_status in nodes.items():
+        state = states.get(node_id) if isinstance(states.get(node_id), dict) else {}
+        items.append({
+            "pipeline_id": pipeline_id,
+            "execution_id": pipeline_id,
+            "node_id": node_id,
+            "status": state.get("status") or node_status,
+            "started_at": state.get("started_at", ""),
+            "finished_at": state.get("finished_at", ""),
+            "updated_at": state.get("updated_at", ""),
+            "duration_s": int(state.get("duration_s") or 0),
+            "progress": int(state.get("progress") or (100 if node_status in {"done", "skipped"} else 0)),
+            "artifact_count": int(state.get("artifact_count") or 0),
+            "error": state.get("error", ""),
+        })
+    return {"pipeline_id": pipeline_id, "execution_id": pipeline_id, "nodes": items}
+
+
+def sop_run_events(sop, pipeline_id, query=None):
+    after_sequence = query_int(query or {}, "after_sequence", 0, 0, 100000000)
+    store = run_index_store(sop)
+    events = []
+    if store:
+        try:
+            events = store.get_events(pipeline_id, after_sequence)
+        except Exception:
+            events = []
+    if not events:
+        events = read_run_events(run_workspace(sop, pipeline_id) / "events.jsonl", after_sequence)
+    return {"pipeline_id": pipeline_id, "execution_id": pipeline_id, "events": events}
+
+
+def sop_run_artifacts(sop, pipeline_id):
+    store = run_index_store(sop)
+    artifacts = None
+    if store:
+        try:
+            artifacts = store.get_artifacts(pipeline_id)
+        except Exception:
+            artifacts = None
+    if artifacts is None:
+        artifacts = read_json(run_workspace(sop, pipeline_id) / "artifacts.json")
+    return {
+        "pipeline_id": pipeline_id,
+        "execution_id": pipeline_id,
+        "artifacts": artifacts_with_preview(sop, artifacts),
+    }
+
+
+def sop_run_logs(sop, pipeline_id):
+    run_dir = run_workspace(sop, pipeline_id)
+    logs = []
+    if run_dir.exists():
+        for path in sorted(run_dir.rglob("*.log"), key=lambda item: item.stat().st_mtime, reverse=True)[:50]:
+            try:
+                rel = path.relative_to(run_dir).as_posix()
+                logs.append({
+                    "path": rel,
+                    "size": path.stat().st_size,
+                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                })
+            except Exception:
+                continue
+    return {"pipeline_id": pipeline_id, "execution_id": pipeline_id, "logs": logs}
 
 
 def _iso_duration_seconds(started_at, finished_at):
@@ -3500,9 +3745,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == ["api", "sop"]:
                 return json_response(self, 200, sop_manifest())
             if path == ["api", "sop", "runtime"]:
-                return json_response(self, 200, runtime_info())
+                return json_response(self, 200, cached_read("runtime", runtime_info))
+            if path == ["api", "sop", "v1", "runtime"]:
+                return json_response(self, 200, cached_read("runtime", runtime_info))
+            if path == ["api", "sop", "v1", "instances"]:
+                cache_key = f"instances:v1:{parsed.query}"
+                return json_response(self, 200, cached_read(cache_key, lambda: sop_instances_v1(query)))
+            if len(path) >= 5 and path[0:4] == ["api", "sop", "v1", "instances"]:
+                sop = find_sop(path[4])
+                if not sop:
+                    return json_response(self, 404, {"detail": "Instance not found"})
+                if len(path) == 5:
+                    return json_response(self, 200, instance_summary(sop))
+                if len(path) == 6 and path[5] == "workflow":
+                    dag = sop_dag(sop)
+                    return json_response(self, 200, {
+                        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+                        "workflow_binding": workflow_binding(sop),
+                        "dag": dag,
+                    })
+                if len(path) == 7 and path[5] == "workflow" and path[6] == "runs":
+                    return json_response(self, 200, sop_runs(sop, query))
+                if len(path) >= 8 and path[5] == "workflow" and path[6] == "runs":
+                    pipeline_id = path[7]
+                    if len(path) == 8:
+                        data = sop_run_detail(sop, pipeline_id)
+                        return json_response(self, 200 if data else 404, data or {"detail": "Execution not found"})
+                    if len(path) == 9 and path[8] == "nodes":
+                        return json_response(self, 200, sop_run_nodes(sop, pipeline_id))
+                    if len(path) == 10 and path[8] == "nodes":
+                        if path[9] not in run_node_ids(sop, pipeline_id):
+                            return json_response(self, 404, {
+                                "detail": f"Node {path[9]!r} is not part of execution {pipeline_id!r}"
+                            })
+                        data = node_runtime_detail(sop, pipeline_id, path[9])
+                        data["execution_id"] = data.get("pipeline_id", pipeline_id)
+                        data["instance_id"] = sop.get("instance_id") or sop.get("id", "")
+                        return json_response(self, 200, data)
+                    if len(path) == 9 and path[8] == "events":
+                        return json_response(self, 200, sop_run_events(sop, pipeline_id, query))
+                    if len(path) == 9 and path[8] == "artifacts":
+                        return json_response(self, 200, sop_run_artifacts(sop, pipeline_id))
+                    if len(path) == 9 and path[8] == "logs":
+                        return json_response(self, 200, sop_run_logs(sop, pipeline_id))
             if path == ["api", "sop", "instances"]:
-                return json_response(self, 200, sop_instances())
+                cache_key = f"instances:legacy:{parsed.query}"
+                return json_response(self, 200, cached_read(cache_key, lambda: sop_instances_v1(query)))
             if len(path) >= 4 and path[0] == "api" and path[1] == "sop" and path[2] == "instances":
                 sop = find_sop(path[3])
                 if not sop:

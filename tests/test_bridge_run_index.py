@@ -29,6 +29,41 @@ class FakeRunIndexStore:
         return True
 
 
+class FakeSummaryStore:
+    def count_runs(self, status="", q="", action="", source_type="", failed_node="", date_from="", date_to=""):
+        return 2
+
+    def list_run_summaries(
+        self,
+        limit=80,
+        offset=0,
+        status="",
+        q="",
+        action="",
+        source_type="",
+        failed_node="",
+        date_from="",
+        date_to="",
+        sort="updated_at",
+        order="desc",
+    ):
+        self.args = {
+            "limit": limit,
+            "offset": offset,
+            "status": status,
+            "q": q,
+            "sort": sort,
+            "order": order,
+        }
+        return [{
+            "pipeline_id": "pipe-2",
+            "execution_id": "pipe-2",
+            "status": "done",
+            "nodes": {"build": "done"},
+            "updated_at": "2026-06-15T00:00:00Z",
+        }]
+
+
 class BridgeRunIndexTest(unittest.TestCase):
     def write_workspace_run(self, wiki, run):
         run_dir = wiki / "raw/pipeline-runs/pipe-1"
@@ -107,6 +142,30 @@ class BridgeRunIndexTest(unittest.TestCase):
                 "updated_at": "2026-06-07T00:06:05Z",
                 "nodes": {"tg-notify": "running"},
             }))
+
+    def test_sop_runs_uses_summary_store_with_pagination(self):
+        sop = {
+            "id": "runtime-management",
+            "instance_id": "runtime-management",
+            "wiki_local_path": "/tmp/does-not-need-files",
+            "nodes": {"build": {"mode": "blocking"}},
+        }
+        store = FakeSummaryStore()
+
+        with patch.object(bridge, "run_index_store", return_value=store):
+            payload = bridge.sop_runs(sop, {
+                "page": ["2"],
+                "page_size": ["1"],
+                "status": ["done"],
+                "q": ["pipe"],
+            })
+
+        self.assertEqual(store.args["limit"], 1)
+        self.assertEqual(store.args["offset"], 1)
+        self.assertEqual(store.args["status"], "done")
+        self.assertEqual(payload["page"]["total"], 2)
+        self.assertEqual(payload["executions"][0]["pipeline_id"], "pipe-2")
+        self.assertNotIn("node_states", payload["executions"][0])
 
 
 if __name__ == "__main__":
