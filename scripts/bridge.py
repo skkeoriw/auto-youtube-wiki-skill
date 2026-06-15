@@ -2443,7 +2443,8 @@ def hermes_agent_command():
 def hermes_agent_manual_command(command, message):
     if not command:
         return "Hermes CLI is missing on this Runtime."
-    return f"printf '%s\\n' {shell_quote_single(message or '你好 你是谁')} | {shell_quote_single(command)}"
+    args = (shlex.split(command) if any(ch.isspace() for ch in command) else [command]) + ["--oneshot", message or "你好 你是谁"]
+    return " ".join(shlex.quote(arg) for arg in args)
 
 
 def hermes_agent_check(message, runner=None):
@@ -2468,11 +2469,11 @@ def hermes_agent_check(message, runner=None):
     run = runner or subprocess.run
     env = os.environ.copy()
     env["TERM"] = "xterm-256color"
+    args = (shlex.split(command) if any(ch.isspace() for ch in command) else [command]) + ["--oneshot", prompt]
     started = time.monotonic()
     try:
         completed = run(
-            shlex.split(command) if any(ch.isspace() for ch in command) else [command],
-            input=f"{prompt}\n",
+            args,
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
