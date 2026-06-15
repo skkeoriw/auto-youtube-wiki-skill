@@ -2483,7 +2483,19 @@ def hermes_agent_check(message, runner=None):
         stdout = strip_ansi(completed.stdout or "")
         stderr = strip_ansi(completed.stderr or "")
         response = stdout.strip() or stderr.strip()
-        ok = completed.returncode == 0 and bool(response)
+        failure_text = f"{response}\n{stderr}".lower()
+        cli_error = any(pattern in failure_text for pattern in [
+            "api call failed",
+            "badrequesterror",
+            "non-retryable",
+            "cloudflare tunnel error",
+            "error code:",
+            "http 4",
+            "http 5",
+            "traceback",
+            "exception",
+        ])
+        ok = completed.returncode == 0 and bool(response) and not cli_error
         return (200 if ok else 502), {
             **base,
             "ok": ok,
@@ -2491,7 +2503,7 @@ def hermes_agent_check(message, runner=None):
             "latency_ms": latency_ms,
             "response": response,
             "stderr": stderr.strip() if stderr and not ok else "",
-            "reason": "" if ok else "Hermes CLI did not return a successful response",
+            "reason": "" if ok else "Hermes CLI returned an error response" if cli_error else "Hermes CLI did not return a successful response",
             "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     except subprocess.TimeoutExpired as exc:

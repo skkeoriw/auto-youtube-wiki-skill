@@ -673,6 +673,23 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(result["mode"], "hermes-agent-chat-check")
         self.assertIn("not installed", result["reason"])
 
+    def test_hermes_agent_check_rejects_cli_error_text_even_with_zero_exit(self):
+        def fake_run(command, input=None, text=False, capture_output=False, timeout=0, env=None):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="API call failed after 3 retries: HTTP 530 — Cloudflare Tunnel error",
+                stderr="",
+            )
+
+        with patch.object(bridge, "hermes_agent_command", return_value="/usr/local/bin/hermes"):
+            status, result = bridge.hermes_agent_check("你好", runner=fake_run)
+
+        self.assertEqual(status, 502)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("error response", result["reason"])
+
     def test_hermes_smoke_check_retries_transient_502(self):
         calls = []
 
