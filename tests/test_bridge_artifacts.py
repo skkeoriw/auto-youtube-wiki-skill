@@ -633,6 +633,46 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("$HERMES_WEBHOOK_TOKEN", result["curl"])
         self.assertEqual(captured["timeout"], 60)
 
+    def test_hermes_agent_check_runs_local_cli_with_prompt(self):
+        captured = {}
+
+        def fake_run(command, input=None, text=False, capture_output=False, timeout=0, env=None):
+            captured["command"] = command
+            captured["input"] = input
+            captured["text"] = text
+            captured["capture_output"] = capture_output
+            captured["timeout"] = timeout
+            captured["term"] = (env or {}).get("TERM")
+            return subprocess.CompletedProcess(command, 0, stdout="我是 Hermes\n", stderr="")
+
+        with (
+            patch.object(bridge, "hermes_agent_command", return_value="/usr/local/bin/hermes"),
+            patch.dict(os.environ, {"HERMES_AGENT_CHECK_TIMEOUT": "9"}, clear=False),
+        ):
+            status, result = bridge.hermes_agent_check("你好 你是谁", runner=fake_run)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "hermes-agent-chat-check")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["response"], "我是 Hermes")
+        self.assertEqual(captured["command"], ["/usr/local/bin/hermes"])
+        self.assertEqual(captured["input"], "你好 你是谁\n")
+        self.assertTrue(captured["text"])
+        self.assertTrue(captured["capture_output"])
+        self.assertEqual(captured["timeout"], 9)
+        self.assertEqual(captured["term"], "xterm-256color")
+        self.assertIn("/usr/local/bin/hermes", result["manual_command"])
+
+    def test_hermes_agent_check_reports_missing_cli(self):
+        with patch.object(bridge, "hermes_agent_command", return_value=""):
+            status, result = bridge.hermes_agent_check("你好")
+
+        self.assertEqual(status, 503)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["mode"], "hermes-agent-chat-check")
+        self.assertIn("not installed", result["reason"])
+
     def test_hermes_smoke_check_retries_transient_502(self):
         calls = []
 

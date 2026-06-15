@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2422,6 +2423,102 @@ def hermes_manual_curl(url, payload):
     ])
 
 
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(text or ""))
+
+
+def hermes_agent_command():
+    configured = os.environ.get("HERMES_CLI", "").strip()
+    if configured:
+        return configured
+    discovered = shutil.which("hermes")
+    if discovered:
+        return discovered
+    local_bin = Path.home() / ".local" / "bin" / "hermes"
+    if local_bin.exists():
+        return str(local_bin)
+    return ""
+
+
+def hermes_agent_manual_command(command, message):
+    if not command:
+        return "Hermes CLI is missing on this Runtime."
+    return f"printf '%s\\n' {shell_quote_single(message or '你好 你是谁')} | {shell_quote_single(command)}"
+
+
+def hermes_agent_check(message, runner=None):
+    command = hermes_agent_command()
+    prompt = message or "你好 你是谁"
+    base = {
+        "mode": "hermes-agent-chat-check",
+        "command": command,
+        "manual_command": hermes_agent_manual_command(command, prompt),
+        "message": prompt,
+    }
+    if not command:
+        return 503, {
+            **base,
+            "ok": False,
+            "reason": "Hermes CLI is not installed or is not on PATH for this Runtime",
+            "response": "",
+            "exit_code": None,
+        }
+
+    timeout_seconds = int(os.environ.get("HERMES_AGENT_CHECK_TIMEOUT", "120") or "120")
+    run = runner or subprocess.run
+    env = os.environ.copy()
+    env["TERM"] = "xterm-256color"
+    started = time.monotonic()
+    try:
+        completed = run(
+            shlex.split(command) if any(ch.isspace() for ch in command) else [command],
+            input=f"{prompt}\n",
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            env=env,
+        )
+        latency_ms = round((time.monotonic() - started) * 1000)
+        stdout = strip_ansi(completed.stdout or "")
+        stderr = strip_ansi(completed.stderr or "")
+        response = stdout.strip() or stderr.strip()
+        ok = completed.returncode == 0 and bool(response)
+        return (200 if ok else 502), {
+            **base,
+            "ok": ok,
+            "exit_code": completed.returncode,
+            "latency_ms": latency_ms,
+            "response": response,
+            "stderr": stderr.strip() if stderr and not ok else "",
+            "reason": "" if ok else "Hermes CLI did not return a successful response",
+            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    except subprocess.TimeoutExpired as exc:
+        latency_ms = round((time.monotonic() - started) * 1000)
+        return 504, {
+            **base,
+            "ok": False,
+            "exit_code": None,
+            "latency_ms": latency_ms,
+            "response": strip_ansi(exc.stdout or ""),
+            "stderr": strip_ansi(exc.stderr or ""),
+            "reason": f"Hermes CLI timed out after {timeout_seconds}s",
+            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - started) * 1000)
+        return 502, {
+            **base,
+            "ok": False,
+            "exit_code": None,
+            "latency_ms": latency_ms,
+            "response": "",
+            "stderr": "",
+            "reason": str(exc),
+            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+
 def hermes_post_with_retry(target, data, headers, attempts=3, opener=None, sleeper=None):
     opener = opener or urllib.request.urlopen
     sleeper = sleeper or time.sleep
@@ -4130,6 +4227,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # POST /api/sop/runtime/hermes-smoke  → server-side signed Hermes connectivity check.
         if path == ["api", "sop", "runtime", "hermes-smoke"]:
             status, result = hermes_smoke_check(str(data.get("message") or data.get("text") or data.get("prompt") or "你好 你是谁"))
+            return json_response(self, status, result)
+
+        # POST /api/sop/runtime/hermes-agent-check  → local Hermes CLI answer check.
+        if path == ["api", "sop", "runtime", "hermes-agent-check"]:
+            status, result = hermes_agent_check(str(data.get("message") or data.get("text") or data.get("prompt") or "你好 你是谁"))
             return json_response(self, status, result)
 
         # POST /api/sop/{instance}/config/management/init  → copy current runtime env/env_file into server-side defaults
