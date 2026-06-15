@@ -135,6 +135,13 @@ RUNTIME_CAPABILITY_ENV = {
     "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": ["youtube_research_workflow_token"],
     "CLOUDFLARE_EMAIL": ["cloudflare_email", "cf_email"],
     "CLOUDFLARE_API_KEY": ["cloudflare_api_key", "cf_api_key", "CF_API_KEY"],
+    "RUNTIME_SETTINGS_BACKEND": ["runtime_settings_backend"],
+    "RUNTIME_SETTINGS_CLOUDFLARE_EMAIL": ["runtime_settings_cloudflare_email"],
+    "RUNTIME_SETTINGS_CLOUDFLARE_API_KEY": ["runtime_settings_cloudflare_api_key"],
+    "RUNTIME_SETTINGS_CLOUDFLARE_API_TOKEN": ["runtime_settings_cloudflare_api_token"],
+    "RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID": ["runtime_settings_cloudflare_account_id", "cloudflare_account_id"],
+    "RUNTIME_SETTINGS_D1_DATABASE_ID": ["runtime_settings_d1_database_id", "cloudflare_d1_database_id", "d1_database_id"],
+    "RUNTIME_SETTINGS_D1_DATABASE_NAME": ["runtime_settings_d1_database_name", "d1_database_name"],
     "TUNNEL_API": ["tunnel_api_url"],
     "SOP_UI_URL": ["sop_ui_url"],
 }
@@ -151,6 +158,10 @@ RUNTIME_MANAGEMENT_REQUEST_DEFAULTS = {
     "RUNTIME_TARGET_PRIVATE_KEY_B64": ["private_key_b64", "ssh_private_key_b64"],
     "RUNTIME_TARGET_RUNTIME_ID": ["runtime_id"],
     "RUNTIME_TARGET_CHANNEL_URL": ["channel_url"],
+}
+CREATE_RUNTIME_MANAGEMENT_DEFAULT_EXCLUDES = {
+    "RUNTIME_TARGET_RUNTIME_ID",
+    "RUNTIME_TARGET_CHANNEL_URL",
 }
 RUNTIME_REQUIRED_ENV = {
     "GITHUB_TOKEN",
@@ -197,6 +208,13 @@ RUNTIME_CONFIG_CATEGORIES = {
     "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "youtube",
     "CLOUDFLARE_EMAIL": "cloudflare",
     "CLOUDFLARE_API_KEY": "cloudflare",
+    "RUNTIME_SETTINGS_BACKEND": "settings",
+    "RUNTIME_SETTINGS_CLOUDFLARE_EMAIL": "settings",
+    "RUNTIME_SETTINGS_CLOUDFLARE_API_KEY": "settings",
+    "RUNTIME_SETTINGS_CLOUDFLARE_API_TOKEN": "settings",
+    "RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID": "settings",
+    "RUNTIME_SETTINGS_D1_DATABASE_ID": "settings",
+    "RUNTIME_SETTINGS_D1_DATABASE_NAME": "settings",
     "TUNNEL_API": "cloudflare",
     "SOP_UI_URL": "runtime",
     "GITHUB_CHANGFENGHU_TOKEN": "github",
@@ -807,6 +825,7 @@ def inject_runtime_management_config(body):
         return body
     merged = {**body}
     injected = []
+    action = str(merged.get("management_action") or merged.get("action") or "").strip()
     for env_key, aliases in RUNTIME_CAPABILITY_ENV.items():
         if request_has_runtime_config(merged, env_key, aliases):
             continue
@@ -819,6 +838,8 @@ def inject_runtime_management_config(body):
                 injected.append(env_key)
                 break
     for default_key, request_keys in RUNTIME_MANAGEMENT_REQUEST_DEFAULTS.items():
+        if action == "create-runtime" and default_key in CREATE_RUNTIME_MANAGEMENT_DEFAULT_EXCLUDES:
+            continue
         if any(merged.get(candidate) not in {None, ""} for candidate in request_keys):
             continue
         for candidate in [default_key, *request_keys]:
