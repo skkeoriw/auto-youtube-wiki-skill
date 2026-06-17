@@ -2242,6 +2242,7 @@ def sop_from_instance(runtime, instance):
             if node_id != "retry":
                 previous = node_id
     instance_id = instance.get("instance_id") or wiki_path.name
+    instance_title = instance.get("display_name") or instance.get("title") or instance_id
     return {
         "id": instance_id,
         "instance_id": instance_id,
@@ -2249,7 +2250,8 @@ def sop_from_instance(runtime, instance):
         "sop_type": instance.get("sop_type") or sop.get("id") or sop.get("name", ""),
         "workspace_kind": instance.get("workspace_kind") or ("workflow-bound" if has_sop_definition else "execution-workspace"),
         "name": sop.get("name", instance_id),
-        "title": instance.get("display_name") or sop.get("title", sop.get("name", instance_id)),
+        "title": instance_title,
+        "workflow_title": sop.get("title", sop.get("name", "")),
         "version": sop.get("version", ""),
         "repo": instance.get("repo") or sop.get("repo", ""),
         "wiki_dir": wiki_path.name,
@@ -2669,7 +2671,7 @@ def workflow_binding(sop):
         }
     return {
         "workflow_id": sop.get("raw_id") or sop.get("sop_type") or sop_id,
-        "workflow_name": sop.get("title") or sop.get("name") or sop_id,
+        "workflow_name": sop.get("workflow_title") or sop.get("name") or sop_id,
         "workflow_version": sop.get("version", ""),
         "definition_source": "sop.yaml",
         "definition_path": "sop.yaml",
@@ -2711,6 +2713,7 @@ def instance_summary(sop, include_latest=True):
         "instance_id": instance_id,
         "runtime_id": sop.get("runtime_id", ""),
         "title": sop.get("title") or instance_id,
+        "display_name": sop.get("title") or instance_id,
         "description": sop.get("description", ""),
         "sop_type": sop.get("sop_type", ""),
         "workspace_kind": sop.get("workspace_kind", ""),
