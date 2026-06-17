@@ -2201,8 +2201,9 @@ def sop_from_instance(runtime, instance):
     wiki_path = Path(str(instance.get("local_path", ""))).expanduser()
     sop_file = wiki_path / "sop.yaml"
     sop = read_yaml(sop_file)
+    has_sop_definition = bool(sop)
     if not sop:
-        return None
+        sop = {}
     nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
     if not nodes:
         previous = ""
@@ -2223,15 +2224,17 @@ def sop_from_instance(runtime, instance):
     return {
         "id": instance_id,
         "instance_id": instance_id,
-        "raw_id": sop.get("id") or sop.get("name") or instance_id,
+        "raw_id": sop.get("id") or sop.get("name") or "",
         "sop_type": instance.get("sop_type") or sop.get("id") or sop.get("name", ""),
+        "workspace_kind": instance.get("workspace_kind") or ("workflow-bound" if has_sop_definition else "execution-workspace"),
         "name": sop.get("name", instance_id),
-        "title": sop.get("title", sop.get("name", instance_id)),
+        "title": instance.get("display_name") or sop.get("title", sop.get("name", instance_id)),
         "version": sop.get("version", ""),
         "repo": instance.get("repo") or sop.get("repo", ""),
         "wiki_dir": wiki_path.name,
         "wiki_local_path": str(wiki_path),
         "sop_file": str(sop_file),
+        "has_sop_definition": has_sop_definition,
         "nodes": nodes,
         "enabled": bool(instance.get("enabled", True)),
         "runtime_id": runtime.get("runtime_id", ""),
@@ -2632,6 +2635,17 @@ def workflow_binding(sop):
         node_id for node_id, config in (sop.get("nodes") or {}).items()
         if node_id != "retry" and (config or {}).get("mode") != "manual"
     ]
+    if not sop.get("has_sop_definition", True):
+        return {
+            "workflow_id": "",
+            "workflow_name": "",
+            "workflow_version": "",
+            "definition_source": "stateless-catalog",
+            "definition_path": "",
+            "node_count": 0,
+            "enabled_node_count": 0,
+            "binding_status": "unbound",
+        }
     return {
         "workflow_id": sop.get("raw_id") or sop.get("sop_type") or sop_id,
         "workflow_name": sop.get("title") or sop.get("name") or sop_id,
@@ -2648,7 +2662,7 @@ def instance_status(sop, latest_execution=None):
     if not sop.get("enabled", True):
         return "disabled"
     workspace = Path(sop["wiki_local_path"])
-    if not workspace.exists() or not Path(sop.get("sop_file", "")).exists():
+    if not workspace.exists():
         return "initializing"
     if latest_execution and latest_execution.get("status") == "running":
         return "running"
@@ -2678,11 +2692,12 @@ def instance_summary(sop, include_latest=True):
         "title": sop.get("title") or instance_id,
         "description": sop.get("description", ""),
         "sop_type": sop.get("sop_type", ""),
+        "workspace_kind": sop.get("workspace_kind", ""),
         "enabled": bool(sop.get("enabled", True)),
         "repo": sop.get("repo", ""),
         "repo_branch": sop.get("repo_branch", "main"),
         "wiki_local_path": sop.get("wiki_local_path", ""),
-        "workspace_status": "ready" if workspace.exists() and Path(sop.get("sop_file", "")).exists() else "missing",
+        "workspace_status": "ready" if workspace.exists() else "missing",
         "run_index_path": run_index_path,
         "run_index_status": run_index_status,
         "workflow_binding": workflow_binding(sop),
@@ -2742,7 +2757,7 @@ def instance_capabilities(sop):
     store = run_index_store(sop)
     return {
         "workspace": "ok" if workspace.exists() else "missing",
-        "sop_yaml": "ok" if Path(sop.get("sop_file", "")).exists() else "missing",
+        "sop_yaml": "ok" if Path(sop.get("sop_file", "")).exists() else "unbound",
         "run_index": "ok" if store and store.db_path.exists() else "missing",
         "git": "configured" if sop.get("repo") else "missing",
         "telegram": "configured" if os.environ.get("YOUTUBE_WIKI_TG_TOKEN") else "unknown",
