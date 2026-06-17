@@ -1298,11 +1298,26 @@ def run_dag_node_config(sop, pipeline_id, node_id):
     return None
 
 
+def provision_node_report(sop, pipeline_id, node_id):
+    wiki = Path(sop["wiki_local_path"])
+    candidates = [
+        wiki / "raw" / "provision" / pipeline_id / f"{node_id}.json",
+        wiki / "raw" / "provision" / pipeline_id / f"{node_id.replace('_', '-')}.json",
+    ]
+    for path in candidates:
+        resolved = safe_artifact_path(wiki, path.relative_to(wiki))
+        if resolved and resolved.is_file():
+            report = read_json(resolved)
+            return report if isinstance(report, dict) else {}
+    return {}
+
+
 def node_runtime_detail(sop, pipeline_id, node_id):
     wiki = Path(sop["wiki_local_path"])
     workspace = run_workspace(sop, pipeline_id)
     node_file = workspace / "nodes" / f"{node_id}.json"
     state = read_json(node_file) or {}
+    report = provision_node_report(sop, pipeline_id, node_id)
     config = (sop.get("nodes") or {}).get(node_id) or run_dag_node_config(sop, pipeline_id, node_id) or {}
     context = run_context(sop, pipeline_id)
 
@@ -1403,6 +1418,9 @@ def node_runtime_detail(sop, pipeline_id, node_id):
         "capabilities": read_json(workspace / "nodes" / node_id / "capabilities.json") or {},
         "plan": read_json(workspace / "nodes" / node_id / "plan.json"),
         "infra": config.get("infra", {}),
+        "report_detail": mask_data(report.get("detail")) if isinstance(report.get("detail"), dict) else {},
+        "report_reason": report.get("reason", "") if isinstance(report.get("reason"), str) else "",
+        "report_manual_fix_hint": report.get("manual_fix_hint", "") if isinstance(report.get("manual_fix_hint"), str) else "",
         "validation": {
             "status": validation_status,
             "missing_outputs": recorded_validation.get("missing_outputs", missing),
@@ -1420,6 +1438,9 @@ def node_runtime_detail(sop, pipeline_id, node_id):
                     "artifacts": indexed_artifacts,
                     "discovered_candidates": discovered_candidates,
                     "plan": detail.get("plan"),
+                    "report_detail": detail.get("report_detail"),
+                    "report_reason": detail.get("report_reason"),
+                    "report_manual_fix_hint": detail.get("report_manual_fix_hint"),
                     "index_resolution": "indexed",
                 })
         except Exception:
