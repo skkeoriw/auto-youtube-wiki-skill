@@ -3592,6 +3592,10 @@ def node_test_workspace(sop, test_id):
     return Path(sop["wiki_local_path"]) / "raw" / "node-tests" / test_id
 
 
+def node_run_workspace(sop, node_run_id):
+    return Path(sop["wiki_local_path"]) / "raw" / "node-runs" / node_run_id
+
+
 def sanitize_test_id(value):
     return re.sub(r"[^A-Za-z0-9._-]", "", str(value or ""))
 
@@ -3971,6 +3975,498 @@ def list_generic_node_tests(sop, node_id, limit=10):
         if len(tests) >= limit:
             break
     return tests
+
+
+def sanitize_node_run_id(value):
+    return re.sub(r"[^A-Za-z0-9._-]", "", str(value or ""))
+
+
+def workflow_id_matches(sop, workflow_id):
+    workflow_id = str(workflow_id or "")
+    if not workflow_id:
+        return True
+    binding = workflow_binding(sop)
+    accepted = {
+        str(binding.get("workflow_id") or ""),
+        str(binding.get("workflow_name") or ""),
+        str(sop.get("id") or ""),
+        str(sop.get("raw_id") or ""),
+        str(sop.get("sop_type") or ""),
+        str(sop.get("name") or ""),
+    }
+    return workflow_id in {item for item in accepted if item}
+
+
+def env_config_item(key, label="", required=False, default_value=None, value=None, source="runtime-env"):
+    if value is None:
+        value = os.environ.get(key)
+    present = not is_blank_value(value)
+    return {
+        "key": key,
+        "label": label or key,
+        "required": bool(required),
+        "present": present,
+        "source": source if present else f"missing:{key}",
+        "masked_value": display_config_value(key, value) if present else "",
+        "value": None if is_secret_key(key) else value if present else default_value,
+    }
+
+
+def parse_int_env(key, default):
+    try:
+        return int(os.environ.get(key, str(default)) or default)
+    except Exception:
+        return default
+
+
+def sop_definition(sop):
+    return read_yaml(Path(sop.get("sop_file") or ""))
+
+
+def resolve_telegram_config(sop, node_id, static):
+    definition = sop_definition(sop)
+    notify = definition.get("notify") if isinstance(definition.get("notify"), dict) else {}
+    telegram = notify.get("telegram") if isinstance(notify.get("telegram"), dict) else {}
+    token_env = str(telegram.get("token_env") or "YOUTUBE_WIKI_TG_TOKEN")
+    chat_id = telegram.get("chat_id")
+    chat_source = "instance-sop:notify.telegram.chat_id" if not is_blank_value(chat_id) else "runtime-env:YOUTUBE_WIKI_TG_CHAT_ID"
+    if is_blank_value(chat_id):
+        chat_id = os.environ.get("YOUTUBE_WIKI_TG_CHAT_ID")
+    capabilities = (node_registry_item(sop, node_id) or {}).get("capabilities") or {}
+    tg_cap = capabilities.get("telegram") if isinstance(capabilities.get("telegram"), dict) else {}
+    enabled = bool(tg_cap.get("enabled", (static.get("infra") or {}).get("tg_notify", True)))
+    required = bool(tg_cap.get("required", False))
+    token_present = not is_blank_value(os.environ.get(token_env))
+    chat_present = not is_blank_value(chat_id)
+    if not enabled:
+        status = "disabled"
+    elif token_present and chat_present:
+        status = "ready"
+    elif required:
+        status = "failed"
+    else:
+        status = "warning"
+    return {
+        "capability": "telegram",
+        "label": "Telegram progress notification",
+        "enabled": enabled,
+        "required": required,
+        "status": status,
+        "token_env": token_env,
+        "token": env_config_item(token_env, "Telegram Bot Token", required=enabled and required),
+        "chat_id": {
+            "key": "YOUTUBE_WIKI_TG_CHAT_ID",
+            "label": "Telegram Chat ID",
+            "required": enabled and required,
+            "present": chat_present,
+            "source": chat_source if chat_present else "missing:YOUTUBE_WIKI_TG_CHAT_ID",
+            "masked_value": mask_value(chat_id) if chat_present else "",
+            "value": str(chat_id) if chat_present else "",
+        },
+        "probe": {
+            "enabled": enabled,
+            "explicit_confirmation_required": True,
+            "side_effect": "sends a Telegram test message",
+        },
+    }
+
+
+def resolve_youtube_research_worker_config(node_id):
+    if node_id != "youtube-deep-research":
+        return None
+    token = os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TOKEN") or os.environ.get("YOUTUBE_CONTENT_API_TOKEN")
+    token_key = "YOUTUBE_RESEARCH_WORKFLOW_TOKEN" if os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TOKEN") else "YOUTUBE_CONTENT_API_TOKEN"
+    base_url = os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_URL", "").rstrip("/")
+    timeout_s = parse_int_env("YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT", 1200)
+    interval_s = parse_int_env("YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL", 10)
+    missing = []
+    if not base_url:
+        missing.append("YOUTUBE_RESEARCH_WORKFLOW_URL")
+    if not token:
+        missing.append("YOUTUBE_RESEARCH_WORKFLOW_TOKEN")
+    return {
+        "capability": "youtube-research-worker",
+        "label": "YouTube Deep Research Worker",
+        "status": "ready" if not missing else "failed",
+        "base_url": env_config_item("YOUTUBE_RESEARCH_WORKFLOW_URL", "Worker URL", required=True, value=base_url),
+        "token": env_config_item(token_key, "Worker API Token", required=True, value=token),
+        "timeout": {
+            "key": "YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT",
+            "label": "Worker Poll Timeout",
+            "required": False,
+            "present": bool(os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT")),
+            "source": "runtime-env:YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT" if os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT") else "default",
+            "value": timeout_s,
+            "unit": "seconds",
+        },
+        "poll_interval": {
+            "key": "YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL",
+            "label": "Worker Poll Interval",
+            "required": False,
+            "present": bool(os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL")),
+            "source": "runtime-env:YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL" if os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL") else "default",
+            "value": interval_s,
+            "unit": "seconds",
+        },
+        "missing": missing,
+    }
+
+
+def resolve_git_config(_sop):
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    return {
+        "capability": "github",
+        "label": "GitHub workspace persistence",
+        "enabled": True,
+        "required": False,
+        "status": "ready" if token else "warning",
+        "token": env_config_item("GITHUB_TOKEN" if os.environ.get("GITHUB_TOKEN") else "GH_TOKEN", "GitHub Token", required=False, value=token),
+    }
+
+
+def node_run_config_summary(sop, node_id, static):
+    configs = {
+        "telegram": resolve_telegram_config(sop, node_id, static),
+        "github": resolve_git_config(sop),
+    }
+    worker = resolve_youtube_research_worker_config(node_id)
+    if worker:
+        configs["youtube_research_worker"] = worker
+    return configs
+
+
+def node_run_fix_suggestions(configs, missing_inputs):
+    suggestions = []
+    for item in missing_inputs or []:
+        suggestions.append({
+            "target": "node-run-inputs",
+            "title": f"Provide {item.get('name')}",
+            "reason": item.get("reason") or "Required input is missing.",
+            "action": "Switch input source, select an existing Workflow Run, pick an artifact, or enter a manual value.",
+        })
+    telegram = configs.get("telegram") or {}
+    if telegram.get("enabled") and telegram.get("status") in {"warning", "failed"}:
+        suggestions.append({
+            "target": "instance-settings",
+            "title": "Fix Telegram progress notification",
+            "reason": "Telegram token or chat id is missing for this Instance/Runtime context.",
+            "action": "Update Instance Settings for per-instance TG, or Runtime/Global Settings for shared defaults. Use explicit probe after saving.",
+        })
+    worker = configs.get("youtube_research_worker") or {}
+    if worker.get("status") == "failed":
+        suggestions.append({
+            "target": "runtime-settings",
+            "title": "Fix YouTube Deep Research Worker config",
+            "reason": ", ".join(worker.get("missing") or []) or "Worker config is incomplete.",
+            "action": "Set YOUTUBE_RESEARCH_WORKFLOW_URL and YOUTUBE_RESEARCH_WORKFLOW_TOKEN on the Runtime, then retry the Node Run.",
+        })
+    git = configs.get("github") or {}
+    if git.get("status") == "warning":
+        suggestions.append({
+            "target": "runtime-settings",
+            "title": "Check GitHub persistence token",
+            "reason": "GitHub token is not visible to this Runtime process.",
+            "action": "Update Runtime Settings or the runtime env file before running a node that writes artifacts.",
+        })
+    return suggestions
+
+
+def build_node_run_plan(sop, workflow_id, node_id, body=None):
+    body = body if isinstance(body, dict) else {}
+    if not workflow_id_matches(sop, workflow_id):
+        return None
+    config = (sop.get("nodes") or {}).get(node_id)
+    if not isinstance(config, dict):
+        return None
+    static = node_static_config(sop, node_id) or {}
+    input_source = str(body.get("input_source") or body.get("source_mode") or "generated-fixture")
+    if input_source == "artifact":
+        input_source = "manual"
+    if input_source not in {"existing-run", "generated-fixture", "manual", "deepseek-mock"}:
+        input_source = "generated-fixture"
+    test_plan = build_node_test_plan(sop, node_id, {
+        **body,
+        "input_source": input_source,
+    }) or {}
+    mode = str(body.get("mode") or "preflight")
+    if mode not in {"preflight", "probe", "dry-run", "real-node"}:
+        mode = "preflight"
+    binding = workflow_binding(sop)
+    runtime = runtime_info()
+    configs = node_run_config_summary(sop, node_id, static)
+    return {
+        **test_plan,
+        "runtime_id": sop.get("runtime_id") or runtime.get("runtime_id") or "",
+        "runtime_channel_url": sop.get("channel_url") or runtime.get("channel_url") or "",
+        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+        "workflow_id": workflow_id or binding.get("workflow_id") or sop.get("sop_type") or sop.get("id", ""),
+        "workflow_name": binding.get("workflow_name") or sop.get("workflow_title") or "",
+        "node_id": node_id,
+        "node_title": static.get("title") or node_id,
+        "mode": mode,
+        "input_source": input_source,
+        "resolved_config": configs,
+        "capability_probes": {
+            key: {
+                "capability": value.get("capability") or key,
+                "label": value.get("label") or key,
+                "status": value.get("status") or "unknown",
+                "required": bool(value.get("required", False)),
+                "enabled": value.get("enabled", True),
+            }
+            for key, value in configs.items()
+        },
+        "fix_suggestions": node_run_fix_suggestions(configs, test_plan.get("missing_inputs") or []),
+        "node_capabilities": (node_registry_item(sop, node_id) or {}).get("capabilities") or {},
+    }
+
+
+def node_run_step(step_id, title, status, summary="", detail=None):
+    return node_test_step(step_id, title, status, summary, detail)
+
+
+def build_node_run_steps(sop, plan):
+    wiki = Path(sop.get("wiki_local_path", ""))
+    missing = plan.get("missing_inputs") or []
+    configs = plan.get("resolved_config") or {}
+    worker = configs.get("youtube_research_worker") or {}
+    telegram = configs.get("telegram") or {}
+    mode = plan.get("mode") or "preflight"
+    config_status = "done"
+    config_notes = []
+    if worker.get("status") == "failed":
+        config_status = "failed"
+        config_notes.append("youtube research worker config missing")
+    if telegram.get("enabled") and telegram.get("status") in {"warning", "failed"}:
+        if telegram.get("required"):
+            config_status = "failed"
+        elif config_status != "failed":
+            config_status = "warning"
+        config_notes.append("telegram progress notification needs attention")
+    steps = [
+        node_run_step(
+            "create-run",
+            "Create node run workspace",
+            "done",
+            "Node Run record is allocated independently from Workflow Run.",
+            {"storage": "raw/node-runs/{node_run_id}"},
+        ),
+        node_run_step(
+            "load-definition",
+            "Load node definition",
+            "done",
+            f"Loaded {plan.get('node_id')} from {plan.get('workflow_id')}.",
+            {"workflow_id": plan.get("workflow_id"), "node_id": plan.get("node_id"), "node_title": plan.get("node_title")},
+        ),
+        node_run_step(
+            "resolve-context",
+            "Resolve Runtime / Instance / Workflow context",
+            "done" if wiki.exists() else "failed",
+            f"{plan.get('runtime_id')} · {plan.get('instance_id')} · {plan.get('workflow_id')}" if wiki.exists() else "Instance workspace is not available.",
+            {
+                "runtime_id": plan.get("runtime_id"),
+                "instance_id": plan.get("instance_id"),
+                "workflow_id": plan.get("workflow_id"),
+                "wiki_local_path": str(wiki),
+            },
+        ),
+        node_run_step(
+            "resolve-inputs",
+            "Resolve node inputs",
+            "needs_input" if missing else "done",
+            f"{len(plan.get('resolved_inputs') or [])} resolved, {len(missing)} missing.",
+            {
+                "input_source": plan.get("input_source"),
+                "base_run_id": plan.get("base_run_id"),
+                "resolved_inputs": plan.get("resolved_inputs") or [],
+                "missing_inputs": missing,
+            },
+        ),
+        node_run_step(
+            "resolve-config",
+            "Resolve execution config",
+            config_status,
+            "; ".join(config_notes) if config_notes else "Runtime, Instance and capability config resolved.",
+            configs,
+        ),
+        node_run_step(
+            "probe-capabilities",
+            "Probe attached capabilities",
+            "done" if mode == "probe" and config_status in {"done", "warning"} else "skipped" if mode != "probe" else "failed",
+            "Capability probes are explicit. Telegram send probes require user confirmation." if mode != "probe" else "Readiness probes evaluated without hidden side effects.",
+            plan.get("capability_probes") or {},
+        ),
+        node_run_step(
+            "build-execution-plan",
+            "Build node execution plan",
+            "skipped" if missing or config_status == "failed" else "done",
+            "Inputs or required config are incomplete." if missing or config_status == "failed" else f"Prepared {mode} execution plan.",
+            {
+                "mode": mode,
+                "real_execution_enabled": False,
+                "reason": "This API records node-level diagnostics first; real-node execution still requires explicit engine adapter confirmation.",
+            },
+        ),
+        node_run_step(
+            "execute-or-dry-run",
+            "Execute or dry-run node",
+            "blocked" if mode == "real-node" else "skipped",
+            "Real node execution is intentionally blocked until the node executor adapter is explicitly enabled." if mode == "real-node" else "No business node was executed in this diagnostic run.",
+            {"mode": mode, "side_effects": plan.get("side_effects") or {}},
+        ),
+        node_run_step(
+            "validate-outputs",
+            "Validate declared outputs",
+            "skipped",
+            "No business execution occurred, so output validation is informational only.",
+            {"declared_outputs": normalize_contract((sop.get("nodes") or {}).get(plan.get("node_id"), {}).get("outputs", {}), "output")},
+        ),
+        node_run_step(
+            "persist-artifacts",
+            "Persist node run artifacts",
+            "done",
+            "Node Run diagnostic record was written to the instance workspace.",
+            {"artifacts": ["input.json", "result.json", "events.jsonl"]},
+        ),
+    ]
+    return steps
+
+
+def node_run_events_from_steps(node_run_id, node_id, steps, timestamp):
+    events = []
+    for index, step in enumerate(steps, start=1):
+        events.append({
+            "sequence": index,
+            "event": f"node_run.step.{step.get('status')}",
+            "node_run_id": node_run_id,
+            "node_id": node_id,
+            "step_id": step.get("id"),
+            "ts": timestamp,
+            "data": {"title": step.get("title"), "summary": step.get("summary")},
+        })
+    return events
+
+
+def node_run_status_from_steps(steps):
+    statuses = [str(step.get("status") or "") for step in steps]
+    if "failed" in statuses:
+        return "failed"
+    if "blocked" in statuses:
+        return "blocked"
+    if "needs_input" in statuses:
+        return "needs_input"
+    if "warning" in statuses:
+        return "warning"
+    if "running" in statuses:
+        return "running"
+    return "done"
+
+
+def write_jsonl(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+
+
+def read_jsonl(path):
+    rows = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rows.append(json.loads(line))
+    except Exception:
+        pass
+    return rows
+
+
+def create_node_run(sop, workflow_id, node_id, body):
+    plan = build_node_run_plan(sop, workflow_id, node_id, body)
+    if plan is None:
+        return 404, {"status": "error", "message": f"Node {node_id!r} or workflow {workflow_id!r} not found"}
+    token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    digest = hashlib.sha1(json.dumps(body if isinstance(body, dict) else {}, sort_keys=True).encode("utf-8")).hexdigest()[:6]
+    node_run_id = sanitize_node_run_id(body.get("node_run_id") if isinstance(body, dict) else "") or f"node-run-{node_id}-{token}-{digest}"
+    workspace = node_run_workspace(sop, node_run_id)
+    now = datetime.now(timezone.utc).isoformat()
+    steps = build_node_run_steps(sop, plan)
+    events = node_run_events_from_steps(node_run_id, node_id, steps, now)
+    status = node_run_status_from_steps(steps)
+    artifacts = [{
+        "id": "node-run-result",
+        "producer": node_id,
+        "type": "node-run.result",
+        "format": "json",
+        "path": f"raw/node-runs/{node_run_id}/result.json",
+        "title": "Node Run diagnostic result",
+        "resolution": "recorded",
+    }]
+    reason = ""
+    if status in {"failed", "blocked", "needs_input", "warning"}:
+        reason = next((step.get("summary") for step in steps if step.get("status") in {"failed", "blocked", "needs_input", "warning"}), "")
+    result = {
+        "node_run_id": node_run_id,
+        "pipeline_id": node_run_id,
+        "runtime_id": plan.get("runtime_id"),
+        "instance_id": plan.get("instance_id"),
+        "workflow_id": plan.get("workflow_id"),
+        "node_id": node_id,
+        "node_title": plan.get("node_title"),
+        "status": status,
+        "mode": plan.get("mode"),
+        "input_source": plan.get("input_source"),
+        "started_at": now,
+        "finished_at": now,
+        "pending": False,
+        "reason": reason,
+        "steps": steps,
+        "events": events,
+        "artifacts": artifacts,
+        "detail": mask_data(plan),
+    }
+    write_json(workspace / "input.json", body if isinstance(body, dict) else {})
+    write_json(workspace / "result.json", result)
+    write_jsonl(workspace / "events.jsonl", events)
+    return 200, result
+
+
+def read_node_run_result(sop, node_id, node_run_id):
+    safe = sanitize_node_run_id(node_run_id)
+    if not safe.startswith("node-run-"):
+        return None
+    result = read_json(node_run_workspace(sop, safe) / "result.json")
+    if not isinstance(result, dict) or result.get("node_id") != node_id:
+        return None
+    result["detail"] = mask_data(result.get("detail") or {})
+    return result
+
+
+def list_node_runs(sop, node_id, limit=20):
+    root = Path(sop["wiki_local_path"]) / "raw" / "node-runs"
+    rows = []
+    if not root.exists():
+        return rows
+    for run_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True):
+        result = read_json(run_dir / "result.json")
+        if not isinstance(result, dict) or result.get("node_id") != node_id:
+            continue
+        rows.append({
+            "node_run_id": result.get("node_run_id") or run_dir.name,
+            "pipeline_id": result.get("pipeline_id") or result.get("node_run_id") or run_dir.name,
+            "runtime_id": result.get("runtime_id"),
+            "instance_id": result.get("instance_id"),
+            "workflow_id": result.get("workflow_id"),
+            "node_id": node_id,
+            "node_title": result.get("node_title"),
+            "status": result.get("status"),
+            "mode": result.get("mode"),
+            "input_source": result.get("input_source"),
+            "started_at": result.get("started_at"),
+            "finished_at": result.get("finished_at"),
+            "reason": result.get("reason"),
+        })
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 def trigger_node_test(sop, node_id, body):
@@ -4604,6 +5100,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "log": log_text,
                         "events": events,
                     })
+                # GET /api/sop/{instance}/workflows/{workflow_id}/nodes/{node_id}/runs — Node Run history
+                if len(path) == 8 and path[3] == "workflows" and path[5] == "nodes" and path[7] == "runs":
+                    if not workflow_id_matches(sop, path[4]):
+                        return json_response(self, 404, {"detail": f"Workflow {path[4]!r} not found"})
+                    if node_registry_item(sop, path[6]) is None:
+                        return json_response(self, 404, {"detail": f"Node {path[6]!r} not found"})
+                    try:
+                        limit = int((query.get("limit") or ["20"])[0])
+                    except Exception:
+                        limit = 20
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+                        "workflow_id": path[4],
+                        "node_id": path[6],
+                        "runs": list_node_runs(sop, path[6], limit=max(1, min(limit, 100))),
+                    })
+                # GET /api/sop/{instance}/workflows/{workflow_id}/nodes/{node_id}/runs/{node_run_id}
+                if len(path) in {9, 10} and path[3] == "workflows" and path[5] == "nodes" and path[7] == "runs":
+                    if not workflow_id_matches(sop, path[4]):
+                        return json_response(self, 404, {"detail": f"Workflow {path[4]!r} not found"})
+                    result = read_node_run_result(sop, path[6], path[8])
+                    if result is None:
+                        return json_response(self, 404, {"detail": f"Node run {path[8]!r} not found"})
+                    if len(path) == 10 and path[9] == "events":
+                        events = read_jsonl(node_run_workspace(sop, path[8]) / "events.jsonl")
+                        return json_response(self, 200, {
+                            "node_run_id": path[8],
+                            "node_id": path[6],
+                            "events": events or result.get("events") or [],
+                        })
+                    if len(path) == 9:
+                        return json_response(self, 200, result)
+                # GET /api/sop/{instance}/nodes/{node_id}/runs — Node Run history alias
+                if len(path) == 6 and path[3] == "nodes" and path[5] == "runs":
+                    if node_registry_item(sop, path[4]) is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+                        "workflow_id": workflow_binding(sop).get("workflow_id", ""),
+                        "node_id": path[4],
+                        "runs": list_node_runs(sop, path[4]),
+                    })
+                # GET /api/sop/{instance}/nodes/{node_id}/runs/{node_run_id}
+                if len(path) in {7, 8} and path[3] == "nodes" and path[5] == "runs":
+                    result = read_node_run_result(sop, path[4], path[6])
+                    if result is None:
+                        return json_response(self, 404, {"detail": f"Node run {path[6]!r} not found"})
+                    if len(path) == 8 and path[7] == "events":
+                        events = read_jsonl(node_run_workspace(sop, path[6]) / "events.jsonl")
+                        return json_response(self, 200, {
+                            "node_run_id": path[6],
+                            "node_id": path[4],
+                            "events": events or result.get("events") or [],
+                        })
+                    if len(path) == 7:
+                        return json_response(self, 200, result)
                 # GET /api/sop/{instance}/nodes — Node Registry
                 if len(path) == 4 and path[3] == "nodes":
                     endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
@@ -4869,6 +5423,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             http_code, result = trigger_node_test(sop, path[4], data)
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/nodes/{node_id}/runs — node-level diagnostic run
+        if (len(path) == 8 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "nodes" and path[7] == "runs"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = create_node_run(sop, path[4], path[6], data)
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/nodes/{node_id}/runs — node-level diagnostic run alias
+        if (len(path) == 6 and path[:2] == ["api", "sop"]
+                and path[3] == "nodes" and path[5] == "runs"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            workflow_id = str(data.get("workflow_id") or workflow_binding(sop).get("workflow_id") or "")
+            http_code, result = create_node_run(sop, workflow_id, path[4], data)
             return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/nodes/{node_id}/tests — generic node preflight

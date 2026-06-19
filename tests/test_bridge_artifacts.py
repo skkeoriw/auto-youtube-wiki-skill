@@ -222,7 +222,8 @@ class ArtifactResolutionTest(unittest.TestCase):
             encoding="utf-8",
         )
         sop = {"id": "runtime-management", "instance_id": "runtime-management", "sop_type": "runtime-management"}
-        with patch.dict(os.environ, {
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path), patch.dict(os.environ, {
             "YOUTUBE_WIKI_ENV_FILE": str(env_file),
             "GITHUB_TOKEN": "",
             "NOTEBOOKLM_BRIDGE_URL": "",
@@ -1210,6 +1211,87 @@ class ArtifactResolutionTest(unittest.TestCase):
 
         history = bridge.list_generic_node_tests(self.sop, "wiki-build")
         self.assertEqual(history[0]["test_id"], result["test_id"])
+
+    def test_node_run_records_diagnostic_flow_without_pipeline_run(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "needs": ["youtube-fetch"],
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/analysis.md"},
+            "infra": {"tg_notify": True, "log_record": True},
+        }
+        with patch.dict(os.environ, {
+            "YOUTUBE_RESEARCH_WORKFLOW_URL": "https://worker.example",
+            "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "worker-token-secret",
+            "YOUTUBE_WIKI_TG_TOKEN": "telegram-token-secret",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "7796171193",
+        }, clear=False):
+            code, result = bridge.create_node_run(
+                sop,
+                "test",
+                "youtube-deep-research",
+                {"mode": "probe", "input_source": "generated-fixture"},
+            )
+
+        self.assertEqual(code, 200)
+        self.assertTrue(result["node_run_id"].startswith("node-run-youtube-deep-research-"))
+        self.assertEqual(result["status"], "done")
+        self.assertTrue((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "result.json").exists())
+        self.assertFalse((self.wiki / "raw" / "pipeline-runs" / result["node_run_id"]).exists())
+        self.assertEqual([step["id"] for step in result["steps"]], [
+            "create-run",
+            "load-definition",
+            "resolve-context",
+            "resolve-inputs",
+            "resolve-config",
+            "probe-capabilities",
+            "build-execution-plan",
+            "execute-or-dry-run",
+            "validate-outputs",
+            "persist-artifacts",
+        ])
+        detail = result["detail"]
+        self.assertEqual(detail["resolved_inputs"][0]["value"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(detail["resolved_config"]["youtube_research_worker"]["timeout"]["value"], 1200)
+        self.assertEqual(detail["resolved_config"]["telegram"]["status"], "ready")
+        self.assertEqual(detail["resolved_config"]["telegram"]["token"]["masked_value"], "tel***ret")
+
+        read_back = bridge.read_node_run_result(sop, "youtube-deep-research", result["node_run_id"])
+        self.assertEqual(read_back["node_run_id"], result["node_run_id"])
+        self.assertEqual(bridge.list_node_runs(sop, "youtube-deep-research")[0]["node_run_id"], result["node_run_id"])
+
+    def test_node_run_routes_create_and_read_shareable_id(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/test/nodes/wiki-build/runs",
+                method="POST",
+                data=json.dumps({"mode": "dry-run", "input_source": "existing-run", "pipeline_id": "pipe-1"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                created = json.loads(response.read())
+            self.assertIn("node_run_id", created)
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/test/nodes/wiki-build/runs/{created['node_run_id']}",
+                timeout=3,
+            ) as response:
+                detail = json.loads(response.read())
+            self.assertEqual(detail["node_run_id"], created["node_run_id"])
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/test/nodes/wiki-build/runs/{created['node_run_id']}/events",
+                timeout=3,
+            ) as response:
+                events = json.loads(response.read())
+            self.assertTrue(events["events"])
+        server.shutdown()
+        server.server_close()
 
     @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
     def test_node_contract_endpoint_returns_engine_contract(self):
