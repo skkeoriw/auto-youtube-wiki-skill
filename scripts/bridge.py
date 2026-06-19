@@ -3492,6 +3492,11 @@ def read_node_test_result(sop, node_id, pipeline_id):
     terminal report with detail (e.g. ssh_ok / stdout / disk_ok / reason)."""
     # Security: only the nodetest namespace, no path traversal.
     safe = re.sub(r"[^A-Za-z0-9._-]", "", pipeline_id or "")
+    if safe.startswith("node-test-"):
+        result = read_generic_node_test_result(sop, safe)
+        if not result:
+            return {"pipeline_id": safe, "node_id": node_id, "status": "running", "pending": True}
+        return result
     if not safe.startswith("nodetest-"):
         return None
     wiki = Path(sop["wiki_local_path"])
@@ -3508,6 +3513,252 @@ def read_node_test_result(sop, node_id, pipeline_id):
         "manual_fix_hint": report.get("manual_fix_hint"),
         "detail": mask_data(report.get("detail") or {}),
     }
+
+
+def node_test_workspace(sop, test_id):
+    return Path(sop["wiki_local_path"]) / "raw" / "node-tests" / test_id
+
+
+def sanitize_test_id(value):
+    return re.sub(r"[^A-Za-z0-9._-]", "", str(value or ""))
+
+
+def recent_run_summaries(sop, limit=20):
+    root = Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs"
+    rows = []
+    if not root.exists():
+        return rows
+    for run_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True):
+        run_json = read_json(run_dir / "run.json") or {}
+        context = read_json(run_dir / "context.json") or {}
+        node_statuses = {}
+        nodes_dir = run_dir / "nodes"
+        if nodes_dir.exists():
+            for node_file in nodes_dir.glob("*.json"):
+                node_data = read_json(node_file) or {}
+                node_statuses[node_file.stem] = node_data.get("status") or node_data.get("state") or ""
+        rows.append({
+            "pipeline_id": run_dir.name,
+            "status": run_json.get("status") or "",
+            "source_url": context.get("source_url") or run_json.get("source_url") or "",
+            "updated_at": run_json.get("updated_at") or run_json.get("finished_at") or run_json.get("started_at") or "",
+            "nodes": node_statuses,
+        })
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def node_output_from_state(sop, pipeline_id, upstream_node, output_name):
+    run_dir = run_workspace(sop, pipeline_id)
+    state = read_json(run_dir / "nodes" / f"{upstream_node}.json") or {}
+    for key in ["actual_outputs", "outputs", "resolved_outputs", "detail"]:
+        value = state.get(key)
+        if isinstance(value, dict) and output_name in value:
+            return value.get(output_name), f"run:{pipeline_id}:nodes/{upstream_node}.json:{key}"
+    return None, ""
+
+
+def format_output_template(template, pipeline_id):
+    if not isinstance(template, str):
+        return ""
+    run_id = pipeline_id
+    return template.replace("{pipeline_id}", pipeline_id).replace("{run_id}", run_id)
+
+
+def generated_fixture_value(input_name, source):
+    name = str(input_name or "").lower()
+    source_text = str(source or "").lower()
+    if name in {"source_url", "url"} or source_text.endswith(".source_url"):
+        return "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    if name in {"metadata_file"} or source_text.endswith(".metadata_file"):
+        return "raw/youtube-metadata/node-test-fixture.json"
+    if name in {"reports"} or source_text.endswith(".reports"):
+        return "raw/notebooklm-analysis/node-test-fixture.md"
+    if name in {"deep_research", "analysis_file"} or source_text.endswith(".analysis_file"):
+        return "raw/youtube-deep-research/node-test-fixture/analysis.md"
+    if name in {"index"} or source_text.endswith(".index"):
+        return "index.md"
+    return None
+
+
+def is_blank_value(value):
+    return value is None or (isinstance(value, str) and value == "")
+
+
+def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manual_inputs=None):
+    manual_inputs = manual_inputs if isinstance(manual_inputs, dict) else {}
+    source = spec.get("from") if isinstance(spec, dict) else spec
+    source = str(source or "")
+    item = {
+        "name": input_name,
+        "source": source,
+        "required": bool(spec.get("required", True)) if isinstance(spec, dict) else True,
+        "resolved": False,
+        "value": None,
+        "provenance": "",
+        "reason": "",
+    }
+    if source_mode == "manual" and input_name in manual_inputs and str(manual_inputs[input_name]).strip():
+        item.update({"resolved": True, "value": manual_inputs[input_name], "provenance": "manual"})
+        return item
+
+    if source_mode == "existing-run" and base_run_id:
+        context = run_context(sop, base_run_id)
+        if source.startswith("context."):
+            key = source.split(".", 1)[1]
+            value = context.get(key)
+            if is_blank_value(value) and key == "source_url":
+                value = context.get("url")
+            if not is_blank_value(value):
+                item.update({"resolved": True, "value": value, "provenance": f"run:{base_run_id}:context.{key}"})
+                return item
+        match = re.match(r"^([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)$", source)
+        if match:
+            upstream, output = match.groups()
+            value, provenance = node_output_from_state(sop, base_run_id, upstream, output)
+            if is_blank_value(value) and output == "source_url":
+                value = context.get("source_url") or context.get("url")
+                provenance = f"run:{base_run_id}:context.source_url"
+            if is_blank_value(value) and upstream == "notebooklm-research" and output == "reports":
+                stage_b = context.get("stage_b") if isinstance(context.get("stage_b"), dict) else {}
+                value = stage_b.get("output_files")
+                provenance = f"run:{base_run_id}:context.stage_b.output_files"
+            if is_blank_value(value) and upstream == "youtube-deep-research" and output == "analysis_file":
+                stage_b2 = context.get("stage_b2") if isinstance(context.get("stage_b2"), dict) else {}
+                value = stage_b2.get("analysis_file")
+                provenance = f"run:{base_run_id}:context.stage_b2.analysis_file"
+            if not is_blank_value(value):
+                item.update({"resolved": True, "value": value, "provenance": provenance})
+                return item
+    if source_mode in {"generated-fixture", "deepseek-mock"}:
+        value = generated_fixture_value(input_name, source)
+        if value is not None:
+            item.update({
+                "resolved": True,
+                "value": value,
+                "provenance": "generated-fixture" if source_mode == "generated-fixture" else "deepseek-mock-fallback",
+            })
+            return item
+        if source_mode == "deepseek-mock":
+            item["reason"] = "No deterministic fixture is available; DeepSeek mock generation is not enabled on this runtime."
+            return item
+
+    item["reason"] = "No source value resolved. Select an existing run, use generated fixture, or provide manual input."
+    return item
+
+
+def node_test_side_effects(node_id, config, static):
+    infra = static.get("infra") if isinstance(static.get("infra"), dict) else {}
+    skill = str((static.get("executor") or {}).get("skill") or config.get("skill") or "")
+    external = node_id in {"notebooklm-research", "youtube-deep-research", "wiki-build", "tg-notify"}
+    llm = node_id == "wiki-build"
+    telegram = node_id == "tg-notify" or bool(infra.get("tg_notify"))
+    return {
+        "writes_workspace": bool(static.get("outputs")),
+        "git_write": True,
+        "telegram": telegram,
+        "external_api": external,
+        "llm": llm,
+        "skill": skill,
+        "default_mode": "preflight",
+        "real_execution_enabled": False,
+    }
+
+
+def build_node_test_plan(sop, node_id, body=None):
+    body = body if isinstance(body, dict) else {}
+    config = (sop.get("nodes") or {}).get(node_id)
+    if not isinstance(config, dict):
+        return None
+    static = node_static_config(sop, node_id) or {}
+    source_mode = str(body.get("input_source") or body.get("source_mode") or "generated-fixture")
+    if source_mode not in {"existing-run", "generated-fixture", "manual", "deepseek-mock"}:
+        source_mode = "generated-fixture"
+    base_run_id = sanitize_test_id(body.get("pipeline_id") or body.get("run_id") or body.get("seed_from_run_id") or "")
+    manual_inputs = body.get("manual_inputs") if isinstance(body.get("manual_inputs"), dict) else {}
+    inputs = normalize_contract(static.get("inputs", {}), "input")
+    optional_inputs = normalize_contract(static.get("optional_inputs", {}), "input")
+    resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs) for name, spec in inputs.items()]
+    resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs) for name, spec in optional_inputs.items()]
+    missing = [item for item in resolved_inputs if item.get("required") and not item.get("resolved")]
+    upstream = []
+    for spec in list(inputs.values()) + list(optional_inputs.values()):
+        source = str((spec or {}).get("from") if isinstance(spec, dict) else spec or "")
+        match = re.match(r"^([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)$", source)
+        if match:
+            upstream.append({"node_id": match.group(1), "output": match.group(2), "source": source})
+    recent = recent_run_summaries(sop, limit=20)
+    for run in recent:
+        statuses = run.get("nodes") or {}
+        run["satisfies_upstream"] = all(statuses.get(item["node_id"]) == "done" for item in upstream)
+    return {
+        "sop_id": sop.get("id", ""),
+        "workflow_id": sop.get("id") or sop.get("name") or "",
+        "instance_id": sop.get("id", ""),
+        "node_id": node_id,
+        "node_title": static.get("title") or node_id,
+        "mode": "preflight",
+        "input_source": source_mode,
+        "base_run_id": base_run_id,
+        "required_inputs": resolved_inputs,
+        "optional_inputs": resolved_optional,
+        "resolved_inputs": [item for item in resolved_inputs if item.get("resolved")],
+        "missing_inputs": missing,
+        "upstream_nodes": upstream,
+        "available_existing_runs": recent,
+        "side_effects": node_test_side_effects(node_id, config, static),
+        "actions": {
+            "preflight": {
+                "method": "POST",
+                "path": f"/api/sop/{sop.get('id', '')}/nodes/{node_id}/tests",
+                "destructive": False,
+                "enabled": True,
+            },
+            "real_execution": {
+                "enabled": False,
+                "reason": "Generic business node test currently supports preflight/dry-run only.",
+            },
+        },
+        "status": "needs_input" if missing else "ready",
+    }
+
+
+def create_node_preflight_test(sop, node_id, body):
+    plan = build_node_test_plan(sop, node_id, body)
+    if plan is None:
+        return 404, {"status": "error", "message": f"Node {node_id!r} not found"}
+    token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    suffix = hashlib.sha1(json.dumps(body if isinstance(body, dict) else {}, sort_keys=True).encode("utf-8")).hexdigest()[:6]
+    test_id = f"node-test-{node_id}-{token}-{suffix}"
+    workspace = node_test_workspace(sop, test_id)
+    now = datetime.now(timezone.utc).isoformat()
+    result = {
+        "test_id": test_id,
+        "pipeline_id": test_id,
+        "node_id": node_id,
+        "status": "needs_input" if plan.get("missing_inputs") else "done",
+        "mode": "preflight",
+        "started_at": now,
+        "finished_at": now,
+        "pending": False,
+        "reason": "Missing required inputs" if plan.get("missing_inputs") else "",
+        "detail": plan,
+    }
+    write_json(workspace / "input.json", body if isinstance(body, dict) else {})
+    write_json(workspace / "result.json", result)
+    return 200, result
+
+
+def read_generic_node_test_result(sop, test_id):
+    safe = sanitize_test_id(test_id)
+    if not safe.startswith("node-test-"):
+        return None
+    result = read_json(node_test_workspace(sop, safe) / "result.json")
+    if not isinstance(result, dict):
+        return None
+    result["detail"] = mask_data(result.get("detail") or {})
+    return result
 
 
 def trigger_node_test(sop, node_id, body):
@@ -4181,11 +4432,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "node_id": path[4],
                         "contract": contract,
                     })
+                # GET /api/sop/{instance}/nodes/{node_id}/test-plan — generic preflight plan
+                if len(path) == 6 and path[3] == "nodes" and path[5] == "test-plan":
+                    plan = build_node_test_plan(sop, path[4], {})
+                    if plan is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    return json_response(self, 200, plan)
                 # GET /api/sop/{instance}/nodes/{node_id}/test-result/{pipeline_id}
                 if len(path) == 7 and path[3] == "nodes" and path[5] == "test-result":
                     result = read_node_test_result(sop, path[4], path[6])
                     if result is None:
                         return json_response(self, 400, {"detail": "invalid nodetest pipeline_id"})
+                    return json_response(self, 200, result)
+                # GET /api/sop/{instance}/node-tests/{test_id}
+                if len(path) == 5 and path[3] == "node-tests":
+                    result = read_generic_node_test_result(sop, path[4])
+                    if result is None:
+                        return json_response(self, 404, {"detail": f"Node test {path[4]!r} not found"})
                     return json_response(self, 200, result)
                 # GET /api/sop/{instance}/nodes/{node_id}/modules
                 if len(path) == 6 and path[3] == "nodes" and path[5] == "modules":
@@ -4379,6 +4642,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             http_code, result = trigger_node_test(sop, path[4], data)
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/nodes/{node_id}/tests — generic node preflight
+        if (len(path) == 6 and path[:2] == ["api", "sop"]
+                and path[3] == "nodes" and path[5] == "tests"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = create_node_preflight_test(sop, path[4], data)
             return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/node-drafts

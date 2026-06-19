@@ -1165,6 +1165,39 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
+    def test_business_node_test_plan_resolves_generated_fixture(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "needs": ["youtube-fetch"],
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/analysis.md"},
+        }
+        plan = bridge.build_node_test_plan(sop, "youtube-deep-research", {"input_source": "generated-fixture"})
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["resolved_inputs"][0]["name"], "source_url")
+        self.assertEqual(plan["resolved_inputs"][0]["value"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(plan["upstream_nodes"][0]["node_id"], "youtube-fetch")
+        self.assertFalse(plan["actions"]["real_execution"]["enabled"])
+
+    def test_business_node_preflight_is_recorded_outside_pipeline_runs(self):
+        code, result = bridge.create_node_preflight_test(
+            self.sop,
+            "wiki-build",
+            {"input_source": "existing-run", "pipeline_id": "pipe-1"},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["test_id"].startswith("node-test-wiki-build-"))
+        self.assertTrue((self.wiki / "raw" / "node-tests" / result["test_id"] / "result.json").exists())
+        self.assertFalse((self.wiki / "raw" / "pipeline-runs" / result["test_id"]).exists())
+        read_back = bridge.read_node_test_result(self.sop, "wiki-build", result["test_id"])
+        self.assertEqual(read_back["status"], "done")
+        self.assertEqual(read_back["detail"]["input_source"], "existing-run")
+
     @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
     def test_node_contract_endpoint_returns_engine_contract(self):
         # P3: run-less catalog contract endpoint serves the engine classification.
