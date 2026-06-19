@@ -1234,12 +1234,15 @@ class ArtifactResolutionTest(unittest.TestCase):
                 sop,
                 "test",
                 "youtube-deep-research",
-                {"mode": "probe", "input_source": "generated-fixture"},
+                {"mode": "probe", "input_source": "generated-fixture", "retry_of": "node-run-old"},
             )
 
         self.assertEqual(code, 200)
         self.assertTrue(result["node_run_id"].startswith("node-run-youtube-deep-research-"))
         self.assertEqual(result["status"], "done")
+        self.assertGreater(result["elapsed_ms"], 0)
+        self.assertEqual(result["retry_of"], "node-run-old")
+        self.assertEqual(result["created_from"], "generated-fixture")
         self.assertTrue((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "result.json").exists())
         self.assertFalse((self.wiki / "raw" / "pipeline-runs" / result["node_run_id"]).exists())
         self.assertEqual([step["id"] for step in result["steps"]], [
@@ -1259,10 +1262,14 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["resolved_config"]["youtube_research_worker"]["timeout"]["value"], 1200)
         self.assertEqual(detail["resolved_config"]["telegram"]["status"], "ready")
         self.assertEqual(detail["resolved_config"]["telegram"]["token"]["masked_value"], "tel***ret")
+        self.assertEqual(len(result["inner_steps"]), 8)
+        self.assertEqual(result["inner_steps"][0]["id"], "prepare-request")
 
         read_back = bridge.read_node_run_result(sop, "youtube-deep-research", result["node_run_id"])
         self.assertEqual(read_back["node_run_id"], result["node_run_id"])
-        self.assertEqual(bridge.list_node_runs(sop, "youtube-deep-research")[0]["node_run_id"], result["node_run_id"])
+        listed = bridge.list_node_runs(sop, "youtube-deep-research")[0]
+        self.assertEqual(listed["node_run_id"], result["node_run_id"])
+        self.assertEqual(listed["retry_of"], "node-run-old")
 
     def test_node_run_routes_create_and_read_shareable_id(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)

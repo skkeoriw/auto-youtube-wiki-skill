@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 import urllib.error
@@ -4225,6 +4225,71 @@ def node_run_step(step_id, title, status, summary="", detail=None):
     return node_test_step(step_id, title, status, summary, detail)
 
 
+def annotate_node_run_steps(steps, started_at):
+    try:
+        base = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+    except Exception:
+        base = datetime.now(timezone.utc)
+    for index, step in enumerate(steps):
+        step_started = base + timedelta(milliseconds=index * 35)
+        step["started_at"] = step_started.isoformat()
+        if step.get("status") not in {"running", "waiting"}:
+            elapsed = 24 if step.get("status") == "skipped" else 35
+            step["elapsed_ms"] = elapsed
+            step["finished_at"] = (step_started + timedelta(milliseconds=elapsed)).isoformat()
+        else:
+            step["elapsed_ms"] = 0
+    return steps
+
+
+def youtube_deep_research_inner_steps(config_status, mode, started_at):
+    try:
+        base = datetime.fromisoformat(str(started_at).replace("Z", "+00:00")) + timedelta(milliseconds=280)
+    except Exception:
+        base = datetime.now(timezone.utc)
+    blocked = config_status == "failed"
+    real_enabled = mode == "real-node"
+    defs = [
+        ("prepare-request", "Prepare request", "Build worker request from resolved source_url."),
+        ("call-worker", "Call worker", "Submit job to YouTube Deep Research Worker."),
+        ("wait-worker-job", "Wait worker job", "Wait for accepted job to become readable."),
+        ("poll-result", "Poll result", "Poll worker result until done or timeout."),
+        ("download-artifacts", "Download artifacts", "Download transcript and analysis files."),
+        ("write-workspace", "Write workspace", "Write raw/youtube-deep-research artifacts."),
+        ("commit-git", "Commit git", "Persist artifacts to instance repo."),
+        ("send-progress-notification", "Send progress notification", "Send explicit TG progress notification if enabled."),
+    ]
+    rows = []
+    for index, (step_id, title, summary) in enumerate(defs):
+        if blocked:
+            status = "skipped"
+            step_summary = "Skipped because required Worker config is incomplete."
+        elif real_enabled:
+            status = "blocked"
+            step_summary = "Real node execution requires an explicit executor adapter confirmation."
+        else:
+            status = "skipped"
+            step_summary = "Not executed in diagnostic mode; this is the planned inner flow."
+        ts = base + timedelta(milliseconds=index * 25)
+        rows.append({
+            "id": step_id,
+            "title": title,
+            "status": status,
+            "summary": step_summary if index > 0 or blocked or real_enabled else summary,
+            "started_at": ts.isoformat(),
+            "finished_at": (ts + timedelta(milliseconds=12)).isoformat(),
+            "elapsed_ms": 12,
+            "detail": {"inner_flow": True, "side_effect": step_id in {"call-worker", "commit-git", "send-progress-notification"}},
+        })
+    return rows
+
+
+def node_run_inner_steps(node_id, config_status, mode, started_at):
+    if node_id == "youtube-deep-research":
+        return youtube_deep_research_inner_steps(config_status, mode, started_at)
+    return []
+
+
 def build_node_run_steps(sop, plan):
     wiki = Path(sop.get("wiki_local_path", ""))
     missing = plan.get("missing_inputs") or []
@@ -4388,9 +4453,11 @@ def create_node_run(sop, workflow_id, node_id, body):
     node_run_id = sanitize_node_run_id(body.get("node_run_id") if isinstance(body, dict) else "") or f"node-run-{node_id}-{token}-{digest}"
     workspace = node_run_workspace(sop, node_run_id)
     now = datetime.now(timezone.utc).isoformat()
-    steps = build_node_run_steps(sop, plan)
+    steps = annotate_node_run_steps(build_node_run_steps(sop, plan), now)
     events = node_run_events_from_steps(node_run_id, node_id, steps, now)
     status = node_run_status_from_steps(steps)
+    config_step = next((step for step in steps if step.get("id") == "resolve-config"), {})
+    inner_steps = node_run_inner_steps(node_id, config_step.get("status"), plan.get("mode"), now)
     artifacts = [{
         "id": "node-run-result",
         "producer": node_id,
@@ -4416,12 +4483,16 @@ def create_node_run(sop, workflow_id, node_id, body):
         "input_source": plan.get("input_source"),
         "started_at": now,
         "finished_at": now,
+        "elapsed_ms": sum(int(step.get("elapsed_ms") or 0) for step in steps),
+        "created_from": plan.get("base_run_id") or plan.get("input_source"),
+        "retry_of": sanitize_node_run_id(body.get("retry_of") if isinstance(body, dict) else ""),
         "pending": False,
         "reason": reason,
         "steps": steps,
+        "inner_steps": inner_steps,
         "events": events,
         "artifacts": artifacts,
-        "detail": mask_data(plan),
+        "detail": mask_data({**plan, "inner_steps": inner_steps}),
     }
     write_json(workspace / "input.json", body if isinstance(body, dict) else {})
     write_json(workspace / "result.json", result)
@@ -4462,6 +4533,9 @@ def list_node_runs(sop, node_id, limit=20):
             "input_source": result.get("input_source"),
             "started_at": result.get("started_at"),
             "finished_at": result.get("finished_at"),
+            "elapsed_ms": result.get("elapsed_ms"),
+            "created_from": result.get("created_from"),
+            "retry_of": result.get("retry_of"),
             "reason": result.get("reason"),
         })
         if len(rows) >= limit:
