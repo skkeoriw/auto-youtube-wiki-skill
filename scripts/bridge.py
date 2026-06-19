@@ -829,6 +829,14 @@ def inject_runtime_management_config(body):
     merged = {**body}
     injected = []
     action = str(merged.get("management_action") or merged.get("action") or "").strip()
+    request_private_key_fields = [
+        "private_key",
+        "ssh_private_key",
+        "ssh_private_key_content",
+        "private_key_b64",
+        "ssh_private_key_b64",
+        "ssh_password",
+    ]
     for env_key, aliases in RUNTIME_CAPABILITY_ENV.items():
         if request_has_runtime_config(merged, env_key, aliases):
             continue
@@ -843,6 +851,9 @@ def inject_runtime_management_config(body):
     for default_key, request_keys in RUNTIME_MANAGEMENT_REQUEST_DEFAULTS.items():
         if action == "create-runtime" and default_key in CREATE_RUNTIME_MANAGEMENT_DEFAULT_EXCLUDES:
             continue
+        if default_key in {"RUNTIME_TARGET_PRIVATE_KEY", "RUNTIME_TARGET_PRIVATE_KEY_B64"}:
+            if any(merged.get(candidate) not in {None, ""} for candidate in request_private_key_fields):
+                continue
         if any(merged.get(candidate) not in {None, ""} for candidate in request_keys):
             continue
         for candidate in [default_key, *request_keys]:

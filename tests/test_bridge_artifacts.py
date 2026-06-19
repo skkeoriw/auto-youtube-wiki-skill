@@ -323,6 +323,45 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(merged["runtime_id"], "runtime-34-29-222-183")
         self.assertIn("ssh_command", merged["_management_config_injected"])
 
+    def test_runtime_management_config_does_not_override_request_machine_key(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path):
+            bridge.save_runtime_management_config({
+                "RUNTIME_TARGET_SSH_COMMAND": "ssh -i ~/.ssh/id_ed25519 default@34.29.222.183",
+                "RUNTIME_TARGET_PRIVATE_KEY": "stale-management-private-key",
+                "RUNTIME_TARGET_PRIVATE_KEY_B64": "STALEB64",
+                "RUNTIME_TARGET_RUNTIME_ID": "runtime-34-29-222-183",
+            })
+            merged = bridge.inject_runtime_management_config({
+                "action": "delete-runtime",
+                "ssh_command": "ssh -i ~/.ssh/id_ed25519 machine@34.134.172.74",
+                "private_key_b64": "MACHINEB64",
+                "runtime_id": "runtime-34-134-172-74",
+            })
+
+        self.assertEqual(merged["ssh_command"], "ssh -i ~/.ssh/id_ed25519 machine@34.134.172.74")
+        self.assertEqual(merged["private_key_b64"], "MACHINEB64")
+        self.assertEqual(merged["runtime_id"], "runtime-34-134-172-74")
+        self.assertNotIn("private_key", merged)
+        self.assertNotIn("ssh_private_key", merged)
+        self.assertNotIn("private_key_b64", merged.get("_management_config_injected", []))
+        self.assertNotIn("private_key", merged.get("_management_config_injected", []))
+
+    def test_runtime_management_config_does_not_inject_key_when_password_provided(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path):
+            bridge.save_runtime_management_config({
+                "RUNTIME_TARGET_PRIVATE_KEY": "stale-management-private-key",
+            })
+            merged = bridge.inject_runtime_management_config({
+                "action": "delete-runtime",
+                "ssh_password": "machine-password",
+            })
+
+        self.assertEqual(merged["ssh_password"], "machine-password")
+        self.assertNotIn("private_key", merged)
+        self.assertNotIn("ssh_private_key", merged)
+
     def test_create_runtime_does_not_inject_saved_runtime_identity(self):
         config_path = self.wiki / ".sop/runtime-management/config.json"
         with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path):
