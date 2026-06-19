@@ -377,6 +377,7 @@ class ArtifactResolutionTest(unittest.TestCase):
 
         def fake_urlopen(request, timeout=0):
             self.assertIn("/api/sop/v1/machines/machine-34/resolve", request.full_url)
+            self.assertEqual(request.get_header("User-agent"), "sop-runtime-bridge/1.0")
             return FakeResponse({
                 "ok": True,
                 "machine": {
@@ -425,6 +426,7 @@ class ArtifactResolutionTest(unittest.TestCase):
 
         def fake_urlopen(request, timeout=0):
             requested_urls.append(request.full_url)
+            self.assertEqual(request.get_header("User-agent"), "sop-runtime-bridge/1.0")
             if request.full_url.endswith("/api/sop/v1/machines?page=1&page_size=200"):
                 return FakeResponse({
                     "machines": [

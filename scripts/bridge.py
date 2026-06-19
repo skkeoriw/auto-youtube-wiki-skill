@@ -860,7 +860,11 @@ def control_plane_get_json(path, timeout=10):
     if not SOP_CONTROL_PLANE_API_URL:
         return {}
     url = f"{SOP_CONTROL_PLANE_API_URL}{path}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "sop-runtime-bridge/1.0"},
+        method="GET",
+    )
     with urllib.request.urlopen(req, timeout=timeout) as response:
         raw = response.read().decode("utf-8", errors="replace")
     try:
