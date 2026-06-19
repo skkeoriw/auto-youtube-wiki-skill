@@ -1540,7 +1540,7 @@ PY
                 sop,
                 "test",
                 "youtube-deep-research",
-                {"mode": "real-node", "input_source": "generated-fixture"},
+                {"mode": "real-node", "input_source": "generated-fixture", "sync": True},
             )
 
         self.assertEqual(code, 200)

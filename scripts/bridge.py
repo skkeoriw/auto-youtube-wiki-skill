@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4480,8 +4481,8 @@ def youtube_deep_research_inner_steps(config_status, mode, started_at):
             status = "skipped"
             step_summary = "Skipped because required Worker config is incomplete."
         elif real_enabled:
-            status = "blocked"
-            step_summary = "Real node execution requires an explicit executor adapter confirmation."
+            status = "running" if index == 0 else "waiting"
+            step_summary = "Real node execution is running." if index == 0 else "Waiting for the stage wrapper to reach this step."
         else:
             status = "skipped"
             step_summary = "Not executed in diagnostic mode; this is the planned inner flow."
@@ -4957,6 +4958,123 @@ def apply_real_node_execution_to_steps(steps, execution):
     )
 
 
+def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, inner_steps, events,
+                                  artifacts, started_at, finished_at, real_execution=None, pending=False):
+    status = node_run_status_from_steps(steps)
+    reason = ""
+    if status in {"failed", "blocked", "needs_input", "warning"}:
+        reason = next((step.get("summary") for step in steps if step.get("status") in {"failed", "blocked", "needs_input", "warning"}), "")
+    return {
+        "node_run_id": node_run_id,
+        "pipeline_id": node_run_id,
+        "runtime_id": plan.get("runtime_id"),
+        "instance_id": plan.get("instance_id"),
+        "workflow_id": plan.get("workflow_id"),
+        "node_id": node_id,
+        "node_title": plan.get("node_title"),
+        "status": status,
+        "mode": plan.get("mode"),
+        "input_source": plan.get("input_source"),
+        "started_at": started_at,
+        "finished_at": "" if pending else finished_at,
+        "elapsed_ms": sum(int(step.get("elapsed_ms") or 0) for step in steps),
+        "created_from": plan.get("base_run_id") or plan.get("input_source"),
+        "retry_of": sanitize_node_run_id(body.get("retry_of") if isinstance(body, dict) else ""),
+        "pending": bool(pending),
+        "reason": reason,
+        "steps": steps,
+        "inner_steps": inner_steps,
+        "events": events,
+        "artifacts": artifacts,
+        "actual_outputs": (real_execution or {}).get("actual_outputs") or {},
+        "validation": (real_execution or {}).get("validation") or {},
+        "business_artifacts": (real_execution or {}).get("artifacts") or [],
+        "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
+    }
+
+
+def persist_node_run_result(sop, node_run_id, body, result, events):
+    workspace = node_run_workspace(sop, node_run_id)
+    write_json(workspace / "input.json", body if isinstance(body, dict) else {})
+    write_json(workspace / "result.json", result)
+    write_jsonl(workspace / "events.jsonl", events)
+
+
+def complete_real_node_run_async(sop, workflow_id, node_id, node_run_id, body, started_at):
+    try:
+        plan = build_node_run_plan(sop, workflow_id, node_id, body)
+        if plan is None:
+            return
+        steps = build_node_run_steps(sop, plan)
+        real_execution = execute_real_node_run(sop, node_run_id, node_id, plan)
+        apply_real_node_execution_to_steps(steps, real_execution)
+        finished_at = datetime.now(timezone.utc).isoformat()
+        steps = annotate_node_run_steps(steps, started_at)
+        events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
+        inner_steps = real_node_inner_steps_from_execution(node_id, real_execution, started_at)
+        artifacts = [{
+            "id": "node-run-result",
+            "producer": node_id,
+            "type": "node-run.result",
+            "format": "json",
+            "path": f"raw/node-runs/{node_run_id}/result.json",
+            "title": "Node Run diagnostic result",
+            "resolution": "recorded",
+        }, *(real_execution.get("artifacts") or [])]
+        result = build_node_run_result_payload(
+            sop,
+            node_run_id,
+            node_id,
+            body,
+            plan,
+            steps,
+            inner_steps,
+            events,
+            artifacts,
+            started_at,
+            finished_at,
+            real_execution=real_execution,
+            pending=False,
+        )
+        persist_node_run_result(sop, node_run_id, body, result, events)
+    except Exception as exc:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        plan = build_node_run_plan(sop, workflow_id, node_id, body) or {
+            "runtime_id": "",
+            "instance_id": sop.get("instance_id") or sop.get("id", ""),
+            "workflow_id": workflow_id,
+            "node_title": node_id,
+            "mode": (body or {}).get("mode") if isinstance(body, dict) else "real-node",
+            "input_source": (body or {}).get("input_source") if isinstance(body, dict) else "",
+        }
+        steps = annotate_node_run_steps(build_node_run_steps(sop, plan), started_at)
+        update_node_run_step(
+            steps,
+            "execute-or-dry-run",
+            "failed",
+            "Real node execution crashed before completion.",
+            {"error": str(exc)},
+            finished_at=finished_at,
+        )
+        events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
+        result = build_node_run_result_payload(
+            sop,
+            node_run_id,
+            node_id,
+            body,
+            plan,
+            steps,
+            [],
+            events,
+            [],
+            started_at,
+            finished_at,
+            real_execution={"status": "failed", "summary": str(exc), "detail": {"error": str(exc)}},
+            pending=False,
+        )
+        persist_node_run_result(sop, node_run_id, body, result, events)
+
+
 def write_jsonl(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
@@ -4981,18 +5099,65 @@ def create_node_run(sop, workflow_id, node_id, body):
     token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     digest = hashlib.sha1(json.dumps(body if isinstance(body, dict) else {}, sort_keys=True).encode("utf-8")).hexdigest()[:6]
     node_run_id = sanitize_node_run_id(body.get("node_run_id") if isinstance(body, dict) else "") or f"node-run-{node_id}-{token}-{digest}"
-    workspace = node_run_workspace(sop, node_run_id)
     now = datetime.now(timezone.utc).isoformat()
     steps = build_node_run_steps(sop, plan)
     real_execution = None
     execute_step = node_run_step_by_id(steps, "execute-or-dry-run") or {}
     if plan.get("mode") == "real-node" and execute_step.get("status") == "waiting":
-        real_execution = execute_real_node_run(sop, node_run_id, node_id, plan)
-        apply_real_node_execution_to_steps(steps, real_execution)
+        if isinstance(body, dict) and body.get("sync") is True:
+            real_execution = execute_real_node_run(sop, node_run_id, node_id, plan)
+            apply_real_node_execution_to_steps(steps, real_execution)
+        else:
+            update_node_run_step(
+                steps,
+                "execute-or-dry-run",
+                "running",
+                "Real stage wrapper is running in the background.",
+                {"mode": "real-node", "async": True},
+            )
+            update_node_run_step(
+                steps,
+                "validate-outputs",
+                "waiting",
+                "Waiting for the real node to produce declared outputs.",
+            )
+            finished_at = datetime.now(timezone.utc).isoformat()
+            steps = annotate_node_run_steps(steps, now)
+            events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
+            inner_steps = node_run_inner_steps(node_id, "done", plan.get("mode"), now)
+            artifacts = [{
+                "id": "node-run-result",
+                "producer": node_id,
+                "type": "node-run.result",
+                "format": "json",
+                "path": f"raw/node-runs/{node_run_id}/result.json",
+                "title": "Node Run diagnostic result",
+                "resolution": "recorded",
+            }]
+            result = build_node_run_result_payload(
+                sop,
+                node_run_id,
+                node_id,
+                body,
+                plan,
+                steps,
+                inner_steps,
+                events,
+                artifacts,
+                now,
+                finished_at,
+                pending=True,
+            )
+            persist_node_run_result(sop, node_run_id, body, result, events)
+            threading.Thread(
+                target=complete_real_node_run_async,
+                args=(sop, workflow_id, node_id, node_run_id, body, now),
+                daemon=True,
+            ).start()
+            return 200, result
     finished_at = datetime.now(timezone.utc).isoformat()
     steps = annotate_node_run_steps(steps, now)
     events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
-    status = node_run_status_from_steps(steps)
     config_step = next((step for step in steps if step.get("id") == "resolve-config"), {})
     inner_steps = (
         real_node_inner_steps_from_execution(node_id, real_execution, now)
@@ -5010,39 +5175,22 @@ def create_node_run(sop, workflow_id, node_id, body):
     }]
     if isinstance(real_execution, dict):
         artifacts.extend(real_execution.get("artifacts") or [])
-    reason = ""
-    if status in {"failed", "blocked", "needs_input", "warning"}:
-        reason = next((step.get("summary") for step in steps if step.get("status") in {"failed", "blocked", "needs_input", "warning"}), "")
-    result = {
-        "node_run_id": node_run_id,
-        "pipeline_id": node_run_id,
-        "runtime_id": plan.get("runtime_id"),
-        "instance_id": plan.get("instance_id"),
-        "workflow_id": plan.get("workflow_id"),
-        "node_id": node_id,
-        "node_title": plan.get("node_title"),
-        "status": status,
-        "mode": plan.get("mode"),
-        "input_source": plan.get("input_source"),
-        "started_at": now,
-        "finished_at": finished_at,
-        "elapsed_ms": sum(int(step.get("elapsed_ms") or 0) for step in steps),
-        "created_from": plan.get("base_run_id") or plan.get("input_source"),
-        "retry_of": sanitize_node_run_id(body.get("retry_of") if isinstance(body, dict) else ""),
-        "pending": False,
-        "reason": reason,
-        "steps": steps,
-        "inner_steps": inner_steps,
-        "events": events,
-        "artifacts": artifacts,
-        "actual_outputs": (real_execution or {}).get("actual_outputs") or {},
-        "validation": (real_execution or {}).get("validation") or {},
-        "business_artifacts": (real_execution or {}).get("artifacts") or [],
-        "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
-    }
-    write_json(workspace / "input.json", body if isinstance(body, dict) else {})
-    write_json(workspace / "result.json", result)
-    write_jsonl(workspace / "events.jsonl", events)
+    result = build_node_run_result_payload(
+        sop,
+        node_run_id,
+        node_id,
+        body,
+        plan,
+        steps,
+        inner_steps,
+        events,
+        artifacts,
+        now,
+        finished_at,
+        real_execution=real_execution,
+        pending=False,
+    )
+    persist_node_run_result(sop, node_run_id, body, result, events)
     return 200, result
 
 
