@@ -1464,6 +1464,105 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["config_sources"]["runtime_env_file"], str(env_file))
         self.assertIn("YOUTUBE_RESEARCH_WORKFLOW_URL", detail["config_sources"]["runtime_env_file_keys"])
 
+    def test_real_node_run_executes_youtube_deep_research_wrapper_and_records_outputs(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "needs": ["youtube-fetch"],
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {
+                "analysis_file": "raw/youtube-deep-research/{pipeline_id}/analysis.md",
+                "transcript_file": "raw/youtube-deep-research/{pipeline_id}/transcript.txt",
+            },
+            "infra": {"tg_notify": True, "log_record": True},
+        }
+
+        plugin_root = self.wiki / "_agent-brain-plugins"
+        script_dir = plugin_root / "youtube-wiki" / "skills" / "sop-youtube-deep-research" / "scripts"
+        script_dir.mkdir(parents=True)
+        script = script_dir / "run_youtube_deep_research.sh"
+        script.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+WIKI="$1"
+RUN_ID="$2"
+PIPELINE_ID="${3:-$2}"
+OUT="$WIKI/raw/youtube-deep-research/$PIPELINE_ID"
+RUN_DIR="$WIKI/raw/pipeline-runs/$PIPELINE_ID"
+mkdir -p "$OUT" "$RUN_DIR/nodes"
+printf '# Analysis\\nreal node output\\n' > "$OUT/analysis.md"
+printf 'transcript output\\n' > "$OUT/transcript.txt"
+python3 - "$WIKI" "$PIPELINE_ID" "$RUN_ID" <<'PY'
+import json
+import sys
+from pathlib import Path
+wiki = Path(sys.argv[1])
+pipeline_id = sys.argv[2]
+run_id = sys.argv[3]
+ctx_file = wiki / "raw" / "pipeline-context.json"
+ctx = json.loads(ctx_file.read_text(encoding="utf-8"))
+ctx.setdefault("stage_b2", {})["analysis_file"] = f"raw/youtube-deep-research/{pipeline_id}/analysis.md"
+run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+(run_dir / "context.json").write_text(json.dumps(ctx), encoding="utf-8")
+(run_dir / "run.json").write_text(json.dumps({
+    "pipeline_id": pipeline_id,
+    "status": "done",
+    "nodes": {"youtube-deep-research": "done"},
+    "source_url": ctx.get("source_url", ""),
+}), encoding="utf-8")
+(run_dir / "nodes" / "youtube-deep-research.json").write_text(json.dumps({
+    "pipeline_id": pipeline_id,
+    "node_id": "youtube-deep-research",
+    "run_id": run_id,
+    "status": "done",
+    "actual_outputs": {
+        "analysis_file": [f"raw/youtube-deep-research/{pipeline_id}/analysis.md"],
+        "transcript_file": [f"raw/youtube-deep-research/{pipeline_id}/transcript.txt"],
+    },
+    "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+}), encoding="utf-8")
+PY
+""",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+
+        with patch.object(bridge, "plugin_root", return_value=plugin_root), patch.dict(os.environ, {
+            "YOUTUBE_RESEARCH_WORKFLOW_URL": "https://worker.example",
+            "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "worker-token-secret",
+            "YOUTUBE_WIKI_TG_TOKEN": "telegram-token-secret",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "7796171193",
+        }, clear=False):
+            code, result = bridge.create_node_run(
+                sop,
+                "test",
+                "youtube-deep-research",
+                {"mode": "real-node", "input_source": "generated-fixture"},
+            )
+
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["validation"]["status"], "passed")
+        self.assertEqual(result["actual_outputs"]["analysis_file"], [
+            f"raw/youtube-deep-research/{result['node_run_id']}/analysis.md",
+        ])
+        self.assertEqual(result["actual_outputs"]["transcript_file"], [
+            f"raw/youtube-deep-research/{result['node_run_id']}/transcript.txt",
+        ])
+        self.assertEqual(
+            next(step for step in result["steps"] if step["id"] == "execute-or-dry-run")["status"],
+            "done",
+        )
+        self.assertEqual(
+            next(step for step in result["steps"] if step["id"] == "validate-outputs")["status"],
+            "done",
+        )
+        self.assertTrue((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "executor.log").exists())
+        self.assertTrue(any(item["type"] == "research.analysis" for item in result["business_artifacts"]))
+
     def test_node_run_routes_create_and_read_shareable_id(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

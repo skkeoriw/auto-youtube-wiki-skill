@@ -4447,13 +4447,13 @@ def annotate_node_run_steps(steps, started_at):
         base = datetime.now(timezone.utc)
     for index, step in enumerate(steps):
         step_started = base + timedelta(milliseconds=index * 35)
-        step["started_at"] = step_started.isoformat()
+        step.setdefault("started_at", step_started.isoformat())
         if step.get("status") not in {"running", "waiting"}:
             elapsed = 24 if step.get("status") == "skipped" else 35
-            step["elapsed_ms"] = elapsed
-            step["finished_at"] = (step_started + timedelta(milliseconds=elapsed)).isoformat()
+            step.setdefault("elapsed_ms", elapsed)
+            step.setdefault("finished_at", (step_started + timedelta(milliseconds=elapsed)).isoformat())
         else:
-            step["elapsed_ms"] = 0
+            step.setdefault("elapsed_ms", 0)
     return steps
 
 
@@ -4512,6 +4512,7 @@ def build_node_run_steps(sop, plan):
     worker = configs.get("youtube_research_worker") or {}
     telegram = configs.get("telegram") or {}
     mode = plan.get("mode") or "preflight"
+    real_supported = node_real_execution_supported(plan.get("node_id"))
     config_status = "done"
     config_notes = []
     if worker.get("status") == "failed":
@@ -4583,22 +4584,26 @@ def build_node_run_steps(sop, plan):
             "Inputs or required config are incomplete." if missing or config_status == "failed" else f"Prepared {mode} execution plan.",
             {
                 "mode": mode,
-                "real_execution_enabled": False,
-                "reason": "This API records node-level diagnostics first; real-node execution still requires explicit engine adapter confirmation.",
+                "real_execution_enabled": mode == "real-node" and real_supported,
+                "reason": (
+                    "Real execution will call the existing stage wrapper for this node."
+                    if mode == "real-node" and real_supported
+                    else "Real execution is only enabled for nodes with an explicit executor adapter."
+                ),
             },
         ),
         node_run_step(
             "execute-or-dry-run",
             "Execute or dry-run node",
-            "blocked" if mode == "real-node" else "skipped",
-            "Real node execution is intentionally blocked until the node executor adapter is explicitly enabled." if mode == "real-node" else "No business node was executed in this diagnostic run.",
+            "waiting" if mode == "real-node" and real_supported and not missing and config_status != "failed" else "blocked" if mode == "real-node" else "skipped",
+            "Waiting for real stage wrapper execution." if mode == "real-node" and real_supported and not missing and config_status != "failed" else "Real node execution is not available for this node." if mode == "real-node" else "No business node was executed in this diagnostic run.",
             {"mode": mode, "side_effects": plan.get("side_effects") or {}},
         ),
         node_run_step(
             "validate-outputs",
             "Validate declared outputs",
-            "skipped",
-            "No business execution occurred, so output validation is informational only.",
+            "waiting" if mode == "real-node" and real_supported and not missing and config_status != "failed" else "skipped",
+            "Waiting for real node outputs." if mode == "real-node" and real_supported and not missing and config_status != "failed" else "No business execution occurred, so output validation is informational only.",
             {"declared_outputs": normalize_contract((sop.get("nodes") or {}).get(plan.get("node_id"), {}).get("outputs", {}), "output")},
         ),
         node_run_step(
@@ -4639,7 +4644,317 @@ def node_run_status_from_steps(steps):
         return "warning"
     if "running" in statuses:
         return "running"
+    if "waiting" in statuses:
+        return "running"
     return "done"
+
+
+def node_real_execution_supported(node_id):
+    return str(node_id or "") in {"youtube-deep-research"}
+
+
+def node_run_step_by_id(steps, step_id):
+    return next((step for step in steps if step.get("id") == step_id), None)
+
+
+def update_node_run_step(steps, step_id, status, summary="", detail=None, started_at=None, finished_at=None, elapsed_ms=None):
+    step = node_run_step_by_id(steps, step_id)
+    if not step:
+        return
+    step["status"] = status
+    if summary:
+        step["summary"] = summary
+    if isinstance(detail, dict):
+        step["detail"] = detail
+    if started_at:
+        step["started_at"] = started_at
+    if finished_at:
+        step["finished_at"] = finished_at
+    if elapsed_ms is not None:
+        step["elapsed_ms"] = elapsed_ms
+
+
+def node_run_resolved_input_value(plan, name):
+    for item in plan.get("resolved_inputs") or []:
+        if item.get("name") == name and item.get("resolved"):
+            return item.get("value")
+    return None
+
+
+def real_node_stage_script(node_id):
+    if node_id != "youtube-deep-research":
+        return None
+    return plugin_root() / "youtube-wiki" / "skills" / "sop-youtube-deep-research" / "scripts" / "run_youtube_deep_research.sh"
+
+
+def real_node_execution_timeout(plan):
+    configured = os.environ.get("NODE_RUN_REAL_TIMEOUT_SECONDS", "")
+    if configured:
+        try:
+            return max(60, int(configured))
+        except ValueError:
+            pass
+    worker = ((plan.get("resolved_config") or {}).get("youtube_research_worker") or {}).get("timeout") or {}
+    try:
+        return max(60, int(worker.get("value") or 1200) + 300)
+    except (TypeError, ValueError):
+        return 1500
+
+
+def prepare_real_node_context(sop, node_run_id, node_id, plan):
+    wiki = Path(sop["wiki_local_path"]).expanduser()
+    source_url = node_run_resolved_input_value(plan, "source_url") or node_run_resolved_input_value(plan, "url")
+    if is_blank_value(source_url):
+        raise ValueError("source_url is required for real node execution")
+
+    ctx_file = wiki / "raw" / "pipeline-context.json"
+    ctx = read_json(ctx_file) or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+    ctx.update({
+        "pipeline_id": node_run_id,
+        "source_url": source_url,
+        "source_type": ctx.get("source_type") or "youtube",
+        "node_run": {
+            "node_run_id": node_run_id,
+            "node_id": node_id,
+            "mode": plan.get("mode"),
+            "input_source": plan.get("input_source"),
+            "base_run_id": plan.get("base_run_id"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    write_json(ctx_file, ctx)
+    return ctx
+
+
+def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    node_state = read_json(run_workspace(sop, node_run_id) / "nodes" / f"{node_id}.json") or {}
+    context = (
+        read_json(run_workspace(sop, node_run_id) / "context.json")
+        or read_json(wiki / "raw" / "pipeline-context.json")
+        or {}
+    )
+    config = (sop.get("nodes") or {}).get(node_id) or {}
+    declared_outputs = normalized_contract(config.get("outputs") or node_state.get("declared_outputs") or {}, "output")
+    actual_outputs = {}
+    artifacts = []
+
+    recorded_outputs = node_state.get("actual_outputs") if isinstance(node_state.get("actual_outputs"), dict) else {}
+    for name, spec in declared_outputs.items():
+        paths = recorded_outputs.get(name)
+        if isinstance(paths, str):
+            paths = [paths]
+        records = []
+        for relative in paths or []:
+            path = safe_artifact_path(wiki, relative)
+            if path and path.is_file():
+                record = artifact_record(sop, node_id, name, path, "recorded")
+                if record:
+                    records.append(record)
+        if not records:
+            records = resolve_output_artifacts(
+                sop,
+                node_run_id,
+                node_id,
+                name,
+                spec,
+                context if isinstance(context, dict) else {},
+                run_id,
+                include_context=True,
+                include_pattern=True,
+            )
+        actual_outputs[name] = [record["path"] for record in records]
+        artifacts.extend(records)
+
+    missing = [
+        name for name, value in actual_outputs.items()
+        if value is None or value == "" or value == []
+    ]
+    return {
+        "declared_outputs": declared_outputs,
+        "actual_outputs": actual_outputs,
+        "artifacts": artifacts,
+        "validation": {
+            "status": "passed" if not missing else "failed",
+            "missing_outputs": missing,
+            "unexpected_outputs": [],
+        },
+        "node_state": node_state,
+    }
+
+
+def real_node_inner_steps_from_execution(node_id, execution, started_at):
+    if node_id != "youtube-deep-research":
+        return []
+    defs = [
+        ("prepare-request", "Prepare request", "Build worker request from resolved source_url."),
+        ("call-worker", "Call worker", "Submit job to YouTube Deep Research Worker."),
+        ("wait-worker-job", "Wait worker job", "Wait for accepted job to become readable."),
+        ("poll-result", "Poll result", "Poll worker result until done or timeout."),
+        ("download-artifacts", "Download artifacts", "Download transcript and analysis files."),
+        ("write-workspace", "Write workspace", "Write raw/youtube-deep-research artifacts."),
+        ("commit-git", "Commit git", "Persist artifacts to instance repo."),
+        ("send-progress-notification", "Send progress notification", "Send explicit TG progress notification if enabled."),
+    ]
+    status = "done" if execution.get("status") == "done" else "failed"
+    try:
+        base = datetime.fromisoformat(str(started_at).replace("Z", "+00:00")) + timedelta(milliseconds=280)
+    except Exception:
+        base = datetime.now(timezone.utc)
+    rows = []
+    for index, (step_id, title, summary) in enumerate(defs):
+        ts = base + timedelta(milliseconds=index * 25)
+        rows.append({
+            "id": step_id,
+            "title": title,
+            "status": status,
+            "summary": summary if status == "done" else execution.get("summary") or "Real node execution failed.",
+            "started_at": ts.isoformat(),
+            "finished_at": (ts + timedelta(milliseconds=12)).isoformat(),
+            "elapsed_ms": 12,
+            "detail": {
+                "inner_flow": True,
+                "side_effect": step_id in {"call-worker", "commit-git", "send-progress-notification"},
+                "log_path": execution.get("log_path", ""),
+            },
+        })
+    return rows
+
+
+def execute_real_node_run(sop, node_run_id, node_id, plan):
+    if not node_real_execution_supported(node_id):
+        return {
+            "status": "blocked",
+            "summary": "Real node execution is not available for this node.",
+            "detail": {"node_id": node_id},
+            "actual_outputs": {},
+            "artifacts": [],
+            "validation": {"status": "skipped", "missing_outputs": [], "unexpected_outputs": []},
+        }
+
+    wiki = Path(sop["wiki_local_path"]).expanduser()
+    script = real_node_stage_script(node_id)
+    if not script or not script.exists():
+        return {
+            "status": "failed",
+            "summary": "Stage wrapper script was not found.",
+            "detail": {"script": str(script or "")},
+            "actual_outputs": {},
+            "artifacts": [],
+            "validation": {"status": "failed", "missing_outputs": [], "unexpected_outputs": []},
+        }
+
+    started = datetime.now(timezone.utc)
+    log_path = node_run_workspace(sop, node_run_id) / "executor.log"
+    command = ["bash", str(script), str(wiki), node_run_id, node_run_id]
+    timeout = real_node_execution_timeout(plan)
+    context = {}
+    stdout = ""
+    stderr = ""
+    returncode = 1
+    timed_out = False
+    try:
+        context = prepare_real_node_context(sop, node_run_id, node_id, plan)
+        env = {**os.environ, "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"}
+        completed = subprocess.run(
+            command,
+            cwd=str(wiki),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        returncode = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        stderr = (stderr + f"\nnode real execution timed out after {timeout}s").strip()
+        returncode = 124
+    except Exception as exc:
+        stderr = str(exc)
+        returncode = 1
+
+    finished = datetime.now(timezone.utc)
+    elapsed_ms = int((finished - started).total_seconds() * 1000)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text((stdout + ("\n" if stdout and stderr else "") + stderr), encoding="utf-8")
+    except OSError:
+        pass
+
+    output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
+    execution_ok = returncode == 0 and output_info["validation"].get("status") == "passed"
+    status = "done" if execution_ok else "failed"
+    summary = (
+        "Real node execution finished and declared outputs were found."
+        if execution_ok
+        else "Real node execution failed." if returncode != 0
+        else "Real node execution finished but declared outputs are missing."
+    )
+    return {
+        "status": status,
+        "summary": summary,
+        "started_at": started.isoformat(),
+        "finished_at": finished.isoformat(),
+        "elapsed_ms": elapsed_ms,
+        "log_path": str(log_path),
+        "actual_outputs": output_info["actual_outputs"],
+        "artifacts": output_info["artifacts"],
+        "validation": output_info["validation"],
+        "detail": {
+            "command": command,
+            "returncode": returncode,
+            "timeout_seconds": timeout,
+            "timed_out": timed_out,
+            "log_path": str(log_path),
+            "context_path": str(wiki / "raw" / "pipeline-context.json"),
+            "context": context,
+            "stdout_tail": stdout[-8000:],
+            "stderr_tail": stderr[-8000:],
+            "node_state": output_info["node_state"],
+            "actual_outputs": output_info["actual_outputs"],
+            "validation": output_info["validation"],
+        },
+    }
+
+
+def apply_real_node_execution_to_steps(steps, execution):
+    status = execution.get("status")
+    execute_status = "done" if status == "done" else "failed" if status == "failed" else "blocked"
+    update_node_run_step(
+        steps,
+        "execute-or-dry-run",
+        execute_status,
+        execution.get("summary") or "Real node execution finished.",
+        execution.get("detail") or {},
+        started_at=execution.get("started_at"),
+        finished_at=execution.get("finished_at"),
+        elapsed_ms=execution.get("elapsed_ms"),
+    )
+    validation = execution.get("validation") or {}
+    validation_status = validation.get("status")
+    update_node_run_step(
+        steps,
+        "validate-outputs",
+        "done" if validation_status == "passed" else "failed" if status == "failed" else "warning",
+        "Declared outputs were found." if validation_status == "passed" else "Declared outputs are missing.",
+        validation,
+    )
+    update_node_run_step(
+        steps,
+        "persist-artifacts",
+        "done",
+        "Node Run result and real node artifacts were written to the instance workspace.",
+        {
+            "artifacts": ["input.json", "result.json", "events.jsonl", "executor.log"],
+            "business_artifact_count": len(execution.get("artifacts") or []),
+        },
+    )
 
 
 def write_jsonl(path, rows):
@@ -4668,11 +4983,22 @@ def create_node_run(sop, workflow_id, node_id, body):
     node_run_id = sanitize_node_run_id(body.get("node_run_id") if isinstance(body, dict) else "") or f"node-run-{node_id}-{token}-{digest}"
     workspace = node_run_workspace(sop, node_run_id)
     now = datetime.now(timezone.utc).isoformat()
-    steps = annotate_node_run_steps(build_node_run_steps(sop, plan), now)
-    events = node_run_events_from_steps(node_run_id, node_id, steps, now)
+    steps = build_node_run_steps(sop, plan)
+    real_execution = None
+    execute_step = node_run_step_by_id(steps, "execute-or-dry-run") or {}
+    if plan.get("mode") == "real-node" and execute_step.get("status") == "waiting":
+        real_execution = execute_real_node_run(sop, node_run_id, node_id, plan)
+        apply_real_node_execution_to_steps(steps, real_execution)
+    finished_at = datetime.now(timezone.utc).isoformat()
+    steps = annotate_node_run_steps(steps, now)
+    events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
     status = node_run_status_from_steps(steps)
     config_step = next((step for step in steps if step.get("id") == "resolve-config"), {})
-    inner_steps = node_run_inner_steps(node_id, config_step.get("status"), plan.get("mode"), now)
+    inner_steps = (
+        real_node_inner_steps_from_execution(node_id, real_execution, now)
+        if isinstance(real_execution, dict)
+        else node_run_inner_steps(node_id, config_step.get("status"), plan.get("mode"), now)
+    )
     artifacts = [{
         "id": "node-run-result",
         "producer": node_id,
@@ -4682,6 +5008,8 @@ def create_node_run(sop, workflow_id, node_id, body):
         "title": "Node Run diagnostic result",
         "resolution": "recorded",
     }]
+    if isinstance(real_execution, dict):
+        artifacts.extend(real_execution.get("artifacts") or [])
     reason = ""
     if status in {"failed", "blocked", "needs_input", "warning"}:
         reason = next((step.get("summary") for step in steps if step.get("status") in {"failed", "blocked", "needs_input", "warning"}), "")
@@ -4697,7 +5025,7 @@ def create_node_run(sop, workflow_id, node_id, body):
         "mode": plan.get("mode"),
         "input_source": plan.get("input_source"),
         "started_at": now,
-        "finished_at": now,
+        "finished_at": finished_at,
         "elapsed_ms": sum(int(step.get("elapsed_ms") or 0) for step in steps),
         "created_from": plan.get("base_run_id") or plan.get("input_source"),
         "retry_of": sanitize_node_run_id(body.get("retry_of") if isinstance(body, dict) else ""),
@@ -4707,7 +5035,10 @@ def create_node_run(sop, workflow_id, node_id, body):
         "inner_steps": inner_steps,
         "events": events,
         "artifacts": artifacts,
-        "detail": mask_data({**plan, "inner_steps": inner_steps}),
+        "actual_outputs": (real_execution or {}).get("actual_outputs") or {},
+        "validation": (real_execution or {}).get("validation") or {},
+        "business_artifacts": (real_execution or {}).get("artifacts") or [],
+        "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
     }
     write_json(workspace / "input.json", body if isinstance(body, dict) else {})
     write_json(workspace / "result.json", result)
