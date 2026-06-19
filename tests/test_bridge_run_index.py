@@ -167,6 +167,65 @@ class BridgeRunIndexTest(unittest.TestCase):
         self.assertEqual(payload["executions"][0]["pipeline_id"], "pipe-2")
         self.assertNotIn("node_states", payload["executions"][0])
 
+    def test_execution_summary_derives_failed_from_blocking_node(self):
+        sop = {
+            "id": "test",
+            "wiki_local_path": "/tmp/does-not-need-files",
+            "nodes": {
+                "fetch": {"mode": "blocking"},
+                "sidecar": {"mode": "sidecar"},
+                "build": {"mode": "blocking"},
+            },
+        }
+        summary = bridge.execution_summary(sop, {
+            "pipeline_id": "pipe-1",
+            "status": "running",
+            "nodes": {"fetch": "done", "sidecar": "failed", "build": "failed"},
+        })
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["failed_node"], "build")
+        self.assertEqual(summary["status_evidence"]["blocking_failed_nodes"], ["build"])
+
+    def test_execution_summary_allows_sidecar_failed_when_blocking_done(self):
+        sop = {
+            "id": "test",
+            "wiki_local_path": "/tmp/does-not-need-files",
+            "nodes": {
+                "fetch": {"mode": "blocking"},
+                "sidecar": {"mode": "sidecar"},
+                "build": {"mode": "blocking"},
+            },
+        }
+        summary = bridge.execution_summary(sop, {
+            "pipeline_id": "pipe-1",
+            "status": "running",
+            "nodes": {"fetch": "done", "sidecar": "failed", "build": "done"},
+        })
+
+        self.assertEqual(summary["status"], "done")
+        self.assertEqual(summary["sidecar_failed_nodes"], ["sidecar"])
+
+    def test_execution_summary_ignores_manual_node_status(self):
+        sop = {
+            "id": "test",
+            "wiki_local_path": "/tmp/does-not-need-files",
+            "nodes": {
+                "fetch": {"mode": "blocking"},
+                "retry": {"mode": "manual"},
+                "manual-fix": {"mode": "manual"},
+            },
+        }
+        summary = bridge.execution_summary(sop, {
+            "pipeline_id": "pipe-1",
+            "status": "running",
+            "nodes": {"fetch": "done", "retry": "failed", "manual-fix": "running"},
+        })
+
+        self.assertEqual(summary["status"], "done")
+        self.assertEqual(summary["status_evidence"]["blocking_failed_nodes"], [])
+        self.assertEqual(summary["status_evidence"]["running_nodes"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

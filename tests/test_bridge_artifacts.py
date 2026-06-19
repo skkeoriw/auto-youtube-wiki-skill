@@ -1197,6 +1197,19 @@ class ArtifactResolutionTest(unittest.TestCase):
         read_back = bridge.read_node_test_result(self.sop, "wiki-build", result["test_id"])
         self.assertEqual(read_back["status"], "done")
         self.assertEqual(read_back["detail"]["input_source"], "existing-run")
+        self.assertEqual([step["id"] for step in read_back["steps"]], [
+            "load-definition",
+            "resolve-instance",
+            "resolve-inputs",
+            "check-upstream",
+            "check-side-effects",
+            "build-execution-plan",
+        ])
+        self.assertTrue(read_back["events"])
+        self.assertEqual(read_back["artifacts"][0]["path"], f"raw/node-tests/{result['test_id']}/result.json")
+
+        history = bridge.list_generic_node_tests(self.sop, "wiki-build")
+        self.assertEqual(history[0]["test_id"], result["test_id"])
 
     @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
     def test_node_contract_endpoint_returns_engine_contract(self):

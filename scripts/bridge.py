@@ -2795,9 +2795,15 @@ def execution_summary(sop, run):
     data = dict(run or {})
     pipeline_id = str(data.get("pipeline_id") or data.get("execution_id") or "")
     workflow = workflow_binding(sop)
+    derived_status, status_evidence = derive_run_status(sop, data)
+    failed_node = data.get("failed_node") or (status_evidence.get("blocking_failed_nodes") or [""])[0] or next(
+        (node_id for node_id, status in (data.get("nodes") or {}).items() if status == "failed"),
+        "",
+    )
     data.update({
         "execution_id": pipeline_id,
         "pipeline_id": pipeline_id,
+        "status": derived_status,
         "runtime_id": sop.get("runtime_id", ""),
         "instance_id": sop.get("instance_id", sop.get("id", "")),
         "workflow_id": data.get("workflow_id") or workflow["workflow_id"],
@@ -2806,10 +2812,9 @@ def execution_summary(sop, run):
         "input": data.get("input") if isinstance(data.get("input"), dict) else {
             "url": data.get("source_url", "")
         },
-        "failed_node": data.get("failed_node") or next(
-            (node_id for node_id, status in (data.get("nodes") or {}).items() if status == "failed"),
-            "",
-        ),
+        "failed_node": failed_node,
+        "status_evidence": status_evidence,
+        "sidecar_failed_nodes": status_evidence.get("sidecar_failed_nodes") or [],
         "event_count": data.get("event_count") or (
             len(read_run_events(run_workspace(sop, pipeline_id) / "events.jsonl")) if pipeline_id else 0
         ),
@@ -2892,6 +2897,66 @@ def page_meta(page, page_size, total):
         "has_next": page < page_count,
         "has_prev": page > 1,
     }
+
+
+def sop_business_node_modes(sop):
+    modes = {}
+    for node_id, config in (sop.get("nodes") or {}).items():
+        config = config or {}
+        mode = str(config.get("mode") or "blocking")
+        if node_id == "retry" or mode == "manual":
+            continue
+        modes[node_id] = mode
+    return modes
+
+
+def derive_run_status(sop, data):
+    """Derive a stable top-level run status from node states.
+
+    Historical runs can have run.status stuck at "running" even after node files
+    show terminal failures. The API should reflect the stronger node evidence
+    without rewriting the user's wiki repo.
+    """
+    data = data if isinstance(data, dict) else {}
+    current = str(data.get("status") or "")
+    if current == "cancelled":
+        return current, {}
+    raw_nodes = data.get("nodes") if isinstance(data.get("nodes"), dict) else {}
+    node_states = data.get("node_states") if isinstance(data.get("node_states"), dict) else {}
+    statuses = {}
+    for node_id, value in raw_nodes.items():
+        statuses[str(node_id)] = str(value or "waiting")
+    for node_id, state in node_states.items():
+        if isinstance(state, dict) and state.get("status"):
+            statuses[str(node_id)] = str(state.get("status"))
+    modes = sop_business_node_modes(sop)
+    if not statuses:
+        return current or "waiting", {}
+    candidate_ids = [node_id for node_id in statuses if node_id in modes] if modes else list(statuses)
+    blocking_ids = [node_id for node_id in candidate_ids if modes.get(node_id, "blocking") != "sidecar"]
+    sidecar_ids = [node_id for node_id in candidate_ids if modes.get(node_id) == "sidecar"]
+    blocking_failed = [node_id for node_id in blocking_ids if statuses.get(node_id) == "failed"]
+    sidecar_failed = [node_id for node_id in sidecar_ids if statuses.get(node_id) == "failed"]
+    running = [node_id for node_id in candidate_ids if statuses.get(node_id) == "running"]
+    terminal = {"done", "skipped", "failed", "cancelled"}
+    blocking_terminal = all(statuses.get(node_id) in terminal for node_id in blocking_ids) if blocking_ids else False
+    blocking_done = all(statuses.get(node_id) in {"done", "skipped"} for node_id in blocking_ids) if blocking_ids else False
+    evidence = {
+        "blocking_failed_nodes": blocking_failed,
+        "sidecar_failed_nodes": sidecar_failed,
+        "running_nodes": running,
+    }
+    if blocking_failed:
+        return "failed", evidence
+    if current == "failed":
+        return "failed", evidence
+    if running:
+        return "running", evidence
+    if blocking_done:
+        return "done", evidence
+    if blocking_terminal:
+        return "failed" if any(statuses.get(node_id) in {"failed", "cancelled"} for node_id in blocking_ids) else "done", evidence
+    return current or "waiting", evidence
 
 
 def filter_instance_summaries(instances, query):
@@ -3202,6 +3267,10 @@ def run_summary(sop, run):
     failed_count = sum(status == "failed" for status in node_states.values())
     running_node = next((node_id for node_id, status in node_states.items() if status == "running"), "")
     progress = round(done_count * 100 / node_count) if node_count else 0
+    derived_status, status_evidence = derive_run_status(sop, {
+        **data,
+        "nodes": node_states,
+    })
 
     artifacts = read_json(run_dir / "artifacts.json") or []
     if not isinstance(artifacts, list):
@@ -3245,10 +3314,14 @@ def run_summary(sop, run):
         )
 
     data.update({
+        "status": derived_status,
         "node_count": node_count,
         "done_count": done_count,
         "failed_count": failed_count,
         "running_node": running_node,
+        "failed_node": data.get("failed_node") or (status_evidence.get("blocking_failed_nodes") or status_evidence.get("sidecar_failed_nodes") or [""])[0],
+        "status_evidence": status_evidence,
+        "sidecar_failed_nodes": status_evidence.get("sidecar_failed_nodes") or [],
         "progress": progress,
         "artifact_count": len(artifacts),
         "git_event_count": len(git_events),
@@ -3724,6 +3797,104 @@ def build_node_test_plan(sop, node_id, body=None):
     }
 
 
+def node_test_step(step_id, title, status, summary="", detail=None):
+    return {
+        "id": step_id,
+        "title": title,
+        "status": status,
+        "summary": summary,
+        "detail": detail if isinstance(detail, dict) else {},
+    }
+
+
+def build_node_test_steps(sop, plan):
+    wiki = Path(sop.get("wiki_local_path", ""))
+    missing = plan.get("missing_inputs") or []
+    upstream = plan.get("upstream_nodes") or []
+    side_effects = plan.get("side_effects") or {}
+    steps = [
+        node_test_step(
+            "load-definition",
+            "Load node definition",
+            "done",
+            f"Loaded {plan.get('node_id')} from workflow definition.",
+            {"workflow_id": plan.get("workflow_id"), "node_id": plan.get("node_id")},
+        ),
+        node_test_step(
+            "resolve-instance",
+            "Resolve instance workspace",
+            "done" if wiki.exists() else "failed",
+            str(wiki) if wiki.exists() else "Instance workspace path is not available.",
+            {"wiki_local_path": str(wiki)},
+        ),
+        node_test_step(
+            "resolve-inputs",
+            "Resolve required inputs",
+            "needs_input" if missing else "done",
+            f"{len(plan.get('resolved_inputs') or [])} resolved, {len(missing)} missing.",
+            {
+                "resolved_inputs": plan.get("resolved_inputs") or [],
+                "missing_inputs": missing,
+                "input_source": plan.get("input_source"),
+                "base_run_id": plan.get("base_run_id"),
+            },
+        ),
+        node_test_step(
+            "check-upstream",
+            "Check upstream dependencies",
+            "done" if not missing else "skipped",
+            "No upstream dependency." if not upstream else ", ".join(f"{item.get('node_id')}.{item.get('output')}" for item in upstream),
+            {"upstream_nodes": upstream, "available_existing_runs": plan.get("available_existing_runs") or []},
+        ),
+        node_test_step(
+            "check-side-effects",
+            "Check side effects",
+            "done",
+            "Real node execution is disabled for this generic preflight.",
+            side_effects,
+        ),
+        node_test_step(
+            "build-execution-plan",
+            "Build dry-run execution plan",
+            "skipped" if missing else "done",
+            "Inputs are incomplete." if missing else "Preflight can be used as the execution plan baseline.",
+            {"real_execution_enabled": False, "mode": "preflight"},
+        ),
+    ]
+    if steps[1]["status"] == "failed":
+        steps[-1]["status"] = "skipped"
+    return steps
+
+
+def node_test_events_from_steps(test_id, node_id, steps, timestamp):
+    events = []
+    for index, step in enumerate(steps, start=1):
+        events.append({
+            "sequence": index,
+            "event": f"node_test.step.{step.get('status')}",
+            "test_id": test_id,
+            "node_id": node_id,
+            "step_id": step.get("id"),
+            "ts": timestamp,
+            "data": {
+                "title": step.get("title"),
+                "summary": step.get("summary"),
+            },
+        })
+    return events
+
+
+def node_test_status_from_steps(steps):
+    statuses = [str(step.get("status") or "") for step in steps]
+    if "failed" in statuses:
+        return "failed"
+    if "needs_input" in statuses:
+        return "needs_input"
+    if "running" in statuses:
+        return "running"
+    return "done"
+
+
 def create_node_preflight_test(sop, node_id, body):
     plan = build_node_test_plan(sop, node_id, body)
     if plan is None:
@@ -3733,16 +3904,31 @@ def create_node_preflight_test(sop, node_id, body):
     test_id = f"node-test-{node_id}-{token}-{suffix}"
     workspace = node_test_workspace(sop, test_id)
     now = datetime.now(timezone.utc).isoformat()
+    steps = build_node_test_steps(sop, plan)
+    events = node_test_events_from_steps(test_id, node_id, steps, now)
+    status = node_test_status_from_steps(steps)
+    artifacts = [{
+        "id": "node-test-result",
+        "producer": node_id,
+        "type": "node-test.result",
+        "format": "json",
+        "path": f"raw/node-tests/{test_id}/result.json",
+        "title": "Node test result",
+        "resolution": "recorded",
+    }]
     result = {
         "test_id": test_id,
         "pipeline_id": test_id,
         "node_id": node_id,
-        "status": "needs_input" if plan.get("missing_inputs") else "done",
+        "status": status,
         "mode": "preflight",
         "started_at": now,
         "finished_at": now,
         "pending": False,
-        "reason": "Missing required inputs" if plan.get("missing_inputs") else "",
+        "reason": "Missing required inputs" if status == "needs_input" else "Preflight failed" if status == "failed" else "",
+        "steps": steps,
+        "events": events,
+        "artifacts": artifacts,
         "detail": plan,
     }
     write_json(workspace / "input.json", body if isinstance(body, dict) else {})
@@ -3759,6 +3945,32 @@ def read_generic_node_test_result(sop, test_id):
         return None
     result["detail"] = mask_data(result.get("detail") or {})
     return result
+
+
+def list_generic_node_tests(sop, node_id, limit=10):
+    root = Path(sop["wiki_local_path"]) / "raw" / "node-tests"
+    tests = []
+    if not root.exists():
+        return tests
+    for test_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True):
+        result = read_json(test_dir / "result.json")
+        if not isinstance(result, dict):
+            continue
+        if result.get("node_id") != node_id:
+            continue
+        tests.append({
+            "test_id": result.get("test_id") or test_dir.name,
+            "pipeline_id": result.get("pipeline_id") or result.get("test_id") or test_dir.name,
+            "node_id": node_id,
+            "status": result.get("status"),
+            "mode": result.get("mode"),
+            "started_at": result.get("started_at"),
+            "finished_at": result.get("finished_at"),
+            "reason": result.get("reason"),
+        })
+        if len(tests) >= limit:
+            break
+    return tests
 
 
 def trigger_node_test(sop, node_id, body):
@@ -4438,6 +4650,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if plan is None:
                         return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
                     return json_response(self, 200, plan)
+                # GET /api/sop/{instance}/nodes/{node_id}/tests — generic node test history
+                if len(path) == 6 and path[3] == "nodes" and path[5] == "tests":
+                    if node_registry_item(sop, path[4]) is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "node_id": path[4],
+                        "tests": list_generic_node_tests(sop, path[4]),
+                    })
+                # GET /api/sop/{instance}/nodes/{node_id}/tests/{test_id}
+                if len(path) == 7 and path[3] == "nodes" and path[5] == "tests":
+                    result = read_generic_node_test_result(sop, path[6])
+                    if result is None or result.get("node_id") != path[4]:
+                        return json_response(self, 404, {"detail": f"Node test {path[6]!r} not found"})
+                    return json_response(self, 200, result)
                 # GET /api/sop/{instance}/nodes/{node_id}/test-result/{pipeline_id}
                 if len(path) == 7 and path[3] == "nodes" and path[5] == "test-result":
                     result = read_node_test_result(sop, path[4], path[6])
