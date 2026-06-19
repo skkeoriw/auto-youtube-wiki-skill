@@ -1399,6 +1399,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["resolved_config"]["youtube_research_worker"]["timeout"]["value"], 1200)
         self.assertEqual(detail["resolved_config"]["telegram"]["status"], "ready")
         self.assertEqual(detail["resolved_config"]["telegram"]["token"]["masked_value"], "tel***ret")
+        self.assertIn(detail["resolved_config"]["youtube_research_worker"]["base_url"]["source"].split(":", 1)[0], {"bridge-env", "runtime-env-file", "node-run-overrides"})
         self.assertEqual(len(result["inner_steps"]), 8)
         self.assertEqual(result["inner_steps"][0]["id"], "prepare-request")
 
@@ -1407,6 +1408,61 @@ class ArtifactResolutionTest(unittest.TestCase):
         listed = bridge.list_node_runs(sop, "youtube-deep-research")[0]
         self.assertEqual(listed["node_run_id"], result["node_run_id"])
         self.assertEqual(listed["retry_of"], "node-run-old")
+
+    def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "needs": ["youtube-fetch"],
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/analysis.md"},
+            "infra": {"tg_notify": True, "log_record": True},
+        }
+        env_file = self.wiki / ".agent-brain-plugins.env"
+        env_file.write_text(
+            "\n".join([
+                "YOUTUBE_RESEARCH_WORKFLOW_URL=https://worker-from-file.example",
+                "YOUTUBE_RESEARCH_WORKFLOW_TOKEN=worker-file-token-secret",
+                "YOUTUBE_WIKI_TG_TOKEN=telegram-file-token-secret",
+                "YOUTUBE_WIKI_TG_CHAT_ID=7796171193",
+                "GITHUB_TOKEN=github-file-token-secret",
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {
+            "YOUTUBE_WIKI_ENV_FILE": str(env_file),
+            "YOUTUBE_RESEARCH_WORKFLOW_URL": "",
+            "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "",
+            "YOUTUBE_CONTENT_API_TOKEN": "",
+            "YOUTUBE_WIKI_TG_TOKEN": "",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "",
+            "GITHUB_TOKEN": "",
+            "GH_TOKEN": "",
+        }, clear=False):
+            code, result = bridge.create_node_run(
+                sop,
+                "test",
+                "youtube-deep-research",
+                {"mode": "probe", "input_source": "generated-fixture"},
+            )
+
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "done")
+        detail = result["detail"]
+        worker = detail["resolved_config"]["youtube_research_worker"]
+        self.assertEqual(worker["status"], "ready")
+        self.assertEqual(worker["base_url"]["source"], "runtime-env-file:YOUTUBE_RESEARCH_WORKFLOW_URL")
+        self.assertEqual(worker["token"]["source"], "runtime-env-file:YOUTUBE_RESEARCH_WORKFLOW_TOKEN")
+        self.assertEqual(worker["base_url"]["value"], "https://worker-from-file.example")
+        self.assertIsNone(worker["token"]["value"])
+        self.assertEqual(detail["resolved_config"]["telegram"]["token"]["source"], "runtime-env-file:YOUTUBE_WIKI_TG_TOKEN")
+        self.assertEqual(detail["resolved_config"]["github"]["status"], "ready")
+        self.assertEqual(detail["resolved_config"]["github"]["token"]["source"], "runtime-env-file:GITHUB_TOKEN")
+        self.assertEqual(detail["config_sources"]["runtime_env_file"], str(env_file))
+        self.assertIn("YOUTUBE_RESEARCH_WORKFLOW_URL", detail["config_sources"]["runtime_env_file_keys"])
 
     def test_node_run_routes_create_and_read_shareable_id(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)

@@ -4157,6 +4157,78 @@ def env_config_item(key, label="", required=False, default_value=None, value=Non
     }
 
 
+def node_run_config_context(body=None):
+    body = body if isinstance(body, dict) else {}
+    overrides = body.get("overrides") if isinstance(body.get("overrides"), dict) else {}
+    env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
+    return {
+        "overrides": {str(k): str(v) for k, v in overrides.items() if not is_blank_value(v)},
+        "runtime_env_file": str(Path(env_file).expanduser()),
+        "runtime_env_file_values": read_env_file_values(env_file),
+        "bridge_env": os.environ,
+    }
+
+
+def node_run_config_lookup(context, key, aliases=None):
+    aliases = aliases or []
+    candidates = [key, *aliases]
+    sources = [
+        ("node-run-overrides", context.get("overrides") or {}),
+        ("runtime-env-file", context.get("runtime_env_file_values") or {}),
+        ("bridge-env", context.get("bridge_env") or {}),
+    ]
+    for source_name, values in sources:
+        for candidate in candidates:
+            value = values.get(candidate) if hasattr(values, "get") else None
+            if not is_blank_value(value):
+                return {
+                    "key": candidate,
+                    "value": str(value),
+                    "source": f"{source_name}:{candidate}",
+                }
+    return {"key": key, "value": "", "source": f"missing:{key}"}
+
+
+def node_run_config_item(context, key, label="", required=False, default_value=None, aliases=None):
+    resolved = node_run_config_lookup(context, key, aliases)
+    return env_config_item(
+        resolved["key"],
+        label or key,
+        required=required,
+        default_value=default_value,
+        value=resolved["value"],
+        source=resolved["source"],
+    )
+
+
+def node_run_config_int(context, key, default):
+    resolved = node_run_config_lookup(context, key)
+    try:
+        value = int(resolved["value"]) if not is_blank_value(resolved["value"]) else int(default)
+    except Exception:
+        value = int(default)
+    return {
+        "key": key,
+        "label": key.replace("_", " ").title(),
+        "required": False,
+        "present": not is_blank_value(resolved["value"]),
+        "source": resolved["source"] if not is_blank_value(resolved["value"]) else "default",
+        "value": value,
+    }
+
+
+def node_run_config_source_summary(context):
+    env_file_values = context.get("runtime_env_file_values") or {}
+    overrides = context.get("overrides") or {}
+    return {
+        "runtime_env_file": context.get("runtime_env_file") or "",
+        "runtime_env_file_present": bool(env_file_values),
+        "runtime_env_file_keys": sorted(k for k in env_file_values if k in RUNTIME_CAPABILITY_ENV or k in RUNTIME_CONFIG_CATEGORIES),
+        "node_run_override_keys": sorted(overrides.keys()),
+        "precedence": ["node-run-overrides", "runtime-env-file", "bridge-env", "defaults"],
+    }
+
+
 def parse_int_env(key, default):
     try:
         return int(os.environ.get(key, str(default)) or default)
@@ -4168,7 +4240,7 @@ def sop_definition(sop):
     return read_yaml(Path(sop.get("sop_file") or ""))
 
 
-def resolve_telegram_config(sop, node_id, static):
+def resolve_telegram_config(sop, node_id, static, context):
     definition = sop_definition(sop)
     notify = definition.get("notify") if isinstance(definition.get("notify"), dict) else {}
     telegram = notify.get("telegram") if isinstance(notify.get("telegram"), dict) else {}
@@ -4176,12 +4248,15 @@ def resolve_telegram_config(sop, node_id, static):
     chat_id = telegram.get("chat_id")
     chat_source = "instance-sop:notify.telegram.chat_id" if not is_blank_value(chat_id) else "runtime-env:YOUTUBE_WIKI_TG_CHAT_ID"
     if is_blank_value(chat_id):
-        chat_id = os.environ.get("YOUTUBE_WIKI_TG_CHAT_ID")
+        chat = node_run_config_lookup(context, "YOUTUBE_WIKI_TG_CHAT_ID", RUNTIME_CAPABILITY_ENV.get("YOUTUBE_WIKI_TG_CHAT_ID", []))
+        chat_id = chat.get("value")
+        chat_source = chat.get("source") or "missing:YOUTUBE_WIKI_TG_CHAT_ID"
+    token = node_run_config_lookup(context, token_env)
     capabilities = (node_registry_item(sop, node_id) or {}).get("capabilities") or {}
     tg_cap = capabilities.get("telegram") if isinstance(capabilities.get("telegram"), dict) else {}
     enabled = bool(tg_cap.get("enabled", (static.get("infra") or {}).get("tg_notify", True)))
     required = bool(tg_cap.get("required", False))
-    token_present = not is_blank_value(os.environ.get(token_env))
+    token_present = not is_blank_value(token.get("value"))
     chat_present = not is_blank_value(chat_id)
     if not enabled:
         status = "disabled"
@@ -4198,7 +4273,7 @@ def resolve_telegram_config(sop, node_id, static):
         "required": required,
         "status": status,
         "token_env": token_env,
-        "token": env_config_item(token_env, "Telegram Bot Token", required=enabled and required),
+        "token": env_config_item(token.get("key") or token_env, "Telegram Bot Token", required=enabled and required, value=token.get("value"), source=token.get("source") or f"missing:{token_env}"),
         "chat_id": {
             "key": "YOUTUBE_WIKI_TG_CHAT_ID",
             "label": "Telegram Chat ID",
@@ -4216,65 +4291,58 @@ def resolve_telegram_config(sop, node_id, static):
     }
 
 
-def resolve_youtube_research_worker_config(node_id):
+def resolve_youtube_research_worker_config(node_id, context):
     if node_id != "youtube-deep-research":
         return None
-    token = os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TOKEN") or os.environ.get("YOUTUBE_CONTENT_API_TOKEN")
-    token_key = "YOUTUBE_RESEARCH_WORKFLOW_TOKEN" if os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TOKEN") else "YOUTUBE_CONTENT_API_TOKEN"
-    base_url = os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_URL", "").rstrip("/")
-    timeout_s = parse_int_env("YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT", 1200)
-    interval_s = parse_int_env("YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL", 10)
+    workflow_token = node_run_config_lookup(context, "YOUTUBE_RESEARCH_WORKFLOW_TOKEN", RUNTIME_CAPABILITY_ENV.get("YOUTUBE_RESEARCH_WORKFLOW_TOKEN", []))
+    content_token = node_run_config_lookup(context, "YOUTUBE_CONTENT_API_TOKEN", RUNTIME_CAPABILITY_ENV.get("YOUTUBE_CONTENT_API_TOKEN", []))
+    token = workflow_token if not is_blank_value(workflow_token.get("value")) else content_token
+    base_url = node_run_config_lookup(context, "YOUTUBE_RESEARCH_WORKFLOW_URL", RUNTIME_CAPABILITY_ENV.get("YOUTUBE_RESEARCH_WORKFLOW_URL", []))
+    timeout = node_run_config_int(context, "YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT", 1200)
+    interval = node_run_config_int(context, "YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL", 10)
     missing = []
-    if not base_url:
+    if not base_url.get("value"):
         missing.append("YOUTUBE_RESEARCH_WORKFLOW_URL")
-    if not token:
+    if not token.get("value"):
         missing.append("YOUTUBE_RESEARCH_WORKFLOW_TOKEN")
     return {
         "capability": "youtube-research-worker",
         "label": "YouTube Deep Research Worker",
         "status": "ready" if not missing else "failed",
-        "base_url": env_config_item("YOUTUBE_RESEARCH_WORKFLOW_URL", "Worker URL", required=True, value=base_url),
-        "token": env_config_item(token_key, "Worker API Token", required=True, value=token),
+        "base_url": env_config_item(base_url.get("key") or "YOUTUBE_RESEARCH_WORKFLOW_URL", "Worker URL", required=True, value=str(base_url.get("value") or "").rstrip("/"), source=base_url.get("source") or "missing:YOUTUBE_RESEARCH_WORKFLOW_URL"),
+        "token": env_config_item(token.get("key") or "YOUTUBE_RESEARCH_WORKFLOW_TOKEN", "Worker API Token", required=True, value=token.get("value"), source=token.get("source") or "missing:YOUTUBE_RESEARCH_WORKFLOW_TOKEN"),
         "timeout": {
-            "key": "YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT",
+            **timeout,
             "label": "Worker Poll Timeout",
-            "required": False,
-            "present": bool(os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT")),
-            "source": "runtime-env:YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT" if os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_TIMEOUT") else "default",
-            "value": timeout_s,
             "unit": "seconds",
         },
         "poll_interval": {
-            "key": "YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL",
+            **interval,
             "label": "Worker Poll Interval",
-            "required": False,
-            "present": bool(os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL")),
-            "source": "runtime-env:YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL" if os.environ.get("YOUTUBE_RESEARCH_WORKFLOW_POLL_INTERVAL") else "default",
-            "value": interval_s,
             "unit": "seconds",
         },
         "missing": missing,
     }
 
 
-def resolve_git_config(_sop):
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+def resolve_git_config(_sop, context):
+    token = node_run_config_lookup(context, "GITHUB_TOKEN", ["GH_TOKEN", *RUNTIME_CAPABILITY_ENV.get("GITHUB_TOKEN", [])])
     return {
         "capability": "github",
         "label": "GitHub workspace persistence",
         "enabled": True,
         "required": False,
-        "status": "ready" if token else "warning",
-        "token": env_config_item("GITHUB_TOKEN" if os.environ.get("GITHUB_TOKEN") else "GH_TOKEN", "GitHub Token", required=False, value=token),
+        "status": "ready" if token.get("value") else "warning",
+        "token": env_config_item(token.get("key") or "GITHUB_TOKEN", "GitHub Token", required=False, value=token.get("value"), source=token.get("source") or "missing:GITHUB_TOKEN"),
     }
 
 
-def node_run_config_summary(sop, node_id, static):
+def node_run_config_summary(sop, node_id, static, context):
     configs = {
-        "telegram": resolve_telegram_config(sop, node_id, static),
-        "github": resolve_git_config(sop),
+        "telegram": resolve_telegram_config(sop, node_id, static, context),
+        "github": resolve_git_config(sop, context),
     }
-    worker = resolve_youtube_research_worker_config(node_id)
+    worker = resolve_youtube_research_worker_config(node_id, context)
     if worker:
         configs["youtube_research_worker"] = worker
     return configs
@@ -4338,7 +4406,8 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
         mode = "preflight"
     binding = workflow_binding(sop)
     runtime = runtime_info()
-    configs = node_run_config_summary(sop, node_id, static)
+    config_context = node_run_config_context(body)
+    configs = node_run_config_summary(sop, node_id, static, config_context)
     return {
         **test_plan,
         "runtime_id": sop.get("runtime_id") or runtime.get("runtime_id") or "",
@@ -4351,6 +4420,7 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
         "mode": mode,
         "input_source": input_source,
         "resolved_config": configs,
+        "config_sources": node_run_config_source_summary(config_context),
         "capability_probes": {
             key: {
                 "capability": value.get("capability") or key,
