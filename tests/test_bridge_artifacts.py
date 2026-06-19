@@ -362,6 +362,102 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertNotIn("private_key", merged)
         self.assertNotIn("ssh_private_key", merged)
 
+    def test_runtime_management_config_machine_id_secret_wins_over_default_key(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout=0):
+            self.assertIn("/api/sop/v1/machines/machine-34/resolve", request.full_url)
+            return FakeResponse({
+                "ok": True,
+                "machine": {
+                    "id": "machine-34",
+                    "host": "34.134.172.74",
+                    "user": "runner",
+                    "ssh_command": "ssh -i ~/.ssh/id_ed25519 runner@34.134.172.74",
+                    "auth_type": "private_key",
+                    "private_key": "machine-private-key",
+                },
+            })
+
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path), \
+             patch.object(bridge.urllib.request, "urlopen", side_effect=fake_urlopen):
+            bridge.save_runtime_management_config({
+                "RUNTIME_TARGET_PRIVATE_KEY": "stale-management-private-key",
+                "RUNTIME_TARGET_PRIVATE_KEY_B64": "STALEB64",
+            })
+            merged = bridge.inject_runtime_management_config({
+                "action": "delete-runtime",
+                "machine_id": "machine-34",
+                "ssh_command": "ssh stale@34.134.172.74",
+            })
+
+        self.assertEqual(merged["machine_id"], "machine-34")
+        self.assertEqual(merged["ssh_command"], "ssh -i ~/.ssh/id_ed25519 runner@34.134.172.74")
+        self.assertEqual(merged["target_host"], "34.134.172.74")
+        self.assertEqual(merged["private_key_b64"], "bWFjaGluZS1wcml2YXRlLWtleQ==")
+        self.assertNotEqual(merged.get("private_key"), "stale-management-private-key")
+        self.assertNotIn("private_key", merged.get("_management_config_injected", []))
+        self.assertIn("private_key_b64", merged.get("_management_config_injected", []))
+
+    def test_runtime_management_config_can_resolve_machine_by_target_host_without_secret(self):
+        config_path = self.wiki / ".sop/runtime-management/config.json"
+        requested_urls = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout=0):
+            requested_urls.append(request.full_url)
+            if request.full_url.endswith("/api/sop/v1/machines?page=1&page_size=200"):
+                return FakeResponse({
+                    "machines": [
+                        {"id": "machine-34", "host": "34.134.172.74", "status": "active"},
+                    ],
+                })
+            if request.full_url.endswith("/api/sop/v1/machines/machine-34/resolve"):
+                return FakeResponse({
+                    "machine": {
+                        "id": "machine-34",
+                        "host": "34.134.172.74",
+                        "ssh_command": "ssh runner@34.134.172.74",
+                        "auth_type": "password",
+                        "password": "machine-password",
+                    },
+                })
+            raise AssertionError(request.full_url)
+
+        with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path), \
+             patch.object(bridge.urllib.request, "urlopen", side_effect=fake_urlopen):
+            bridge.save_runtime_management_config({})
+            merged = bridge.inject_runtime_management_config({
+                "action": "delete-runtime",
+                "target_host": "34.134.172.74",
+            })
+
+        self.assertEqual(len(requested_urls), 2)
+        self.assertEqual(merged["machine_id"], "machine-34")
+        self.assertEqual(merged["ssh_command"], "ssh runner@34.134.172.74")
+        self.assertEqual(merged["ssh_password"], "machine-password")
+        self.assertNotIn("private_key", merged)
+        self.assertNotIn("private_key_b64", merged)
+
     def test_create_runtime_does_not_inject_saved_runtime_identity(self):
         config_path = self.wiki / ".sop/runtime-management/config.json"
         with patch.object(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", config_path):

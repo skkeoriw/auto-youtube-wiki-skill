@@ -1,4 +1,5 @@
 import http.server
+import base64
 import hashlib
 import hmac
 import importlib.util
@@ -38,6 +39,10 @@ RUNTIME_SETTINGS_D1_AUDIT_TABLE = "global_settings_audit"
 SSE_STREAM_WINDOW_SECONDS = float(os.environ.get("SSE_STREAM_WINDOW_SECONDS", "5"))
 SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "3"))
 GENERIC_NODE_CLI_URL = os.environ.get("SOP_NODE_CLI_URL", "https://skill.vyibc.com/sop-node.sh")
+SOP_CONTROL_PLANE_API_URL = os.environ.get(
+    "SOP_CONTROL_PLANE_API_URL",
+    os.environ.get("CONTROL_PLANE_API_URL", "https://sop-control-plane.hb67egcim4.workers.dev"),
+).rstrip("/")
 _RUN_INDEX_CLASS = None
 _SOP_READ_CACHE = {}
 _SOP_READ_CACHE_TTL_SECONDS = float(os.environ.get("SOP_READ_CACHE_TTL_SECONDS", "3"))
@@ -822,21 +827,144 @@ def request_has_runtime_config(body, env_key, aliases):
     return False
 
 
-def inject_runtime_management_config(body):
-    values = read_runtime_management_config_values()
-    if not values:
-        return body
-    merged = {**body}
-    injected = []
-    action = str(merged.get("management_action") or merged.get("action") or "").strip()
-    request_private_key_fields = [
+def runtime_management_secret_fields():
+    return [
         "private_key",
         "ssh_private_key",
         "ssh_private_key_content",
+        "private_key_content",
         "private_key_b64",
         "ssh_private_key_b64",
         "ssh_password",
     ]
+
+
+def parse_ssh_host(command):
+    text = str(command or "").strip()
+    if not text:
+        return ""
+    tokens = shlex.split(text)
+    host_token = ""
+    for token in reversed(tokens):
+        if token.startswith("-"):
+            continue
+        if "@" in token:
+            host_token = token
+            break
+    if not host_token:
+        return ""
+    return host_token.rsplit("@", 1)[-1].strip("[]")
+
+
+def control_plane_get_json(path, timeout=10):
+    if not SOP_CONTROL_PLANE_API_URL:
+        return {}
+    url = f"{SOP_CONTROL_PLANE_API_URL}{path}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+def resolve_control_plane_machine(machine_id):
+    safe = re.sub(r"[^A-Za-z0-9._:-]", "", str(machine_id or ""))
+    if not safe:
+        return {}
+    try:
+        payload = control_plane_get_json(f"/api/sop/v1/machines/{safe}/resolve")
+    except Exception:
+        return {}
+    machine = payload.get("machine") if isinstance(payload, dict) else None
+    return machine if isinstance(machine, dict) else {}
+
+
+def find_control_plane_machine_by_host(host):
+    target_host = str(host or "").strip()
+    if not target_host:
+        return {}
+    try:
+        payload = control_plane_get_json("/api/sop/v1/machines?page=1&page_size=200")
+    except Exception:
+        return {}
+    machines = payload.get("machines") or payload.get("items") if isinstance(payload, dict) else []
+    if not isinstance(machines, list):
+        return {}
+    for item in machines:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "active") == "deleted":
+            continue
+        if str(item.get("host") or "").strip() == target_host:
+            machine_id = item.get("id") or ""
+            return resolve_control_plane_machine(machine_id)
+    return {}
+
+
+def machine_credentials_from_request(merged):
+    action = str(merged.get("management_action") or merged.get("action") or "").strip()
+    if action not in {"create-runtime", "delete-runtime"}:
+        return {}
+    explicit_machine_id = str(
+        merged.get("machine_id")
+        or merged.get("target_machine_id")
+        or merged.get("runtime_machine_id")
+        or ""
+    ).strip()
+    request_has_secret = any(merged.get(candidate) not in {None, ""} for candidate in runtime_management_secret_fields())
+    machine = {}
+    if explicit_machine_id:
+        machine = resolve_control_plane_machine(explicit_machine_id)
+    elif not request_has_secret:
+        host = str(merged.get("target_host") or "").strip() or parse_ssh_host(merged.get("ssh_command") or "")
+        machine = find_control_plane_machine_by_host(host)
+    if not machine:
+        return {"_machine_credential_resolve_error": "machine credential not found"} if explicit_machine_id else {}
+
+    ssh_command = str(machine.get("ssh_command") or machine.get("sshCommand") or merged.get("ssh_command") or "").strip()
+    auth_type = str(machine.get("auth_type") or machine.get("authType") or "private_key").strip()
+    private_key = str(machine.get("private_key") or machine.get("privateKey") or "")
+    password = str(machine.get("password") or "")
+    resolved = {
+        "machine_id": str(machine.get("id") or explicit_machine_id or "").strip(),
+        "ssh_command": ssh_command,
+        "target_host": str(machine.get("host") or merged.get("target_host") or "").strip(),
+    }
+    if auth_type == "password" and password:
+        resolved["ssh_password"] = password
+        for key in ["private_key", "ssh_private_key", "ssh_private_key_content", "private_key_content", "private_key_b64", "ssh_private_key_b64"]:
+            resolved[key] = ""
+        return {key: value for key, value in resolved.items() if value not in {None, ""}}
+    if private_key:
+        resolved["private_key_b64"] = base64.b64encode(private_key.encode("utf-8")).decode("ascii")
+        for key in ["private_key", "ssh_private_key", "ssh_private_key_content", "private_key_content", "ssh_private_key_b64"]:
+            resolved[key] = ""
+    return {key: value for key, value in resolved.items() if value not in {None, ""}}
+
+
+def inject_runtime_management_config(body):
+    values = read_runtime_management_config_values()
+    if not values:
+        merged = {**body}
+        machine_credentials = machine_credentials_from_request(merged)
+        if machine_credentials:
+            merged.update(machine_credentials)
+        return merged
+    merged = {**body}
+    injected = []
+    action = str(merged.get("management_action") or merged.get("action") or "").strip()
+    machine_credentials = machine_credentials_from_request(merged)
+    if machine_credentials:
+        merged.update(machine_credentials)
+        if merged.get("_machine_credential_resolve_error"):
+            injected.append("_machine_credential_resolve_error")
+        else:
+            for key in ["machine_id", "ssh_command", "target_host", "private_key_b64", "ssh_password"]:
+                if merged.get(key) not in {None, ""}:
+                    injected.append(key)
+    request_private_key_fields = runtime_management_secret_fields()
     for env_key, aliases in RUNTIME_CAPABILITY_ENV.items():
         if request_has_runtime_config(merged, env_key, aliases):
             continue
@@ -852,6 +980,8 @@ def inject_runtime_management_config(body):
         if action == "create-runtime" and default_key in CREATE_RUNTIME_MANAGEMENT_DEFAULT_EXCLUDES:
             continue
         if default_key in {"RUNTIME_TARGET_PRIVATE_KEY", "RUNTIME_TARGET_PRIVATE_KEY_B64"}:
+            if merged.get("machine_id") not in {None, ""}:
+                continue
             if any(merged.get(candidate) not in {None, ""} for candidate in request_private_key_fields):
                 continue
         if any(merged.get(candidate) not in {None, ""} for candidate in request_keys):
