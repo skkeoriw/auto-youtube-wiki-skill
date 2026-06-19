@@ -4731,9 +4731,11 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
 
 def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
-    node_state = read_json(run_workspace(sop, node_run_id) / "nodes" / f"{node_id}.json") or {}
+    workspace = run_workspace(sop, node_run_id)
+    node_state = read_json(workspace / "nodes" / f"{node_id}.json") or {}
+    capabilities = read_json(workspace / "nodes" / node_id / "capabilities.json") or {}
     context = (
-        read_json(run_workspace(sop, node_run_id) / "context.json")
+        read_json(workspace / "context.json")
         or read_json(wiki / "raw" / "pipeline-context.json")
         or {}
     )
@@ -4782,6 +4784,7 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
             "missing_outputs": missing,
             "unexpected_outputs": [],
         },
+        "capabilities": capabilities if isinstance(capabilities, dict) else {},
         "node_state": node_state,
     }
 
@@ -4907,6 +4910,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "actual_outputs": output_info["actual_outputs"],
         "artifacts": output_info["artifacts"],
         "validation": output_info["validation"],
+        "capabilities": output_info["capabilities"],
         "detail": {
             "command": command,
             "returncode": returncode,
@@ -4918,6 +4922,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             "stdout_tail": stdout[-8000:],
             "stderr_tail": stderr[-8000:],
             "node_state": output_info["node_state"],
+            "capabilities": output_info["capabilities"],
             "actual_outputs": output_info["actual_outputs"],
             "validation": output_info["validation"],
         },
@@ -4988,6 +4993,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "artifacts": artifacts,
         "actual_outputs": (real_execution or {}).get("actual_outputs") or {},
         "validation": (real_execution or {}).get("validation") or {},
+        "capabilities": (real_execution or {}).get("capabilities") or {},
         "business_artifacts": (real_execution or {}).get("artifacts") or [],
         "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
     }
