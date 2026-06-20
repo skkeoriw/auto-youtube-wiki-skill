@@ -1415,8 +1415,8 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(tg_capability["status"], "ready")
         git_capability = next(item for item in result["capability_results"] if item["key"] == "git")
         self.assertEqual(git_capability["status"], "warning")
-        self.assertEqual(len(result["inner_steps"]), 8)
-        self.assertEqual(result["inner_steps"][0]["id"], "prepare-request")
+        self.assertEqual([step["id"] for step in result["inner_steps"]], ["pre", "doing", "post"])
+        self.assertEqual(result["inner_steps"][0]["title"], "执行前")
 
         read_back = bridge.read_node_run_result(sop, "youtube-deep-research", result["node_run_id"])
         self.assertEqual(read_back["node_run_id"], result["node_run_id"])

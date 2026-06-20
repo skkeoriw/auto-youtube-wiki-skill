@@ -1888,7 +1888,13 @@ def ensure_node_explanation(detail):
             "environment": inputs.get("environment") or environment,
             "secrets": inputs.get("secrets") or secrets,
         },
-        "actions": detail.get("actions") if isinstance(detail.get("actions"), list) and detail.get("actions") else meta["actions"],
+        "actions": (
+            detail.get("action_steps")
+            if isinstance(detail.get("action_steps"), list) and detail.get("action_steps")
+            else detail.get("actions")
+            if isinstance(detail.get("actions"), list) and detail.get("actions")
+            else meta["actions"]
+        ),
         "outputs": {
             "declared": declared_outputs,
             "actual": actual_outputs,
@@ -2178,6 +2184,7 @@ def node_static_config(sop, node_id):
         "optional_inputs": config.get("optional_inputs", {}),
         "infra": config.get("infra", {"tg_notify": True, "log_record": True}),
         "params": config.get("params") or {},
+        "action_steps": config.get("actions") or manifest.get("actions") or [],
         "skill_script": skill_script,
         "skill_readme": skill_readme,
         "manifest": manifest,
@@ -5391,52 +5398,149 @@ def annotate_node_run_steps(steps, started_at):
     return steps
 
 
-def youtube_deep_research_inner_steps(config_status, mode, started_at):
-    try:
-        base = datetime.fromisoformat(str(started_at).replace("Z", "+00:00")) + timedelta(milliseconds=280)
-    except Exception:
-        base = datetime.now(timezone.utc)
-    blocked = config_status == "failed"
-    real_enabled = mode == "real-node"
-    defs = [
-        ("prepare-request", "Prepare request", "Build worker request from resolved source_url."),
-        ("call-worker", "Call worker", "Submit job to YouTube Deep Research Worker."),
-        ("wait-worker-job", "Wait worker job", "Wait for accepted job to become readable."),
-        ("poll-result", "Poll result", "Poll worker result until done or timeout."),
-        ("download-artifacts", "Download artifacts", "Download transcript and analysis files."),
-        ("write-workspace", "Write workspace", "Write raw/youtube-deep-research artifacts."),
-        ("commit-git", "Commit git", "Persist artifacts to instance repo."),
-        ("send-progress-notification", "Send progress notification", "Send explicit TG progress notification if enabled."),
+def outer_step_status(steps, step_id):
+    step = node_run_step_by_id(steps, step_id)
+    return str((step or {}).get("status") or "")
+
+
+def status_is_problem(status):
+    return status in {"failed", "blocked", "needs_input"}
+
+
+def lifecycle_status_from_capabilities(capabilities):
+    status = "done"
+    for item in (capabilities or {}).values():
+        if not isinstance(item, dict):
+            continue
+        item_status = str(item.get("status") or "")
+        required = bool(item.get("required", False))
+        if item_status == "failed" and required:
+            return "failed"
+        if item_status == "failed" and status != "failed":
+            status = "warning"
+    return status
+
+
+def forward_next_summary(real_execution):
+    stdout = str(((real_execution or {}).get("detail") or {}).get("stdout_tail") or "")
+    matches = [line.strip() for line in stdout.splitlines() if "forward_next" in line]
+    return matches[-1] if matches else ""
+
+
+def node_run_lifecycle_steps(plan, steps, real_execution=None, started_at="", finished_at="", pending=False):
+    """Generic lifecycle exposed as Node Run inner flow.
+
+    This intentionally does not infer skill-internal steps. Every node shares the
+    same visible lifecycle; detailed business progress belongs in logs/events.
+    """
+    real_execution = real_execution if isinstance(real_execution, dict) else {}
+    resolved_inputs = plan.get("resolved_inputs") or []
+    missing_inputs = plan.get("missing_inputs") or []
+    execute_step = node_run_step_by_id(steps, "execute-or-dry-run") or {}
+    config_step = node_run_step_by_id(steps, "resolve-config") or {}
+    validation = real_execution.get("validation") or {}
+    capabilities = real_execution.get("capabilities") if isinstance(real_execution.get("capabilities"), dict) else {}
+    command = ((real_execution.get("detail") or {}).get("command") or execute_step.get("detail", {}).get("command") or [])
+    returncode = ((real_execution.get("detail") or {}).get("returncode") if real_execution else None)
+    timed_out = bool(((real_execution.get("detail") or {}).get("timed_out")) if real_execution else False)
+    problem_statuses = [
+        outer_step_status(steps, "load-definition"),
+        outer_step_status(steps, "resolve-context"),
+        outer_step_status(steps, "resolve-inputs"),
+        outer_step_status(steps, "resolve-config"),
     ]
-    rows = []
-    for index, (step_id, title, summary) in enumerate(defs):
-        if blocked:
-            status = "skipped"
-            step_summary = "Skipped because required Worker config is incomplete."
-        elif real_enabled:
-            status = "running" if index == 0 else "waiting"
-            step_summary = "Real node execution is running." if index == 0 else "Waiting for the stage wrapper to reach this step."
+
+    if any(status_is_problem(status) for status in problem_statuses):
+        pre_status = "failed" if "failed" in problem_statuses else "needs_input"
+    elif outer_step_status(steps, "execute-or-dry-run") in {"running", "waiting"}:
+        pre_status = "done"
+    else:
+        pre_status = "done"
+
+    if pending:
+        doing_status = "running"
+    elif real_execution:
+        doing_status = "done" if real_execution.get("status") == "done" else "failed"
+    elif plan.get("mode") != "real-node":
+        doing_status = "skipped"
+    else:
+        doing_status = str(execute_step.get("status") or "waiting")
+
+    if pending:
+        post_status = "waiting"
+    elif doing_status == "failed":
+        post_status = "failed"
+    elif real_execution:
+        if validation.get("status") == "failed":
+            post_status = "failed"
         else:
-            status = "skipped"
-            step_summary = "Not executed in diagnostic mode; this is the planned inner flow."
-        ts = base + timedelta(milliseconds=index * 25)
-        rows.append({
-            "id": step_id,
-            "title": title,
-            "status": status,
-            "summary": step_summary if index > 0 or blocked or real_enabled else summary,
-            "started_at": ts.isoformat(),
-            "finished_at": (ts + timedelta(milliseconds=12)).isoformat(),
-            "elapsed_ms": 12,
-            "detail": {"inner_flow": True, "side_effect": step_id in {"call-worker", "commit-git", "send-progress-notification"}},
-        })
-    return rows
+            post_status = lifecycle_status_from_capabilities(capabilities)
+    else:
+        post_status = "skipped" if plan.get("mode") != "real-node" else "waiting"
 
-
-def node_run_inner_steps(node_id, config_status, mode, started_at):
-    if node_id == "youtube-deep-research":
-        return youtube_deep_research_inner_steps(config_status, mode, started_at)
-    return []
+    log_path = real_execution.get("log_path") or ((real_execution.get("detail") or {}).get("log_path") if real_execution else "")
+    actual_outputs = real_execution.get("actual_outputs") or {}
+    artifacts = real_execution.get("artifacts") or []
+    return [
+        {
+            "id": "pre",
+            "title": "执行前",
+            "status": pre_status,
+            "summary": "Node Run 上下文、输入和运行配置已准备，并交给 stage runner on_start。",
+            "started_at": started_at or "",
+            "finished_at": real_execution.get("started_at") or "",
+            "detail": {
+                "mode": plan.get("mode"),
+                "input_source": plan.get("input_source"),
+                "resolved_inputs": resolved_inputs,
+                "missing_inputs": missing_inputs,
+                "config_status": config_step.get("status"),
+                "command": command,
+                "stage_hook": "on_start",
+            },
+        },
+        {
+            "id": "doing",
+            "title": "执行中",
+            "status": doing_status,
+            "summary": (
+                "Skill / agent 业务执行完成。"
+                if doing_status == "done"
+                else "Skill / agent 业务仍在执行。"
+                if doing_status == "running"
+                else "Skill / agent 业务执行失败。"
+                if doing_status == "failed"
+                else "当前模式未执行真实业务逻辑。"
+            ),
+            "started_at": real_execution.get("started_at") or "",
+            "finished_at": real_execution.get("finished_at") or "",
+            "elapsed_ms": real_execution.get("elapsed_ms"),
+            "detail": {
+                "command": command,
+                "returncode": returncode,
+                "timed_out": timed_out,
+                "log_path": log_path,
+                "stdout_tail": ((real_execution.get("detail") or {}).get("stdout_tail") if real_execution else ""),
+                "stderr_tail": ((real_execution.get("detail") or {}).get("stderr_tail") if real_execution else ""),
+            },
+        },
+        {
+            "id": "post",
+            "title": "执行后",
+            "status": post_status,
+            "summary": "stage_runner on_done/on_failed、输出校验、Git/TG capability 和 bridge 结果收集已归档。",
+            "started_at": real_execution.get("finished_at") or "",
+            "finished_at": finished_at or "",
+            "detail": {
+                "stage_hooks": ["on_done/on_failed", "forward_next"],
+                "validation": validation,
+                "actual_outputs": actual_outputs,
+                "business_artifact_count": len(artifacts),
+                "capabilities": capabilities,
+                "forward_next": forward_next_summary(real_execution),
+            },
+        },
+    ]
 
 
 def build_node_run_steps(sop, plan):
@@ -5800,44 +5904,6 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     }
 
 
-def real_node_inner_steps_from_execution(node_id, execution, started_at):
-    if node_id != "youtube-deep-research":
-        return []
-    defs = [
-        ("prepare-request", "Prepare request", "Build worker request from resolved source_url."),
-        ("call-worker", "Call worker", "Submit job to YouTube Deep Research Worker."),
-        ("wait-worker-job", "Wait worker job", "Wait for accepted job to become readable."),
-        ("poll-result", "Poll result", "Poll worker result until done or timeout."),
-        ("download-artifacts", "Download artifacts", "Download transcript and analysis files."),
-        ("write-workspace", "Write workspace", "Write raw/youtube-deep-research artifacts."),
-        ("commit-git", "Commit git", "Persist artifacts to instance repo."),
-        ("send-progress-notification", "Send progress notification", "Send explicit TG progress notification if enabled."),
-    ]
-    status = "done" if execution.get("status") == "done" else "failed"
-    try:
-        base = datetime.fromisoformat(str(started_at).replace("Z", "+00:00")) + timedelta(milliseconds=280)
-    except Exception:
-        base = datetime.now(timezone.utc)
-    rows = []
-    for index, (step_id, title, summary) in enumerate(defs):
-        ts = base + timedelta(milliseconds=index * 25)
-        rows.append({
-            "id": step_id,
-            "title": title,
-            "status": status,
-            "summary": summary if status == "done" else execution.get("summary") or "Real node execution failed.",
-            "started_at": ts.isoformat(),
-            "finished_at": (ts + timedelta(milliseconds=12)).isoformat(),
-            "elapsed_ms": 12,
-            "detail": {
-                "inner_flow": True,
-                "side_effect": step_id in {"call-worker", "commit-git", "send-progress-notification"},
-                "log_path": execution.get("log_path", ""),
-            },
-        })
-    return rows
-
-
 def execute_real_node_run(sop, node_run_id, node_id, plan):
     if not node_real_execution_supported(node_id):
         return {
@@ -6062,7 +6128,13 @@ def complete_real_node_run_async(sop, workflow_id, node_id, node_run_id, body, s
         finished_at = datetime.now(timezone.utc).isoformat()
         steps = annotate_node_run_steps(steps, started_at)
         events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
-        inner_steps = real_node_inner_steps_from_execution(node_id, real_execution, started_at)
+        inner_steps = node_run_lifecycle_steps(
+            plan,
+            steps,
+            real_execution=real_execution,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
         artifacts = [{
             "id": "node-run-result",
             "producer": node_id,
@@ -6191,7 +6263,13 @@ def create_node_run(sop, workflow_id, node_id, body):
             finished_at = datetime.now(timezone.utc).isoformat()
             steps = annotate_node_run_steps(steps, now)
             events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
-            inner_steps = node_run_inner_steps(node_id, "done", plan.get("mode"), now)
+            inner_steps = node_run_lifecycle_steps(
+                plan,
+                steps,
+                started_at=now,
+                finished_at=finished_at,
+                pending=True,
+            )
             artifacts = [{
                 "id": "node-run-result",
                 "producer": node_id,
@@ -6225,11 +6303,12 @@ def create_node_run(sop, workflow_id, node_id, body):
     finished_at = datetime.now(timezone.utc).isoformat()
     steps = annotate_node_run_steps(steps, now)
     events = node_run_events_from_steps(node_run_id, node_id, steps, finished_at)
-    config_step = next((step for step in steps if step.get("id") == "resolve-config"), {})
-    inner_steps = (
-        real_node_inner_steps_from_execution(node_id, real_execution, now)
-        if isinstance(real_execution, dict)
-        else node_run_inner_steps(node_id, config_step.get("status"), plan.get("mode"), now)
+    inner_steps = node_run_lifecycle_steps(
+        plan,
+        steps,
+        real_execution=real_execution,
+        started_at=now,
+        finished_at=finished_at,
     )
     artifacts = [{
         "id": "node-run-result",
