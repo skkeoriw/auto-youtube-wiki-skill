@@ -5688,6 +5688,58 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
     return ctx
 
 
+def write_shell_env_file(path, values):
+    rows = []
+    for key, value in sorted((values or {}).items()):
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(key or "")):
+            continue
+        if is_blank_value(value):
+            continue
+        rows.append(f"export {key}={shlex.quote(str(value))}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(rows).rstrip() + ("\n" if rows else ""), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return len(rows)
+
+
+def node_run_resolved_env_values(sop, plan):
+    context = node_run_config_context({
+        "capability_overrides": (plan or {}).get("capability_overrides") or {},
+    }, sop)
+    values = {}
+    for env_key, aliases in RUNTIME_CAPABILITY_ENV.items():
+        resolved = node_run_config_lookup(context, env_key, aliases)
+        if not is_blank_value(resolved.get("value")):
+            values[env_key] = str(resolved.get("value"))
+
+    telegram = ((plan or {}).get("resolved_config") or {}).get("telegram") or {}
+    token_env = str(telegram.get("token_env") or "YOUTUBE_WIKI_TG_TOKEN")
+    if token_env and token_env != "YOUTUBE_WIKI_TG_TOKEN":
+        token = node_run_config_lookup(context, token_env)
+        if is_blank_value(token.get("value")):
+            token = node_run_config_lookup(context, "YOUTUBE_WIKI_TG_TOKEN", RUNTIME_CAPABILITY_ENV.get("YOUTUBE_WIKI_TG_TOKEN", []))
+        if not is_blank_value(token.get("value")):
+            values[token_env] = str(token.get("value"))
+    return values
+
+
+def node_run_subprocess_env(sop, node_run_id, plan):
+    values = node_run_resolved_env_values(sop, plan)
+    override_file = node_run_workspace(sop, node_run_id) / "runtime.env"
+    written = write_shell_env_file(override_file, values)
+    env = {
+        **os.environ,
+        **values,
+        "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}",
+    }
+    if written:
+        env["YOUTUBE_WIKI_NODE_RUN_ENV_FILE"] = str(override_file)
+    return env
+
+
 def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     workspace = run_workspace(sop, node_run_id)
@@ -5820,7 +5872,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
     timed_out = False
     try:
         context = prepare_real_node_context(sop, node_run_id, node_id, plan)
-        env = {**os.environ, "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"}
+        env = node_run_subprocess_env(sop, node_run_id, plan)
         completed = subprocess.run(
             command,
             cwd=str(wiki),

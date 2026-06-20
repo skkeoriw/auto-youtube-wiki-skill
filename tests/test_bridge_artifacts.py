@@ -1556,6 +1556,25 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(github_request["GITHUB_TOKEN"], "github-instance-token")
         self.assertIn("test-instance:GITHUB_TOKEN:instance", github_request["_instance_config_injected"])
 
+    def test_real_node_subprocess_env_uses_instance_capability_settings(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        bridge.save_capability_config(sop, {
+            "YOUTUBE_WIKI_TG_TOKEN": "telegram-instance-token-secret",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "7796171193",
+        }, scope="instance", node_id="youtube-deep-research")
+        plan = {
+            "capability_overrides": {},
+            "resolved_config": {
+                "telegram": {"token_env": "YOUTUBE_WIKI_TG_TOKEN"},
+            },
+        }
+        with patch.object(bridge, "runtime_info", return_value={"runtime_id": "runtime-test", "id": "runtime-test"}):
+            values = bridge.node_run_resolved_env_values(sop, plan)
+        self.assertEqual(values["YOUTUBE_WIKI_TG_TOKEN"], "telegram-instance-token-secret")
+        self.assertEqual(values["YOUTUBE_WIKI_TG_CHAT_ID"], "7796171193")
+
     def test_setting_registry_exposes_workflow_node_and_capability_tags(self):
         registry = bridge.setting_registry_preview()
         self.assertGreater(registry["registry_total"], 6)
