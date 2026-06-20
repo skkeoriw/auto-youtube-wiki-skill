@@ -1366,6 +1366,9 @@ class ArtifactResolutionTest(unittest.TestCase):
             "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "worker-token-secret",
             "YOUTUBE_WIKI_TG_TOKEN": "telegram-token-secret",
             "YOUTUBE_WIKI_TG_CHAT_ID": "7796171193",
+            "GITHUB_TOKEN": "",
+            "GH_TOKEN": "",
+            "YOUTUBE_WIKI_ENV_FILE": str(self.wiki / "missing.env"),
         }, clear=False):
             code, result = bridge.create_node_run(
                 sop,
@@ -1400,6 +1403,13 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["resolved_config"]["telegram"]["status"], "ready")
         self.assertEqual(detail["resolved_config"]["telegram"]["token"]["masked_value"], "tel***ret")
         self.assertIn(detail["resolved_config"]["youtube_research_worker"]["base_url"]["source"].split(":", 1)[0], {"bridge-env", "runtime-env-file", "node-run-overrides"})
+        env_keys = {item["key"] for item in result["environment_snapshot"]}
+        self.assertIn("YOUTUBE_RESEARCH_WORKFLOW_URL", env_keys)
+        self.assertIn("YOUTUBE_WIKI_TG_TOKEN", env_keys)
+        tg_capability = next(item for item in result["capability_results"] if item["key"] == "telegram")
+        self.assertEqual(tg_capability["status"], "ready")
+        git_capability = next(item for item in result["capability_results"] if item["key"] == "git")
+        self.assertEqual(git_capability["status"], "warning")
         self.assertEqual(len(result["inner_steps"]), 8)
         self.assertEqual(result["inner_steps"][0]["id"], "prepare-request")
 
@@ -1463,6 +1473,10 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["resolved_config"]["github"]["token"]["source"], "runtime-env-file:GITHUB_TOKEN")
         self.assertEqual(detail["config_sources"]["runtime_env_file"], str(env_file))
         self.assertIn("YOUTUBE_RESEARCH_WORKFLOW_URL", detail["config_sources"]["runtime_env_file_keys"])
+        env_by_key = {item["key"]: item for item in result["environment_snapshot"]}
+        self.assertEqual(env_by_key["YOUTUBE_RESEARCH_WORKFLOW_URL"]["source"], "runtime-env-file:YOUTUBE_RESEARCH_WORKFLOW_URL")
+        self.assertEqual(env_by_key["GITHUB_TOKEN"]["capability"], "git")
+        self.assertEqual(next(item for item in result["capability_results"] if item["key"] == "git")["status"], "ready")
 
     def test_real_node_run_executes_youtube_deep_research_wrapper_and_records_outputs(self):
         sop = dict(self.sop)
@@ -1492,7 +1506,7 @@ RUN_ID="$2"
 PIPELINE_ID="${3:-$2}"
 OUT="$WIKI/raw/youtube-deep-research/$PIPELINE_ID"
 RUN_DIR="$WIKI/raw/pipeline-runs/$PIPELINE_ID"
-mkdir -p "$OUT" "$RUN_DIR/nodes"
+mkdir -p "$OUT" "$RUN_DIR/nodes/youtube-deep-research"
 printf '# Analysis\\nreal node output\\n' > "$OUT/analysis.md"
 printf 'transcript output\\n' > "$OUT/transcript.txt"
 python3 - "$WIKI" "$PIPELINE_ID" "$RUN_ID" <<'PY'
@@ -1523,6 +1537,21 @@ run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
         "transcript_file": [f"raw/youtube-deep-research/{pipeline_id}/transcript.txt"],
     },
     "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+}), encoding="utf-8")
+(run_dir / "nodes" / "youtube-deep-research" / "capabilities.json").write_text(json.dumps({
+    "git": {
+        "enabled": True,
+        "required": False,
+        "status": "done",
+        "managed_by": "runtime-harness",
+        "changed_files": [f"raw/youtube-deep-research/{pipeline_id}/analysis.md"],
+    },
+    "telegram": {
+        "enabled": True,
+        "required": False,
+        "status": "failed",
+        "error": "Forbidden: bot can't initiate conversation with a user",
+    },
 }), encoding="utf-8")
 PY
 """,
@@ -1562,6 +1591,12 @@ PY
         )
         self.assertTrue((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "executor.log").exists())
         self.assertTrue(any(item["type"] == "research.analysis" for item in result["business_artifacts"]))
+        capability_by_key = {item["key"]: item for item in result["capability_results"]}
+        self.assertEqual(capability_by_key["git"]["status"], "done")
+        self.assertEqual(capability_by_key["git"]["managed_by"], "runtime-harness")
+        self.assertEqual(capability_by_key["telegram"]["status"], "failed")
+        self.assertIn("bot can't initiate conversation", capability_by_key["telegram"]["reason"])
+        self.assertTrue(any("bot can't initiate conversation" in issue["message"] for issue in result["issues"]))
 
     def test_node_run_routes_create_and_read_shareable_id(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)

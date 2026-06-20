@@ -4329,7 +4329,7 @@ def resolve_youtube_research_worker_config(node_id, context):
 def resolve_git_config(_sop, context):
     token = node_run_config_lookup(context, "GITHUB_TOKEN", ["GH_TOKEN", *RUNTIME_CAPABILITY_ENV.get("GITHUB_TOKEN", [])])
     return {
-        "capability": "github",
+        "capability": "git",
         "label": "GitHub workspace persistence",
         "enabled": True,
         "required": False,
@@ -4383,6 +4383,163 @@ def node_run_fix_suggestions(configs, missing_inputs):
             "action": "Update Runtime Settings or the runtime env file before running a node that writes artifacts.",
         })
     return suggestions
+
+
+def node_run_environment_snapshot(plan):
+    configs = plan.get("resolved_config") or {}
+    rows = []
+    seen = set()
+
+    def add_item(capability, parent_status, item):
+        if not isinstance(item, dict) or "key" not in item:
+            return
+        key = str(item.get("key") or "")
+        if not key:
+            return
+        source = str(item.get("source") or "")
+        row_id = f"{capability}:{key}:{source}"
+        if row_id in seen:
+            return
+        seen.add(row_id)
+        present = bool(item.get("present", not is_blank_value(item.get("value"))))
+        raw_display = item.get("masked_value")
+        if is_blank_value(raw_display):
+            raw_display = display_config_value(key, item.get("value")) if present else ""
+        rows.append({
+            "id": row_id,
+            "capability": capability,
+            "key": key,
+            "label": item.get("label") or key,
+            "source": source or ("missing:" + key if not present else "unknown"),
+            "source_kind": (source.split(":", 1)[0] if source else ("missing" if not present else "unknown")),
+            "present": present,
+            "required": bool(item.get("required", False)),
+            "secret": is_secret_key(key),
+            "value": raw_display if present else "",
+            "status": parent_status or ("ready" if present else "missing"),
+            "unit": item.get("unit") or "",
+            "category": RUNTIME_CONFIG_CATEGORIES.get(key, capability),
+        })
+
+    def walk(capability, parent_status, value):
+        if isinstance(value, dict):
+            add_item(capability, parent_status, value)
+            for child in value.values():
+                walk(capability, parent_status, child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(capability, parent_status, child)
+
+    for capability, config in configs.items():
+        config = config if isinstance(config, dict) else {}
+        capability_name = str(config.get("capability") or capability)
+        if capability_name == "github":
+            capability_name = "git"
+        walk(capability_name, str(config.get("status") or ""), config)
+    return rows
+
+
+def node_run_capability_results(plan, real_execution=None):
+    real_execution = real_execution if isinstance(real_execution, dict) else {}
+    def normalize_capability_map(value):
+        result = {}
+        source = value if isinstance(value, dict) else {}
+        for raw_key, raw_item in source.items():
+            item = raw_item if isinstance(raw_item, dict) else {}
+            key = str(item.get("capability") or raw_key)
+            if key == "github":
+                key = "git"
+            result[key] = {**item, "_source_key": raw_key}
+        return result
+
+    real_caps = normalize_capability_map(real_execution.get("capabilities"))
+    probes = normalize_capability_map(plan.get("capability_probes"))
+    configs = normalize_capability_map(plan.get("resolved_config"))
+    rows = []
+    for key in sorted(set(real_caps) | set(probes) | set(configs)):
+        runtime = real_caps.get(key) if isinstance(real_caps.get(key), dict) else {}
+        probe = probes.get(key) if isinstance(probes.get(key), dict) else {}
+        config = configs.get(key) if isinstance(configs.get(key), dict) else {}
+        detail = runtime or probe or config
+        status = str(runtime.get("status") or probe.get("status") or config.get("status") or "unknown")
+        reason = str(
+            runtime.get("error")
+            or runtime.get("reason")
+            or runtime.get("message")
+            or config.get("reason")
+            or ""
+        )
+        rows.append({
+            "key": key,
+            "capability": runtime.get("capability") or probe.get("capability") or config.get("capability") or key,
+            "label": runtime.get("label") or probe.get("label") or config.get("label") or key.replace("_", " "),
+            "status": status,
+            "enabled": bool(runtime.get("enabled", probe.get("enabled", config.get("enabled", True)))),
+            "required": bool(runtime.get("required", probe.get("required", config.get("required", False)))),
+            "source": "runtime-result" if runtime else "config-resolution",
+            "reason": reason,
+            "managed_by": runtime.get("managed_by") or config.get("managed_by") or "",
+            "detail": mask_data(detail),
+        })
+    return rows
+
+
+def node_run_issue_rows(plan, capability_results):
+    issues = []
+    seen = set()
+
+    def add_issue(issue):
+        issue_id = str(issue.get("id") or f"{issue.get('target', 'issue')}:{issue.get('title', '')}")
+        if issue_id in seen:
+            return
+        seen.add(issue_id)
+        issues.append({**issue, "id": issue_id})
+
+    for item in plan.get("fix_suggestions") or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "Suggested fix")
+        target = str(item.get("target") or "configuration")
+        severity = "error" if any(word in title.lower() for word in ("fix", "missing", "failed")) else "warning"
+        add_issue({
+            "target": target,
+            "severity": severity,
+            "title": title,
+            "message": str(item.get("reason") or ""),
+            "action": str(item.get("action") or ""),
+            "source": "config-resolution",
+            "related_capability": "",
+            "related_config_keys": [],
+        })
+
+    env_by_capability = {}
+    for item in node_run_environment_snapshot(plan):
+        env_by_capability.setdefault(item.get("capability"), []).append(item.get("key"))
+
+    target_by_capability = {
+        "telegram": "instance-settings",
+        "github": "runtime-settings",
+        "git": "runtime-settings",
+        "youtube-research-worker": "runtime-settings",
+        "youtube_research_worker": "runtime-settings",
+    }
+    for row in capability_results:
+        status = str(row.get("status") or "")
+        if status not in {"failed", "warning", "blocked", "needs_input"}:
+            continue
+        capability = str(row.get("key") or row.get("capability") or "")
+        target = target_by_capability.get(capability, "runtime-settings")
+        add_issue({
+            "target": target,
+            "severity": "error" if status in {"failed", "blocked", "needs_input"} else "warning",
+            "title": f"{row.get('label') or capability} needs attention",
+            "message": str(row.get("reason") or f"Capability status is {status}."),
+            "action": "Review the resolved configuration for this capability, update the owning Runtime or Instance settings, then retry this Node Run.",
+            "source": str(row.get("source") or "runtime-result"),
+            "related_capability": capability,
+            "related_config_keys": sorted(set(env_by_capability.get(capability, []))),
+        })
+    return issues
 
 
 def build_node_run_plan(sop, workflow_id, node_id, body=None):
@@ -4969,6 +5126,9 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
     reason = ""
     if status in {"failed", "blocked", "needs_input", "warning"}:
         reason = next((step.get("summary") for step in steps if step.get("status") in {"failed", "blocked", "needs_input", "warning"}), "")
+    environment_snapshot = node_run_environment_snapshot(plan)
+    capability_results = node_run_capability_results(plan, real_execution)
+    issues = node_run_issue_rows(plan, capability_results)
     return {
         "node_run_id": node_run_id,
         "pipeline_id": node_run_id,
@@ -4995,6 +5155,9 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "validation": (real_execution or {}).get("validation") or {},
         "capabilities": (real_execution or {}).get("capabilities") or {},
         "business_artifacts": (real_execution or {}).get("artifacts") or [],
+        "environment_snapshot": environment_snapshot,
+        "capability_results": capability_results,
+        "issues": issues,
         "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
     }
 
