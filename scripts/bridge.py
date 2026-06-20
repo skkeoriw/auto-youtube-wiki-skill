@@ -4677,12 +4677,12 @@ def resolve_telegram_config(sop, node_id, static, context):
     notify = definition.get("notify") if isinstance(definition.get("notify"), dict) else {}
     telegram = notify.get("telegram") if isinstance(notify.get("telegram"), dict) else {}
     token_env = str(telegram.get("token_env") or "YOUTUBE_WIKI_TG_TOKEN")
-    chat_id = telegram.get("chat_id")
-    chat_source = "instance-sop:notify.telegram.chat_id" if not is_blank_value(chat_id) else "runtime-env:YOUTUBE_WIKI_TG_CHAT_ID"
-    if is_blank_value(chat_id):
-        chat = node_run_config_lookup(context, "YOUTUBE_WIKI_TG_CHAT_ID", RUNTIME_CAPABILITY_ENV.get("YOUTUBE_WIKI_TG_CHAT_ID", []))
-        chat_id = chat.get("value")
-        chat_source = chat.get("source") or "missing:YOUTUBE_WIKI_TG_CHAT_ID"
+    chat = node_run_config_lookup(context, "YOUTUBE_WIKI_TG_CHAT_ID", RUNTIME_CAPABILITY_ENV.get("YOUTUBE_WIKI_TG_CHAT_ID", []))
+    chat_id = chat.get("value")
+    chat_source = chat.get("source") or "missing:YOUTUBE_WIKI_TG_CHAT_ID"
+    if is_blank_value(chat_id) and not is_blank_value(telegram.get("chat_id")):
+        chat_id = telegram.get("chat_id")
+        chat_source = "instance-sop:notify.telegram.chat_id"
     token = node_run_config_lookup(context, token_env)
     capabilities = (node_registry_item(sop, node_id) or {}).get("capabilities") or {}
     tg_cap = capabilities.get("telegram") if isinstance(capabilities.get("telegram"), dict) else {}
