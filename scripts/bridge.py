@@ -731,6 +731,231 @@ def read_runtime_management_config_values():
     return read_runtime_management_config().get("values", {})
 
 
+CAPABILITY_CONFIG_FIELDS = [
+    {
+        "key": "GITHUB_TOKEN",
+        "label": "GitHub Token",
+        "capability": "git",
+        "required": False,
+        "scopes": ["run", "instance", "runtime", "global"],
+    },
+    {
+        "key": "YOUTUBE_WIKI_TG_TOKEN",
+        "label": "Telegram Bot Token",
+        "capability": "telegram",
+        "required": False,
+        "scopes": ["run", "instance", "runtime", "global"],
+    },
+    {
+        "key": "YOUTUBE_WIKI_TG_CHAT_ID",
+        "label": "Telegram Chat ID",
+        "capability": "telegram",
+        "required": False,
+        "scopes": ["run", "instance", "runtime", "global"],
+    },
+    {
+        "key": "YOUTUBE_RESEARCH_WORKFLOW_URL",
+        "label": "YouTube Research Worker URL",
+        "capability": "youtube-research-worker",
+        "required": True,
+        "scopes": ["run", "instance", "runtime", "global"],
+    },
+    {
+        "key": "YOUTUBE_RESEARCH_WORKFLOW_TOKEN",
+        "label": "YouTube Research Worker Token",
+        "capability": "youtube-research-worker",
+        "required": True,
+        "scopes": ["run", "instance", "runtime", "global"],
+    },
+    {
+        "key": "YOUTUBE_CONTENT_API_TOKEN",
+        "label": "YouTube Content API Token",
+        "capability": "youtube-research-worker",
+        "required": False,
+        "scopes": ["run", "instance", "runtime", "global"],
+    },
+]
+
+
+def canonical_runtime_setting_key(key):
+    raw = str(key or "").strip()
+    return runtime_settings_alias_map().get(raw, runtime_settings_alias_map().get(raw.lower(), raw))
+
+
+def scoped_runtime_setting_key(scope, runtime_id, instance_id, key):
+    canonical = canonical_runtime_setting_key(key)
+    scope = str(scope or "global").strip()
+    runtime_id = str(runtime_id or "").strip()
+    instance_id = str(instance_id or "").strip()
+    if scope == "instance":
+        return f"instance:{runtime_id}:{instance_id}:{canonical}"
+    if scope == "runtime":
+        return f"runtime:{runtime_id}:{canonical}"
+    return canonical
+
+
+def scoped_runtime_setting_values(values, scope, runtime_id, instance_id=""):
+    prefix = ""
+    if scope == "instance":
+        prefix = f"instance:{runtime_id}:{instance_id}:"
+    elif scope == "runtime":
+        prefix = f"runtime:{runtime_id}:"
+    result = {}
+    if not prefix:
+        for key, value in (values or {}).items():
+            if ":" not in str(key):
+                result[canonical_runtime_setting_key(key)] = value
+        return result
+    for key, value in (values or {}).items():
+        text = str(key)
+        if text.startswith(prefix):
+            result[canonical_runtime_setting_key(text[len(prefix):])] = value
+    return result
+
+
+def capability_config_fields_for_node(_sop, _node_id=""):
+    return [dict(item) for item in CAPABILITY_CONFIG_FIELDS]
+
+
+def capability_config_resolution(sop, node_id="", run_overrides=None):
+    run_overrides = normalize_runtime_settings_values(run_overrides or {})
+    runtime = runtime_info()
+    runtime_id = str(sop.get("runtime_id") or runtime.get("runtime_id") or "")
+    instance_id = str(sop.get("instance_id") or sop.get("id") or "")
+    env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
+    env_file_values = normalize_runtime_settings_values(read_env_file_values(env_file))
+    bridge_env_values = normalize_runtime_settings_values(os.environ)
+    settings = read_runtime_management_config()
+    all_values = settings.get("values", {})
+    global_values = scoped_runtime_setting_values(all_values, "global", runtime_id, instance_id)
+    runtime_values = scoped_runtime_setting_values(all_values, "runtime", runtime_id, instance_id)
+    instance_values = scoped_runtime_setting_values(all_values, "instance", runtime_id, instance_id)
+    sources = [
+        ("node-run-overrides", run_overrides),
+        ("instance-settings", instance_values),
+        ("runtime-settings", runtime_values),
+        ("global-settings", global_values),
+        ("runtime-env-file", env_file_values),
+        ("bridge-env", bridge_env_values),
+    ]
+    fields = capability_config_fields_for_node(sop, node_id)
+    items = []
+    for field in fields:
+        key = canonical_runtime_setting_key(field.get("key"))
+        aliases = RUNTIME_CAPABILITY_ENV.get(key, [])
+        candidates = [key, *aliases]
+        resolved_value = ""
+        resolved_source = "missing"
+        matched_key = key
+        scope_values = {}
+        for scope_name, values in [
+            ("run", run_overrides),
+            ("instance", instance_values),
+            ("runtime", runtime_values),
+            ("global", global_values),
+            ("runtime_env_file", env_file_values),
+            ("bridge_env", bridge_env_values),
+        ]:
+            scope_raw = ""
+            scope_key = key
+            for candidate in candidates:
+                if not is_blank_value(values.get(candidate)):
+                    scope_raw = str(values.get(candidate))
+                    scope_key = candidate
+                    break
+            scope_values[scope_name] = {
+                "present": bool(scope_raw),
+                "matched_key": scope_key if scope_raw else "",
+                "masked_value": display_config_value(key, scope_raw) if scope_raw else "",
+                "secret": is_secret_key(key),
+            }
+        for source_name, values in sources:
+            for candidate in candidates:
+                value = values.get(candidate)
+                if not is_blank_value(value):
+                    resolved_value = str(value)
+                    resolved_source = f"{source_name}:{candidate}"
+                    matched_key = candidate
+                    break
+            if resolved_value:
+                break
+        present = bool(resolved_value)
+        items.append({
+            "key": key,
+            "aliases": aliases,
+            "label": field.get("label") or key,
+            "capability": field.get("capability") or RUNTIME_CONFIG_CATEGORIES.get(key, "runtime"),
+            "category": RUNTIME_CONFIG_CATEGORIES.get(key, field.get("capability") or "runtime"),
+            "required": bool(field.get("required", False)),
+            "secret": is_secret_key(key),
+            "editable_scopes": field.get("scopes") or ["run", "instance", "runtime", "global"],
+            "matched_key": matched_key if present else "",
+            "source": resolved_source,
+            "source_kind": resolved_source.split(":", 1)[0] if resolved_source else "missing",
+            "present": present,
+            "masked_value": display_config_value(key, resolved_value) if present else "",
+            "values_by_scope": scope_values,
+        })
+    groups = runtime_config_group_status(items)
+    return {
+        "runtime_id": runtime_id,
+        "instance_id": instance_id,
+        "node_id": node_id,
+        "backend": settings.get("backend", runtime_settings_backend()),
+        "updated_at": settings.get("updated_at", ""),
+        "env_file": str(Path(env_file).expanduser()),
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env"],
+        "items": items,
+        "groups": groups,
+        "scopes": {
+            "run": "Only this Node Run request; not persisted.",
+            "instance": "Saved for this Runtime + Instance in the settings backend.",
+            "runtime": "Saved for this Runtime in the settings backend.",
+            "global": "Saved as the global default in the settings backend.",
+        },
+        "note": "Secret values are masked. Submit a new value to override the selected scope.",
+    }
+
+
+def save_capability_config(sop, values, scope="instance", node_id=""):
+    scope = str(scope or "instance").strip()
+    if scope not in {"instance", "runtime", "global"}:
+        raise ValueError("scope must be instance, runtime or global")
+    runtime = runtime_info()
+    runtime_id = str(sop.get("runtime_id") or runtime.get("runtime_id") or "")
+    instance_id = str(sop.get("instance_id") or sop.get("id") or "")
+    allowed = {field["key"] for field in capability_config_fields_for_node(sop, node_id)}
+    changed = {}
+    current = normalize_runtime_settings_values(read_runtime_management_config_values())
+    for key, value in (values or {}).items():
+        canonical = canonical_runtime_setting_key(key)
+        if canonical not in allowed:
+            continue
+        text = str(value or "").strip()
+        if not text:
+            continue
+        scoped_key = scoped_runtime_setting_key(scope, runtime_id, instance_id, canonical)
+        current[scoped_key] = text
+        changed[scoped_key] = text
+    if not changed:
+        return {"status": "unchanged", "changed_keys": [], "scope": scope, "config": capability_config_resolution(sop, node_id)}
+    payload = {"values": current, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if runtime_settings_backend() == "d1":
+        try:
+            runtime_settings_d1_save(changed, updated_by=f"{scope}-capability-config-save")
+            payload = runtime_settings_save_to_file(current, payload["updated_at"])
+        except Exception:
+            write_json(RUNTIME_MANAGEMENT_CONFIG_PATH, payload, mode=0o600)
+    else:
+        write_json(RUNTIME_MANAGEMENT_CONFIG_PATH, payload, mode=0o600)
+    return {
+        "status": "saved",
+        "scope": scope,
+        "changed_keys": sorted(changed.keys()),
+        "config": capability_config_resolution(sop, node_id),
+    }
+
+
 def runtime_management_config_preview(sop):
     data = read_runtime_management_config()
     values = data.get("values", {})
@@ -4171,17 +4396,26 @@ def env_config_item(key, label="", required=False, default_value=None, value=Non
     }
 
 
-def node_run_config_context(body=None):
+def node_run_config_context(body=None, sop=None):
     body = body if isinstance(body, dict) else {}
     overrides = body.get("overrides") if isinstance(body.get("overrides"), dict) else {}
     capability_overrides = body.get("capability_overrides") if isinstance(body.get("capability_overrides"), dict) else {}
     env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
+    settings = read_runtime_management_config()
+    values = settings.get("values", {})
+    runtime = runtime_info()
+    runtime_id = str((sop or {}).get("runtime_id") or runtime.get("runtime_id") or "")
+    instance_id = str((sop or {}).get("instance_id") or (sop or {}).get("id") or "")
     return {
-        "overrides": {str(k): str(v) for k, v in overrides.items() if not is_blank_value(v)},
+        "overrides": normalize_runtime_settings_values({str(k): str(v) for k, v in overrides.items() if not is_blank_value(v)}),
         "capability_overrides": capability_overrides,
+        "instance_settings_values": scoped_runtime_setting_values(values, "instance", runtime_id, instance_id),
+        "runtime_settings_values": scoped_runtime_setting_values(values, "runtime", runtime_id, instance_id),
+        "global_settings_values": scoped_runtime_setting_values(values, "global", runtime_id, instance_id),
+        "settings_backend": settings.get("backend", runtime_settings_backend()),
         "runtime_env_file": str(Path(env_file).expanduser()),
-        "runtime_env_file_values": read_env_file_values(env_file),
-        "bridge_env": os.environ,
+        "runtime_env_file_values": normalize_runtime_settings_values(read_env_file_values(env_file)),
+        "bridge_env": normalize_runtime_settings_values(os.environ),
     }
 
 
@@ -4190,6 +4424,9 @@ def node_run_config_lookup(context, key, aliases=None):
     candidates = [key, *aliases]
     sources = [
         ("node-run-overrides", context.get("overrides") or {}),
+        ("instance-settings", context.get("instance_settings_values") or {}),
+        ("runtime-settings", context.get("runtime_settings_values") or {}),
+        ("global-settings", context.get("global_settings_values") or {}),
         ("runtime-env-file", context.get("runtime_env_file_values") or {}),
         ("bridge-env", context.get("bridge_env") or {}),
     ]
@@ -4416,7 +4653,11 @@ def node_run_config_source_summary(context):
         "runtime_env_file_keys": sorted(k for k in env_file_values if k in RUNTIME_CAPABILITY_ENV or k in RUNTIME_CONFIG_CATEGORIES),
         "node_run_override_keys": sorted(overrides.keys()),
         "capability_override_keys": sorted(capability_overrides.keys()),
-        "precedence": ["node-run-overrides", "runtime-env-file", "bridge-env", "defaults"],
+        "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
+        "instance_settings_keys": sorted((context.get("instance_settings_values") or {}).keys()),
+        "runtime_settings_keys": sorted((context.get("runtime_settings_values") or {}).keys()),
+        "global_settings_keys": sorted((context.get("global_settings_values") or {}).keys()),
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env", "defaults"],
     }
 
 
@@ -4792,7 +5033,7 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
     runtime = runtime_info()
     capability_overrides = normalize_node_run_capability_overrides(sop, node_id, body)
     body = {**body, "capability_overrides": capability_overrides}
-    config_context = node_run_config_context(body)
+    config_context = node_run_config_context(body, sop)
     configs = node_run_config_summary(sop, node_id, static, config_context)
     return {
         **test_plan,
@@ -6191,6 +6432,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
                         return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
                     return json_response(self, 200, runtime_management_config_preview(sop))
+                if len(path) == 5 and path[3] == "config" and path[4] == "capabilities":
+                    node_id = str((query.get("node_id") or [""])[0] or "")
+                    return json_response(self, 200, capability_config_resolution(sop, node_id))
+                if len(path) == 7 and path[3] == "nodes" and path[5] == "config" and path[6] == "capabilities":
+                    if node_registry_item(sop, path[4]) is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    return json_response(self, 200, capability_config_resolution(sop, path[4]))
                 if len(path) == 4 and path[3] == "dag":
                     return json_response(self, 200, sop_dag(sop))
                 if len(path) == 4 and path[3] == "runs":
@@ -6599,6 +6847,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "changed_keys": sorted(changed.keys()),
                 "config": runtime_management_config_preview(sop),
             })
+
+        # POST /api/sop/{instance}/config/capabilities  → save scoped capability config
+        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "config" and path[4] == "capabilities":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            values = data.get("values") if isinstance(data.get("values"), dict) else {}
+            scope = str(data.get("scope") or "instance")
+            node_id = str(data.get("node_id") or "")
+            try:
+                result = save_capability_config(sop, values, scope=scope, node_id=node_id)
+            except ValueError as exc:
+                return json_response(self, 400, {"detail": str(exc)})
+            return json_response(self, 200, result)
+
+        # POST /api/sop/{instance}/nodes/{node_id}/config/capabilities  → save scoped capability config for a node context
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "nodes" and path[5] == "config" and path[6] == "capabilities"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            if node_registry_item(sop, path[4]) is None:
+                return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+            values = data.get("values") if isinstance(data.get("values"), dict) else {}
+            scope = str(data.get("scope") or "instance")
+            try:
+                result = save_capability_config(sop, values, scope=scope, node_id=path[4])
+            except ValueError as exc:
+                return json_response(self, 400, {"detail": str(exc)})
+            return json_response(self, 200, result)
 
         # POST /api/sop/{instance}/runs  → trigger
         if len(path) == 4 and path[:2] == ["api", "sop"] and path[3] == "runs":

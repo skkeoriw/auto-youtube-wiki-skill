@@ -26,6 +26,9 @@ class ArtifactResolutionTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.wiki = Path(self.temp.name)
+        self.original_runtime_management_config_path = bridge.RUNTIME_MANAGEMENT_CONFIG_PATH
+        bridge.RUNTIME_MANAGEMENT_CONFIG_PATH = self.wiki / "runtime-management-config.json"
+        self.addCleanup(lambda: setattr(bridge, "RUNTIME_MANAGEMENT_CONFIG_PATH", self.original_runtime_management_config_path))
         (self.wiki / "raw/pipeline-runs/pipe-1/nodes").mkdir(parents=True)
         (self.wiki / "raw/notebooklm-analysis").mkdir(parents=True)
         (self.wiki / "wiki/entities").mkdir(parents=True)
@@ -1479,6 +1482,50 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(env_by_key["YOUTUBE_RESEARCH_WORKFLOW_URL"]["source"], "runtime-env-file:YOUTUBE_RESEARCH_WORKFLOW_URL")
         self.assertEqual(env_by_key["GITHUB_TOKEN"]["capability"], "git")
         self.assertEqual(next(item for item in result["capability_results"] if item["key"] == "git")["status"], "ready")
+
+    def test_node_run_prefers_instance_capability_settings_over_env_file(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "needs": ["youtube-fetch"],
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/analysis.md"},
+            "infra": {"tg_notify": True, "log_record": True},
+        }
+        env_file = self.wiki / ".agent-brain-plugins.env"
+        env_file.write_text(
+            "YOUTUBE_WIKI_TG_TOKEN=telegram-file-token-secret\n"
+            "YOUTUBE_WIKI_TG_CHAT_ID=7796171193\n",
+            encoding="utf-8",
+        )
+        saved = bridge.save_capability_config(sop, {
+            "YOUTUBE_WIKI_TG_TOKEN": "telegram-instance-token-secret",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "1234567890",
+        }, scope="instance", node_id="youtube-deep-research")
+        self.assertEqual(saved["status"], "saved")
+        with patch.dict(os.environ, {
+            "YOUTUBE_WIKI_ENV_FILE": str(env_file),
+            "YOUTUBE_WIKI_TG_TOKEN": "",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "",
+        }, clear=False):
+            code, result = bridge.create_node_run(
+                sop,
+                "test",
+                "youtube-deep-research",
+                {"mode": "probe", "input_source": "generated-fixture"},
+            )
+        self.assertEqual(code, 200)
+        telegram = result["detail"]["resolved_config"]["telegram"]
+        self.assertEqual(telegram["token"]["source"], "instance-settings:YOUTUBE_WIKI_TG_TOKEN")
+        self.assertEqual(telegram["chat_id"]["source"], "instance-settings:YOUTUBE_WIKI_TG_CHAT_ID")
+        preview = bridge.capability_config_resolution(sop, "youtube-deep-research")
+        token_item = next(item for item in preview["items"] if item["key"] == "YOUTUBE_WIKI_TG_TOKEN")
+        self.assertTrue(token_item["values_by_scope"]["instance"]["present"])
 
     def test_real_node_run_executes_youtube_deep_research_wrapper_and_records_outputs(self):
         sop = dict(self.sop)
