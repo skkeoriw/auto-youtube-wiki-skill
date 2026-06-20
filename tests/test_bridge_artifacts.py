@@ -1527,6 +1527,35 @@ class ArtifactResolutionTest(unittest.TestCase):
         token_item = next(item for item in preview["items"] if item["key"] == "YOUTUBE_WIKI_TG_TOKEN")
         self.assertTrue(token_item["values_by_scope"]["instance"]["present"])
 
+    def test_instance_health_node_test_injects_instance_capability_settings(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        bridge.save_capability_config(sop, {
+            "GITHUB_TOKEN": "github-instance-token",
+            "YOUTUBE_WIKI_TG_TOKEN": "telegram-instance-token-secret",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "7796171193",
+        }, scope="instance")
+
+        request = {
+            "runtime_id": "runtime-test",
+            "instances": [{
+                "instance_id": "test-instance",
+                "repo": "skkeoriw/wiki-sop-new-instance",
+                "workspace_kind": "execution-workspace",
+            }],
+        }
+        with patch.object(bridge, "runtime_info", return_value={"runtime_id": "runtime-test", "id": "runtime-test"}):
+            telegram_request = bridge.inject_node_test_instance_config(request, "test-instance-telegram")
+            github_request = bridge.inject_node_test_instance_config(request, "test-instance-github")
+
+        telegram = telegram_request["instances"][0]["telegram"]
+        self.assertEqual(telegram["token"], "telegram-instance-token-secret")
+        self.assertEqual(telegram["chat_id"], "7796171193")
+        self.assertIn("test-instance:YOUTUBE_WIKI_TG_TOKEN:instance", telegram_request["_instance_config_injected"])
+        self.assertEqual(github_request["GITHUB_TOKEN"], "github-instance-token")
+        self.assertIn("test-instance:GITHUB_TOKEN:instance", github_request["_instance_config_injected"])
+
     def test_setting_registry_exposes_workflow_node_and_capability_tags(self):
         registry = bridge.setting_registry_preview()
         self.assertGreater(registry["registry_total"], 6)

@@ -1450,6 +1450,85 @@ def inject_runtime_management_config(body):
     return merged
 
 
+def scoped_runtime_config_value(values, runtime_id, instance_id, env_key, aliases=None):
+    aliases = aliases or []
+    candidates = [env_key, *aliases]
+    for scope in ["instance", "runtime", "global"]:
+        scoped = scoped_runtime_setting_values(values, scope, runtime_id, instance_id)
+        for candidate in candidates:
+            value = scoped.get(candidate)
+            if not is_blank_value(value):
+                return str(value), scope, candidate
+    return "", "", ""
+
+
+def request_has_any_value(source, keys):
+    if not isinstance(source, dict):
+        return False
+    return any(not is_blank_value(source.get(key)) for key in keys)
+
+
+def inject_node_test_instance_config(body, node_id):
+    if node_id not in {"test-instance-github", "test-instance-telegram"}:
+        return body
+    values = read_runtime_management_config_values()
+    if not values:
+        return body
+    merged = {**(body if isinstance(body, dict) else {})}
+    runtime = runtime_info()
+    runtime_id = str(merged.get("runtime_id") or runtime.get("runtime_id") or runtime.get("id") or "")
+    instances = merged.get("instances") if isinstance(merged.get("instances"), list) else []
+    if not instances:
+        target_id = str(merged.get("instance_id") or merged.get("target_instance_id") or "").strip()
+        if target_id:
+            instances = [{"instance_id": target_id, "repo": merged.get("repo") or merged.get("instance_repo") or ""}]
+    if not instances:
+        return merged
+
+    injected = list(merged.get("_instance_config_injected") or [])
+    normalized_instances = []
+    for raw_instance in instances:
+        instance = dict(raw_instance) if isinstance(raw_instance, dict) else {"instance_id": str(raw_instance or "")}
+        instance_id = str(instance.get("instance_id") or instance.get("id") or merged.get("instance_id") or "").strip()
+        if not instance_id:
+            normalized_instances.append(instance)
+            continue
+
+        if node_id == "test-instance-telegram":
+            telegram = dict(instance.get("telegram") if isinstance(instance.get("telegram"), dict) else {})
+            token_keys = ["token", "bot_token", "telegram_token", "telegram_bot_token", "tg_token", "youtube_wiki_tg_token", "instance_telegram_token", "instance_tg_token"]
+            chat_keys = ["chat_id", "telegram_chat_id", "tg_chat_id", "youtube_wiki_tg_chat_id", "instance_telegram_chat_id", "instance_tg_chat_id"]
+            token, token_scope, _token_key = scoped_runtime_config_value(
+                values, runtime_id, instance_id, "YOUTUBE_WIKI_TG_TOKEN", RUNTIME_CAPABILITY_ENV["YOUTUBE_WIKI_TG_TOKEN"]
+            )
+            chat_id, chat_scope, _chat_key = scoped_runtime_config_value(
+                values, runtime_id, instance_id, "YOUTUBE_WIKI_TG_CHAT_ID", RUNTIME_CAPABILITY_ENV["YOUTUBE_WIKI_TG_CHAT_ID"]
+            )
+            if token and not request_has_any_value(telegram, token_keys) and not request_has_any_value(instance, token_keys):
+                telegram["token"] = token
+                injected.append(f"{instance_id}:YOUTUBE_WIKI_TG_TOKEN:{token_scope}")
+            if chat_id and not request_has_any_value(telegram, chat_keys) and not request_has_any_value(instance, chat_keys):
+                telegram["chat_id"] = chat_id
+                injected.append(f"{instance_id}:YOUTUBE_WIKI_TG_CHAT_ID:{chat_scope}")
+            if telegram:
+                instance["telegram"] = telegram
+
+        if node_id == "test-instance-github":
+            github_token, github_scope, _github_key = scoped_runtime_config_value(
+                values, runtime_id, instance_id, "GITHUB_TOKEN", RUNTIME_CAPABILITY_ENV["GITHUB_TOKEN"]
+            )
+            if github_token and not request_has_runtime_config(merged, "GITHUB_TOKEN", RUNTIME_CAPABILITY_ENV["GITHUB_TOKEN"]):
+                merged["GITHUB_TOKEN"] = github_token
+                injected.append(f"{instance_id}:GITHUB_TOKEN:{github_scope}")
+
+        normalized_instances.append(instance)
+
+    merged["instances"] = normalized_instances
+    if injected:
+        merged["_instance_config_injected"] = sorted(set(injected))
+    return merged
+
+
 def run_workspace(sop, pipeline_id):
     return Path(sop["wiki_local_path"]) / "raw" / "pipeline-runs" / pipeline_id
 
@@ -6223,7 +6302,11 @@ def trigger_node_test(sop, node_id, body):
                  or contract.get("branch") or "create-runtime")
     if action not in RUNTIME_MANAGEMENT_ACTIONS:
         action = "create-runtime"
-    request_body = inject_runtime_management_config({**base, **overrides, "management_action": action, "action": action})
+    request_body = inject_node_test_instance_config(
+        {**base, **overrides, "management_action": action, "action": action},
+        node_id,
+    )
+    request_body = inject_runtime_management_config(request_body)
 
     now_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     pipeline_id = f"nodetest-{node_id}-{now_token}"
