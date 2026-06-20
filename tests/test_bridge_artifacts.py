@@ -1395,6 +1395,8 @@ class ArtifactResolutionTest(unittest.TestCase):
             "build-execution-plan",
             "execute-or-dry-run",
             "validate-outputs",
+            "persist-to-github",
+            "send-telegram-notification",
             "persist-artifacts",
         ])
         detail = result["detail"]

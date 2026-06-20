@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 import urllib.error
 import urllib.request
 
@@ -1781,6 +1781,19 @@ def node_registry_item(sop, node_id, endpoint=""):
     instance_id = sop.get("id") or sop.get("name") or ""
     manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
     manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
+    node_caps = config.get("capabilities") if isinstance(config.get("capabilities"), dict) else {}
+    git_caps = {
+        "enabled": True,
+        "required": False,
+        **(manifest_caps.get("git") if isinstance(manifest_caps.get("git"), dict) else {}),
+        **(node_caps.get("git") if isinstance(node_caps.get("git"), dict) else {}),
+    }
+    telegram_caps = {
+        "enabled": (static.get("infra") or {}).get("tg_notify", True),
+        "required": False,
+        **(manifest_caps.get("telegram") if isinstance(manifest_caps.get("telegram"), dict) else {}),
+        **(node_caps.get("telegram") if isinstance(node_caps.get("telegram"), dict) else {}),
+    }
     return {
         **static,
         "description": static.get("purpose") or manifest.get("description", ""),
@@ -1799,8 +1812,8 @@ def node_registry_item(sop, node_id, endpoint=""):
         "optional_inputs": normalize_contract(static.get("optional_inputs", {}), "input"),
         "outputs": normalize_contract(static.get("outputs", {}), "output"),
         "capabilities": {
-            "git": manifest_caps.get("git", {"enabled": True, "required": False}),
-            "telegram": manifest_caps.get("telegram", {"enabled": (static.get("infra") or {}).get("tg_notify", True), "required": False}),
+            "git": git_caps,
+            "telegram": telegram_caps,
             "sse": {"enabled": True, "required": True},
         },
         "actions": node_actions(instance_id, node_id, node_classification_for(node_id)),
@@ -4161,9 +4174,11 @@ def env_config_item(key, label="", required=False, default_value=None, value=Non
 def node_run_config_context(body=None):
     body = body if isinstance(body, dict) else {}
     overrides = body.get("overrides") if isinstance(body.get("overrides"), dict) else {}
+    capability_overrides = body.get("capability_overrides") if isinstance(body.get("capability_overrides"), dict) else {}
     env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
     return {
         "overrides": {str(k): str(v) for k, v in overrides.items() if not is_blank_value(v)},
+        "capability_overrides": capability_overrides,
         "runtime_env_file": str(Path(env_file).expanduser()),
         "runtime_env_file_values": read_env_file_values(env_file),
         "bridge_env": os.environ,
@@ -4188,6 +4203,179 @@ def node_run_config_lookup(context, key, aliases=None):
                     "source": f"{source_name}:{candidate}",
                 }
     return {"key": key, "value": "", "source": f"missing:{key}"}
+
+
+def node_capability_defaults(sop, node_id):
+    item = node_registry_item(sop, node_id) or {}
+    capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
+    result = {}
+    for key in ("git", "telegram"):
+        value = capabilities.get(key) if isinstance(capabilities.get(key), dict) else {}
+        result[key] = dict(value)
+    return result
+
+
+def sanitize_managed_paths(paths):
+    clean = []
+    for raw in paths or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if path.is_absolute() or ".." in path.parts:
+            continue
+        if text not in clean:
+            clean.append(text)
+    return clean
+
+
+def normalize_node_run_capability_overrides(sop, node_id, body=None):
+    body = body if isinstance(body, dict) else {}
+    raw = body.get("capability_overrides") if isinstance(body.get("capability_overrides"), dict) else {}
+    defaults = node_capability_defaults(sop, node_id)
+    result = {}
+    for capability in ("git", "telegram"):
+        item = raw.get(capability) if isinstance(raw.get(capability), dict) else {}
+        default = defaults.get(capability) if isinstance(defaults.get(capability), dict) else {}
+        enabled = item.get("enabled")
+        if enabled is None:
+            enabled = default.get("enabled", True)
+        save_scope = str(item.get("save_scope") or item.get("scope") or "run")
+        if save_scope not in {"run", "instance", "project"}:
+            save_scope = "run"
+        normalized = {
+            "enabled": bool(enabled),
+            "required": bool(item.get("required", default.get("required", False))),
+            "managed_by": item.get("managed_by") or default.get("managed_by") or "runtime-harness",
+            "save_scope": save_scope,
+        }
+        if capability == "git":
+            paths = item.get("paths")
+            if isinstance(paths, str):
+                paths = [line.strip() for line in paths.splitlines()]
+            if paths is None:
+                paths = default.get("paths") or default.get("managed_paths") or []
+            normalized["paths"] = sanitize_managed_paths(paths)
+        result[capability] = normalized
+    return result
+
+
+def configure_instance_repo_remote(wiki_path, repo):
+    if not repo or "/" not in str(repo):
+        return False, "repo is missing"
+    owner = str(repo).split("/", 1)[0]
+    candidate_keys = []
+    if owner == "skkeoriw":
+        candidate_keys.append("SKKEORIW_GITHUB_TOKEN")
+    if owner == "divanoo65":
+        candidate_keys.append("DIVANOO65_GITHUB_TOKEN")
+    candidate_keys.extend(["GITHUB_TOKEN", "GH_TOKEN"])
+    token = next((os.environ.get(key) for key in candidate_keys if os.environ.get(key)), "")
+    if not token:
+        return False, "GitHub token is not available"
+    remote = f"https://x-access-token:{quote(token, safe='')}@github.com/{repo}.git"
+    result = subprocess.run(["git", "remote", "set-url", "origin", remote], cwd=str(wiki_path), capture_output=True, text=True)
+    if result.returncode != 0:
+        return False, result.stderr[:300] or "failed to set origin remote"
+    return True, ""
+
+
+def write_yaml_file(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
+def apply_instance_capability_override(sop, node_id, overrides):
+    sop_file = Path(str(sop.get("sop_file") or "")).expanduser()
+    wiki_path = Path(str(sop.get("wiki_local_path") or sop_file.parent)).expanduser()
+    if not sop_file.exists():
+        return {"status": "skipped", "reason": "sop.yaml is missing"}
+    doc = read_yaml(sop_file)
+    nodes = doc.setdefault("nodes", {})
+    node = nodes.setdefault(node_id, {})
+    capabilities = node.setdefault("capabilities", {})
+    changed = {}
+    for capability, item in (overrides or {}).items():
+        if not isinstance(item, dict) or item.get("save_scope") != "instance":
+            continue
+        target = capabilities.setdefault(capability, {})
+        before = json.dumps(target, sort_keys=True, ensure_ascii=False)
+        target["enabled"] = bool(item.get("enabled", True))
+        target["required"] = bool(item.get("required", False))
+        target["managed_by"] = item.get("managed_by") or target.get("managed_by") or "runtime-harness"
+        if capability == "git":
+            paths = sanitize_managed_paths(item.get("paths") or [])
+            if paths:
+                target["paths"] = paths
+            target["editable"] = True
+            target["save_scope"] = "instance-override"
+        if capability == "telegram":
+            target["editable"] = True
+            target["save_scope"] = "instance-override"
+        after = json.dumps(target, sort_keys=True, ensure_ascii=False)
+        if before != after:
+            changed[capability] = mask_data(target)
+    if not changed:
+        return {"status": "unchanged", "changed": {}}
+    write_yaml_file(sop_file, doc)
+    remote_ok, remote_error = configure_instance_repo_remote(wiki_path, sop.get("repo", ""))
+    subprocess.run(["git", "add", "--", "sop.yaml"], cwd=str(wiki_path), capture_output=True, text=True)
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet", "--", "sop.yaml"], cwd=str(wiki_path), capture_output=True)
+    if diff.returncode == 0:
+        return {"status": "unchanged", "changed": changed}
+    message = f"chore: update node {node_id} capability defaults"
+    commit = subprocess.run(["git", "commit", "-m", message], cwd=str(wiki_path), capture_output=True, text=True)
+    commit_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(wiki_path), capture_output=True, text=True).stdout.strip()
+    pushed = False
+    push_error = ""
+    if commit.returncode == 0 and remote_ok:
+        push = subprocess.run(["git", "push", "origin", "main"], cwd=str(wiki_path), capture_output=True, text=True, timeout=60)
+        pushed = push.returncode == 0
+        push_error = "" if pushed else push.stderr[:300]
+    return {
+        "status": "saved" if commit.returncode == 0 else "failed",
+        "scope": "instance",
+        "sop_file": str(sop_file),
+        "repo": sop.get("repo", ""),
+        "changed": changed,
+        "commit": commit_hash,
+        "pushed": pushed,
+        "error": "" if commit.returncode == 0 and (pushed or not remote_ok) else (commit.stderr[:300] if commit.returncode != 0 else push_error or remote_error),
+    }
+
+
+def create_project_definition_change_request(sop, node_id, overrides, node_run_id):
+    project_changes = {
+        key: value for key, value in (overrides or {}).items()
+        if isinstance(value, dict) and value.get("save_scope") == "project"
+    }
+    if not project_changes:
+        return {"status": "skipped"}
+    wiki_path = Path(str(sop.get("wiki_local_path") or "")).expanduser()
+    request_id = sanitize_node_run_id(node_run_id) or f"node-definition-change-{int(time.time())}"
+    target = wiki_path / "raw" / "node-definition-change-requests" / f"{request_id}.json"
+    payload = {
+        "status": "pending-development",
+        "reason": "Project defaults live in agent-brain-plugins and must be changed through the repo-first development workflow.",
+        "node_id": node_id,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_changes": mask_data(project_changes),
+        "target_files": [
+            f"youtube-wiki/skills/sop-{node_id}/node.yaml",
+            "youtube-wiki/templates/wiki-repo/sop.yaml",
+        ],
+    }
+    write_json(target, payload)
+    return {"status": "created", "path": str(target.relative_to(wiki_path)), **payload}
+
+
+def node_run_definition_scope_reports(sop, node_id, node_run_id, overrides):
+    instance_report = apply_instance_capability_override(sop, node_id, overrides)
+    project_report = create_project_definition_change_request(sop, node_id, overrides, node_run_id)
+    return {
+        "instance_override": instance_report,
+        "project_default_request": project_report,
+    }
 
 
 def node_run_config_item(context, key, label="", required=False, default_value=None, aliases=None):
@@ -4221,11 +4409,13 @@ def node_run_config_int(context, key, default):
 def node_run_config_source_summary(context):
     env_file_values = context.get("runtime_env_file_values") or {}
     overrides = context.get("overrides") or {}
+    capability_overrides = context.get("capability_overrides") or {}
     return {
         "runtime_env_file": context.get("runtime_env_file") or "",
         "runtime_env_file_present": bool(env_file_values),
         "runtime_env_file_keys": sorted(k for k in env_file_values if k in RUNTIME_CAPABILITY_ENV or k in RUNTIME_CONFIG_CATEGORIES),
         "node_run_override_keys": sorted(overrides.keys()),
+        "capability_override_keys": sorted(capability_overrides.keys()),
         "precedence": ["node-run-overrides", "runtime-env-file", "bridge-env", "defaults"],
     }
 
@@ -4255,8 +4445,9 @@ def resolve_telegram_config(sop, node_id, static, context):
     token = node_run_config_lookup(context, token_env)
     capabilities = (node_registry_item(sop, node_id) or {}).get("capabilities") or {}
     tg_cap = capabilities.get("telegram") if isinstance(capabilities.get("telegram"), dict) else {}
-    enabled = bool(tg_cap.get("enabled", (static.get("infra") or {}).get("tg_notify", True)))
-    required = bool(tg_cap.get("required", False))
+    override = ((context.get("capability_overrides") or {}).get("telegram") or {}) if isinstance(context.get("capability_overrides"), dict) else {}
+    enabled = bool(override.get("enabled", tg_cap.get("enabled", (static.get("infra") or {}).get("tg_notify", True))))
+    required = bool(override.get("required", tg_cap.get("required", False)))
     token_present = not is_blank_value(token.get("value"))
     chat_present = not is_blank_value(chat_id)
     if not enabled:
@@ -4272,6 +4463,8 @@ def resolve_telegram_config(sop, node_id, static, context):
         "label": "Telegram progress notification",
         "enabled": enabled,
         "required": required,
+        "managed_by": override.get("managed_by") or tg_cap.get("managed_by") or "runtime-harness",
+        "save_scope": override.get("save_scope") or "run",
         "status": status,
         "token_env": token_env,
         "token": env_config_item(token.get("key") or token_env, "Telegram Bot Token", required=enabled and required, value=token.get("value"), source=token.get("source") or f"missing:{token_env}"),
@@ -4328,12 +4521,17 @@ def resolve_youtube_research_worker_config(node_id, context):
 
 def resolve_git_config(_sop, context):
     token = node_run_config_lookup(context, "GITHUB_TOKEN", ["GH_TOKEN", *RUNTIME_CAPABILITY_ENV.get("GITHUB_TOKEN", [])])
+    override = ((context.get("capability_overrides") or {}).get("git") or {}) if isinstance(context.get("capability_overrides"), dict) else {}
+    enabled = bool(override.get("enabled", True))
     return {
         "capability": "git",
         "label": "GitHub workspace persistence",
-        "enabled": True,
+        "enabled": enabled,
         "required": False,
-        "status": "ready" if token.get("value") else "warning",
+        "status": "disabled" if not enabled else "ready" if token.get("value") else "warning",
+        "managed_by": override.get("managed_by") or "runtime-harness",
+        "save_scope": override.get("save_scope") or "run",
+        "paths": sanitize_managed_paths(override.get("paths") or []),
         "token": env_config_item(token.get("key") or "GITHUB_TOKEN", "GitHub Token", required=False, value=token.get("value"), source=token.get("source") or "missing:GITHUB_TOKEN"),
     }
 
@@ -4542,6 +4740,34 @@ def node_run_issue_rows(plan, capability_results):
     return issues
 
 
+def node_run_runtime_context(sop):
+    runtime = runtime_info()
+    return {
+        "runtime_id": sop.get("runtime_id") or runtime.get("runtime_id") or "",
+        "channel_url": sop.get("channel_url") or runtime.get("channel_url") or "",
+        "spi_base_url": sop.get("spi_base_url") or runtime.get("spi_base_url") or "",
+        "registry_path": runtime.get("registry_path") or str(REGISTRY_PATH),
+        "health": runtime.get("health") or {},
+        "hermes_webhook_url": (runtime.get("metadata") or {}).get("hermes_webhook_url") if isinstance(runtime.get("metadata"), dict) else "",
+    }
+
+
+def node_run_instance_context(sop):
+    summary = instance_summary(sop, include_latest=False)
+    return {
+        "instance_id": summary.get("instance_id") or sop.get("id") or "",
+        "status": summary.get("status") or "",
+        "repo": summary.get("repo") or "",
+        "repo_branch": summary.get("repo_branch") or "main",
+        "wiki_local_path": summary.get("wiki_local_path") or sop.get("wiki_local_path") or "",
+        "workspace_status": summary.get("workspace_status") or "",
+        "registry_status": "enabled" if summary.get("enabled") is not False else "disabled",
+        "run_index_path": summary.get("run_index_path") or "",
+        "run_index_status": summary.get("run_index_status") or "",
+        "capabilities": summary.get("capabilities") or {},
+    }
+
+
 def build_node_run_plan(sop, workflow_id, node_id, body=None):
     body = body if isinstance(body, dict) else {}
     if not workflow_id_matches(sop, workflow_id):
@@ -4564,6 +4790,8 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
         mode = "preflight"
     binding = workflow_binding(sop)
     runtime = runtime_info()
+    capability_overrides = normalize_node_run_capability_overrides(sop, node_id, body)
+    body = {**body, "capability_overrides": capability_overrides}
     config_context = node_run_config_context(body)
     configs = node_run_config_summary(sop, node_id, static, config_context)
     return {
@@ -4578,6 +4806,11 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
         "mode": mode,
         "input_source": input_source,
         "resolved_config": configs,
+        "runtime_context": node_run_runtime_context(sop),
+        "instance_context": node_run_instance_context(sop),
+        "definition_defaults": node_capability_defaults(sop, node_id),
+        "capability_overrides": capability_overrides,
+        "definition_scope_reports": body.get("_definition_scope_reports") if isinstance(body.get("_definition_scope_reports"), dict) else {},
         "config_sources": node_run_config_source_summary(config_context),
         "capability_probes": {
             key: {
@@ -4669,6 +4902,7 @@ def build_node_run_steps(sop, plan):
     configs = plan.get("resolved_config") or {}
     worker = configs.get("youtube_research_worker") or {}
     telegram = configs.get("telegram") or {}
+    git = configs.get("github") or configs.get("git") or {}
     mode = plan.get("mode") or "preflight"
     real_supported = node_real_execution_supported(plan.get("node_id"))
     config_status = "done"
@@ -4703,10 +4937,9 @@ def build_node_run_steps(sop, plan):
             "done" if wiki.exists() else "failed",
             f"{plan.get('runtime_id')} · {plan.get('instance_id')} · {plan.get('workflow_id')}" if wiki.exists() else "Instance workspace is not available.",
             {
-                "runtime_id": plan.get("runtime_id"),
-                "instance_id": plan.get("instance_id"),
+                "runtime": plan.get("runtime_context") or {},
+                "instance": plan.get("instance_context") or {},
                 "workflow_id": plan.get("workflow_id"),
-                "wiki_local_path": str(wiki),
             },
         ),
         node_run_step(
@@ -4726,7 +4959,12 @@ def build_node_run_steps(sop, plan):
             "Resolve execution config",
             config_status,
             "; ".join(config_notes) if config_notes else "Runtime, Instance and capability config resolved.",
-            configs,
+            {
+                "resolved_config": configs,
+                "definition_defaults": plan.get("definition_defaults") or {},
+                "capability_overrides": plan.get("capability_overrides") or {},
+                "definition_scope_reports": plan.get("definition_scope_reports") or {},
+            },
         ),
         node_run_step(
             "probe-capabilities",
@@ -4765,6 +5003,27 @@ def build_node_run_steps(sop, plan):
             {"declared_outputs": normalize_contract((sop.get("nodes") or {}).get(plan.get("node_id"), {}).get("outputs", {}), "output")},
         ),
         node_run_step(
+            "persist-to-github",
+            "Persist to GitHub",
+            "waiting" if mode == "real-node" and real_supported and bool(git.get("enabled", True)) and not missing and config_status != "failed" else "skipped",
+            "Waiting for runtime harness to push selected paths to the Instance repo." if bool(git.get("enabled", True)) else "GitHub persistence is not attached for this Node Run.",
+            {
+                "repository": (plan.get("instance_context") or {}).get("repo", ""),
+                "paths": git.get("paths") or ((plan.get("capability_overrides") or {}).get("git") or {}).get("paths") or [],
+                "save_scope": git.get("save_scope") or "run",
+            },
+        ),
+        node_run_step(
+            "send-telegram-notification",
+            "Send Telegram notification",
+            "waiting" if mode == "real-node" and real_supported and bool(telegram.get("enabled", True)) and not missing and config_status != "failed" else "skipped",
+            "Waiting for runtime harness to send the Instance Telegram notification." if bool(telegram.get("enabled", True)) else "Telegram notification is not attached for this Node Run.",
+            {
+                "chat_id": ((telegram.get("chat_id") or {}).get("masked_value") if isinstance(telegram.get("chat_id"), dict) else ""),
+                "save_scope": telegram.get("save_scope") or "run",
+            },
+        ),
+        node_run_step(
             "persist-artifacts",
             "Persist node run artifacts",
             "done",
@@ -4798,8 +5057,6 @@ def node_run_status_from_steps(steps):
         return "blocked"
     if "needs_input" in statuses:
         return "needs_input"
-    if "warning" in statuses:
-        return "warning"
     if "running" in statuses:
         return "running"
     if "waiting" in statuses:
@@ -4879,6 +5136,8 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
             "mode": plan.get("mode"),
             "input_source": plan.get("input_source"),
             "base_run_id": plan.get("base_run_id"),
+            "capability_overrides": plan.get("capability_overrides") or {},
+            "definition_scope_reports": plan.get("definition_scope_reports") or {},
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
     })
@@ -5108,6 +5367,29 @@ def apply_real_node_execution_to_steps(steps, execution):
         "Declared outputs were found." if validation_status == "passed" else "Declared outputs are missing.",
         validation,
     )
+    capabilities = execution.get("capabilities") if isinstance(execution.get("capabilities"), dict) else {}
+    git = capabilities.get("git") if isinstance(capabilities.get("git"), dict) else {}
+    if git:
+        git_failed = git.get("status") == "failed"
+        git_required = bool(git.get("required", False))
+        update_node_run_step(
+            steps,
+            "persist-to-github",
+            "done" if git.get("status") == "done" else "failed" if git_failed and git_required else "warning" if git_failed else "skipped" if git.get("status") == "disabled" else "warning",
+            git.get("reason") or git.get("error") or "GitHub persistence capability finished.",
+            git,
+        )
+    telegram = capabilities.get("telegram") if isinstance(capabilities.get("telegram"), dict) else {}
+    if telegram:
+        telegram_failed = telegram.get("status") == "failed"
+        telegram_required = bool(telegram.get("required", False))
+        update_node_run_step(
+            steps,
+            "send-telegram-notification",
+            "done" if telegram.get("status") == "done" else "failed" if telegram_failed and telegram_required else "warning" if telegram_failed else "skipped" if telegram.get("status") == "disabled" else "warning",
+            telegram.get("error") or telegram.get("reason") or "Telegram notification capability finished.",
+            telegram,
+        )
     update_node_run_step(
         steps,
         "persist-artifacts",
@@ -5155,6 +5437,11 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "validation": (real_execution or {}).get("validation") or {},
         "capabilities": (real_execution or {}).get("capabilities") or {},
         "business_artifacts": (real_execution or {}).get("artifacts") or [],
+        "runtime_context": plan.get("runtime_context") or {},
+        "instance_context": plan.get("instance_context") or {},
+        "definition_defaults": plan.get("definition_defaults") or {},
+        "capability_overrides": plan.get("capability_overrides") or {},
+        "definition_scope_reports": plan.get("definition_scope_reports") or {},
         "environment_snapshot": environment_snapshot,
         "capability_results": capability_results,
         "issues": issues,
@@ -5262,12 +5549,28 @@ def read_jsonl(path):
 
 
 def create_node_run(sop, workflow_id, node_id, body):
-    plan = build_node_run_plan(sop, workflow_id, node_id, body)
-    if plan is None:
+    if not workflow_id_matches(sop, workflow_id) or not isinstance((sop.get("nodes") or {}).get(node_id), dict):
         return 404, {"status": "error", "message": f"Node {node_id!r} or workflow {workflow_id!r} not found"}
     token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     digest = hashlib.sha1(json.dumps(body if isinstance(body, dict) else {}, sort_keys=True).encode("utf-8")).hexdigest()[:6]
     node_run_id = sanitize_node_run_id(body.get("node_run_id") if isinstance(body, dict) else "") or f"node-run-{node_id}-{token}-{digest}"
+    body = body if isinstance(body, dict) else {}
+    capability_overrides = normalize_node_run_capability_overrides(sop, node_id, body)
+    definition_scope_reports = node_run_definition_scope_reports(sop, node_id, node_run_id, capability_overrides)
+    sop_file = Path(str(sop.get("sop_file") or "")).expanduser()
+    if definition_scope_reports.get("instance_override", {}).get("status") in {"saved", "unchanged"} and sop_file.exists():
+        updated = read_yaml(sop_file)
+        for key in ("nodes", "pipeline", "notify", "repo", "repo_branch", "name", "title", "version"):
+            if key in updated:
+                sop[key] = updated[key]
+    body = {
+        **body,
+        "capability_overrides": capability_overrides,
+        "_definition_scope_reports": definition_scope_reports,
+    }
+    plan = build_node_run_plan(sop, workflow_id, node_id, body)
+    if plan is None:
+        return 404, {"status": "error", "message": f"Node {node_id!r} or workflow {workflow_id!r} not found"}
     now = datetime.now(timezone.utc).isoformat()
     steps = build_node_run_steps(sop, plan)
     real_execution = None
