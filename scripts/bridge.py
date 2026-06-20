@@ -731,50 +731,70 @@ def read_runtime_management_config_values():
     return read_runtime_management_config().get("values", {})
 
 
-CAPABILITY_CONFIG_FIELDS = [
-    {
-        "key": "GITHUB_TOKEN",
-        "label": "GitHub Token",
-        "capability": "git",
-        "required": False,
-        "scopes": ["run", "instance", "runtime", "global"],
-    },
-    {
-        "key": "YOUTUBE_WIKI_TG_TOKEN",
-        "label": "Telegram Bot Token",
-        "capability": "telegram",
-        "required": False,
-        "scopes": ["run", "instance", "runtime", "global"],
-    },
-    {
-        "key": "YOUTUBE_WIKI_TG_CHAT_ID",
-        "label": "Telegram Chat ID",
-        "capability": "telegram",
-        "required": False,
-        "scopes": ["run", "instance", "runtime", "global"],
-    },
-    {
-        "key": "YOUTUBE_RESEARCH_WORKFLOW_URL",
-        "label": "YouTube Research Worker URL",
-        "capability": "youtube-research-worker",
-        "required": True,
-        "scopes": ["run", "instance", "runtime", "global"],
-    },
-    {
-        "key": "YOUTUBE_RESEARCH_WORKFLOW_TOKEN",
-        "label": "YouTube Research Worker Token",
-        "capability": "youtube-research-worker",
-        "required": True,
-        "scopes": ["run", "instance", "runtime", "global"],
-    },
-    {
-        "key": "YOUTUBE_CONTENT_API_TOKEN",
-        "label": "YouTube Content API Token",
-        "capability": "youtube-research-worker",
-        "required": False,
-        "scopes": ["run", "instance", "runtime", "global"],
-    },
+YOUTUBE_WORKFLOW_ID = "youtube-research-wiki"
+RUNTIME_MANAGEMENT_WORKFLOW_ID = "runtime-management"
+YOUTUBE_WORKFLOW_NODES = [
+    "youtube-fetch",
+    "notebooklm-research",
+    "youtube-deep-research",
+    "wiki-build",
+    "tg-notify",
 ]
+SETTING_CONFIG_LABELS = {
+    "GITHUB_TOKEN": "GitHub Token",
+    "DEEPSEEK_API_KEY": "DeepSeek API Key",
+    "WIKI_LLM_PROVIDER": "Wiki LLM Provider",
+    "WIKI_DEEPSEEK_MODEL": "Wiki DeepSeek Model",
+    "HERMES_MODEL_PROVIDER": "Hermes Model Provider",
+    "HERMES_MODEL": "Hermes Default Model",
+    "HERMES_MODEL_BASE_URL": "Hermes Model Base URL",
+    "HERMES_OPENAI_API_KEY": "Hermes OpenAI-compatible API Key",
+    "OPENAI_API_KEY": "OpenAI API Key",
+    "GOOGLE_CLOUD_API_KEY": "Google Cloud API Key",
+    "GEMINI_API_KEY": "Gemini API Key",
+    "WIKI_GEMINI_MODEL": "Wiki Gemini Model",
+    "GOOGLE_PROJECT_ID": "Google Project ID",
+    "VERTEX_LOCATION": "Vertex Location",
+    "WIKI_VERTEX_MODEL": "Wiki Vertex Model",
+    "HERMES_WEBHOOK_TOKEN": "Hermes Webhook Token",
+    "HERMES_WEBHOOK_PORT": "Hermes Webhook Port",
+    "HERMES_WEBHOOK_URL": "Hermes Webhook URL",
+    "HERMES_SMOKE_ROUTE": "Hermes Smoke Route",
+    "WEBHOOK_PUBLIC_HOST": "Webhook Public Host",
+    "NOTEBOOKLM_BRIDGE_URL": "NotebookLM Bridge URL",
+    "NOTEBOOKLM_BRIDGE_TOKEN": "NotebookLM Bridge Token",
+    "NOTEBOOKLM_CLIENT_ID": "NotebookLM Client ID",
+    "BRIDGE_PORT": "Runtime Bridge Port",
+    "YOUTUBE_WIKI_TG_TOKEN": "Telegram Bot Token",
+    "YOUTUBE_WIKI_TG_CHAT_ID": "Telegram Chat ID",
+    "YOUTUBE_CONTENT_API_URL": "YouTube Content API URL",
+    "YOUTUBE_CONTENT_API_TOKEN": "YouTube Content API Token",
+    "YOUTUBE_RESEARCH_WORKFLOW_URL": "YouTube Research Worker URL",
+    "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "YouTube Research Worker Token",
+    "CLOUDFLARE_EMAIL": "Cloudflare Email",
+    "CLOUDFLARE_API_KEY": "Cloudflare API Key",
+    "RUNTIME_SETTINGS_BACKEND": "Settings Backend",
+    "RUNTIME_SETTINGS_CLOUDFLARE_EMAIL": "Settings Cloudflare Email",
+    "RUNTIME_SETTINGS_CLOUDFLARE_API_KEY": "Settings Cloudflare API Key",
+    "RUNTIME_SETTINGS_CLOUDFLARE_API_TOKEN": "Settings Cloudflare API Token",
+    "RUNTIME_SETTINGS_CLOUDFLARE_ACCOUNT_ID": "Settings Cloudflare Account ID",
+    "RUNTIME_SETTINGS_D1_DATABASE_ID": "Settings D1 Database ID",
+    "RUNTIME_SETTINGS_D1_DATABASE_NAME": "Settings D1 Database Name",
+    "TUNNEL_API": "Tunnel API",
+    "SOP_UI_URL": "SOP UI URL",
+    "GITHUB_CHANGFENGHU_TOKEN": "ChangfengHU GitHub Token",
+    "GITHUB_SKKEORIW_TOKEN": "skkeoriw GitHub Token",
+    "AGENT_REPO": "Agent Brain Repo",
+    "SKILL_REPO": "Skill Repo",
+    "AUTO_DOMAIN_REPO": "Auto Domain Repo",
+    "AUTO_DOMAIN_TUNNEL_REPO": "Auto Domain Tunnel Repo",
+    "SKILL_PUBLISHER_REPO": "Skill Publisher Repo",
+    "RUNTIME_TARGET_SSH_COMMAND": "Target SSH Command",
+    "RUNTIME_TARGET_PRIVATE_KEY": "Target Private Key",
+    "RUNTIME_TARGET_PRIVATE_KEY_B64": "Target Private Key Base64",
+    "RUNTIME_TARGET_RUNTIME_ID": "Target Runtime ID",
+    "RUNTIME_TARGET_CHANNEL_URL": "Target Channel URL",
+}
 
 
 def canonical_runtime_setting_key(key):
@@ -813,15 +833,208 @@ def scoped_runtime_setting_values(values, scope, runtime_id, instance_id=""):
     return result
 
 
-def capability_config_fields_for_node(_sop, _node_id=""):
-    return [dict(item) for item in CAPABILITY_CONFIG_FIELDS]
+def unique_sorted(values):
+    return sorted({str(value) for value in values if str(value or "").strip()})
 
 
-def capability_config_resolution(sop, node_id="", run_overrides=None):
+def setting_capability_tags(key, category):
+    tags = {category}
+    if category == "github":
+        tags.update({"git", "repo-access"})
+    if category == "telegram":
+        tags.update({"notification", "progress-notification"})
+    if category == "youtube":
+        tags.update({"youtube-research-worker", "content-api"})
+    if category == "llm":
+        tags.update({"model", "gemini", "vertex"})
+    if category == "hermes":
+        tags.update({"agent-runtime", "model-auth"})
+    if category == "notebooklm":
+        tags.add("research-bridge")
+    if category == "cloudflare":
+        tags.update({"tunnel", "domain"})
+    if category == "target":
+        tags.update({"ssh", "machine"})
+    if category == "repo":
+        tags.add("source-repo")
+    return unique_sorted(tags)
+
+
+def setting_workflow_tags(key, category):
+    workflows = set()
+    if category in {"telegram", "youtube", "notebooklm", "llm"}:
+        workflows.add(YOUTUBE_WORKFLOW_ID)
+    if key in {"GITHUB_TOKEN", "HERMES_WEBHOOK_URL", "HERMES_WEBHOOK_TOKEN", "WEBHOOK_PUBLIC_HOST"}:
+        workflows.update({YOUTUBE_WORKFLOW_ID, RUNTIME_MANAGEMENT_WORKFLOW_ID})
+    if category in {"cloudflare", "settings", "repo", "target", "runtime"}:
+        workflows.add(RUNTIME_MANAGEMENT_WORKFLOW_ID)
+    if key.startswith("HERMES_") or key in {"DEEPSEEK_API_KEY", "OPENAI_API_KEY"}:
+        workflows.update({YOUTUBE_WORKFLOW_ID, RUNTIME_MANAGEMENT_WORKFLOW_ID})
+    if key in {"SOP_UI_URL", "BRIDGE_PORT"}:
+        workflows.add(RUNTIME_MANAGEMENT_WORKFLOW_ID)
+    return unique_sorted(workflows)
+
+
+def setting_node_tags(key, category):
+    if category == "telegram":
+        return ["tg-notify", "youtube-deep-research"]
+    if key.startswith("YOUTUBE_RESEARCH_WORKFLOW_"):
+        return ["youtube-deep-research"]
+    if key.startswith("YOUTUBE_CONTENT_API_"):
+        return ["youtube-fetch", "youtube-deep-research"]
+    if category == "notebooklm":
+        return ["notebooklm-research"]
+    if category == "llm":
+        return ["wiki-build"]
+    if key == "GITHUB_TOKEN":
+        return unique_sorted([*YOUTUBE_WORKFLOW_NODES, *RUNTIME_MANAGEMENT_NODES])
+    if category in {"hermes", "runtime", "cloudflare", "settings", "repo", "target"}:
+        return unique_sorted(RUNTIME_MANAGEMENT_NODES)
+    return []
+
+
+def setting_operation_tags(key, category):
+    operations = set()
+    if category in {"telegram", "youtube", "notebooklm", "llm"} or key == "GITHUB_TOKEN":
+        operations.update({"workflow-run", "node-run"})
+    if category in {"cloudflare", "settings", "repo", "target", "runtime", "hermes"} or key in {"GITHUB_TOKEN", "GITHUB_CHANGFENGHU_TOKEN", "GITHUB_SKKEORIW_TOKEN"}:
+        operations.update(RUNTIME_MANAGEMENT_ACTIONS)
+    if category == "telegram":
+        operations.add("create-instance")
+    return unique_sorted(operations)
+
+
+def setting_registry_definitions():
+    definitions = []
+    seen = set()
+    for key, aliases in {**RUNTIME_CAPABILITY_ENV, **RUNTIME_MANAGEMENT_REQUEST_DEFAULTS}.items():
+        canonical = canonical_runtime_setting_key(key)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        category = RUNTIME_CONFIG_CATEGORIES.get(canonical, "runtime")
+        workflow_tags = setting_workflow_tags(canonical, category)
+        node_tags = setting_node_tags(canonical, category)
+        capability_tags = setting_capability_tags(canonical, category)
+        operation_tags = setting_operation_tags(canonical, category)
+        definitions.append({
+            "key": canonical,
+            "aliases": aliases,
+            "label": SETTING_CONFIG_LABELS.get(canonical, canonical.replace("_", " ").title()),
+            "category": category,
+            "capability": capability_tags[0] if capability_tags else category,
+            "capability_tags": capability_tags,
+            "workflow_tags": workflow_tags,
+            "node_tags": node_tags,
+            "operation_tags": operation_tags,
+            "tags": unique_sorted([category, *workflow_tags, *node_tags, *capability_tags, *operation_tags]),
+            "required": canonical in RUNTIME_REQUIRED_ENV or canonical in RUNTIME_MANAGEMENT_REQUIRED_DEFAULTS,
+            "secret": is_secret_key(canonical),
+            "scopes": ["run", "instance", "runtime", "global"],
+            "description": f"{canonical} is resolved by Settings, Runtime, Instance and run override precedence.",
+        })
+    return sorted(definitions, key=lambda item: (item.get("category") or "", item.get("key") or ""))
+
+
+def workflow_id_for_sop(sop):
+    try:
+        binding = workflow_binding(sop)
+    except Exception:
+        binding = {}
+    candidate = str(
+        (binding or {}).get("workflow_id")
+        or sop.get("workflow_id")
+        or sop.get("sop_type")
+        or ""
+    )
+    node_ids = set((sop.get("nodes") or {}).keys())
+    instance_like_id = str(sop.get("id") or sop.get("instance_id") or "")
+    if (not candidate or candidate == instance_like_id) and node_ids:
+        if node_ids & set(YOUTUBE_WORKFLOW_NODES):
+            return YOUTUBE_WORKFLOW_ID
+        if node_ids & set(RUNTIME_MANAGEMENT_NODES):
+            return RUNTIME_MANAGEMENT_WORKFLOW_ID
+    return candidate or str(sop.get("id") or "")
+
+
+def setting_registry_item_matches(item, workflow_id="", node_id="", capability="", operation="", tag="", category=""):
+    workflow_id = str(workflow_id or "").strip()
+    node_id = str(node_id or "").strip()
+    capability = str(capability or "").strip()
+    operation = str(operation or "").strip()
+    tag = str(tag or "").strip()
+    category = str(category or "").strip()
+    workflow_tags = set(item.get("workflow_tags") or [])
+    node_tags = set(item.get("node_tags") or [])
+    capability_tags = set(item.get("capability_tags") or [])
+    operation_tags = set(item.get("operation_tags") or [])
+    all_tags = set(item.get("tags") or [])
+    if workflow_id and workflow_id not in workflow_tags and "all-workflows" not in workflow_tags:
+        return False
+    if node_id and node_id not in node_tags:
+        return False
+    if capability and capability not in capability_tags and capability != item.get("capability"):
+        return False
+    if operation and operation not in operation_tags:
+        return False
+    if category and category != item.get("category"):
+        return False
+    if tag and tag not in all_tags:
+        return False
+    return True
+
+
+def setting_registry_preview(sop=None, node_id="", query=None):
+    query = query or {}
+    workflow_id = str(
+        (query.get("workflow_id") or [""])[0]
+        if isinstance(query.get("workflow_id"), list)
+        else query.get("workflow_id") or ""
+    ).strip()
+    if not workflow_id and sop:
+        workflow_id = workflow_id_for_sop(sop)
+    node_id = str(
+        node_id
+        or ((query.get("node_id") or [""])[0] if isinstance(query.get("node_id"), list) else query.get("node_id") or "")
+        or ""
+    ).strip()
+    filters = {
+        "workflow_id": workflow_id,
+        "node_id": node_id,
+        "capability": str((query.get("capability") or [""])[0] if isinstance(query.get("capability"), list) else query.get("capability") or "").strip(),
+        "operation": str((query.get("operation") or [""])[0] if isinstance(query.get("operation"), list) else query.get("operation") or "").strip(),
+        "tag": str((query.get("tag") or [""])[0] if isinstance(query.get("tag"), list) else query.get("tag") or "").strip(),
+        "category": str((query.get("category") or [""])[0] if isinstance(query.get("category"), list) else query.get("category") or "").strip(),
+    }
+    all_items = setting_registry_definitions()
+    items = [
+        item for item in all_items
+        if setting_registry_item_matches(item, **filters)
+    ]
+    return {
+        "workflow_id": workflow_id,
+        "node_id": node_id,
+        "filters": filters,
+        "registry_total": len(all_items),
+        "total": len(items),
+        "items": items,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def capability_config_fields_for_node(sop, node_id="", workflow_id=""):
+    if not workflow_id:
+        workflow_id = workflow_id_for_sop(sop) if sop else ""
+    preview = setting_registry_preview(sop, node_id=node_id, query={"workflow_id": workflow_id, "node_id": node_id})
+    return [dict(item) for item in preview.get("items") or []]
+
+
+def capability_config_resolution(sop, node_id="", run_overrides=None, workflow_id="", query=None):
     run_overrides = normalize_runtime_settings_values(run_overrides or {})
     runtime = runtime_info()
     runtime_id = str(sop.get("runtime_id") or runtime.get("runtime_id") or "")
     instance_id = str(sop.get("instance_id") or sop.get("id") or "")
+    workflow_id = str(workflow_id or workflow_id_for_sop(sop) or "")
     env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
     env_file_values = normalize_runtime_settings_values(read_env_file_values(env_file))
     bridge_env_values = normalize_runtime_settings_values(os.environ)
@@ -838,11 +1051,12 @@ def capability_config_resolution(sop, node_id="", run_overrides=None):
         ("runtime-env-file", env_file_values),
         ("bridge-env", bridge_env_values),
     ]
-    fields = capability_config_fields_for_node(sop, node_id)
+    registry = setting_registry_preview(sop, node_id=node_id, query={**(query or {}), "workflow_id": workflow_id, "node_id": node_id})
+    fields = [dict(item) for item in registry.get("items") or []]
     items = []
     for field in fields:
         key = canonical_runtime_setting_key(field.get("key"))
-        aliases = RUNTIME_CAPABILITY_ENV.get(key, [])
+        aliases = field.get("aliases") or RUNTIME_CAPABILITY_ENV.get(key, []) or RUNTIME_MANAGEMENT_REQUEST_DEFAULTS.get(key, [])
         candidates = [key, *aliases]
         resolved_value = ""
         resolved_source = "missing"
@@ -886,6 +1100,12 @@ def capability_config_resolution(sop, node_id="", run_overrides=None):
             "label": field.get("label") or key,
             "capability": field.get("capability") or RUNTIME_CONFIG_CATEGORIES.get(key, "runtime"),
             "category": RUNTIME_CONFIG_CATEGORIES.get(key, field.get("capability") or "runtime"),
+            "workflow_tags": field.get("workflow_tags") or [],
+            "node_tags": field.get("node_tags") or [],
+            "capability_tags": field.get("capability_tags") or [],
+            "operation_tags": field.get("operation_tags") or [],
+            "tags": field.get("tags") or [],
+            "description": field.get("description") or "",
             "required": bool(field.get("required", False)),
             "secret": is_secret_key(key),
             "editable_scopes": field.get("scopes") or ["run", "instance", "runtime", "global"],
@@ -900,11 +1120,14 @@ def capability_config_resolution(sop, node_id="", run_overrides=None):
     return {
         "runtime_id": runtime_id,
         "instance_id": instance_id,
+        "workflow_id": workflow_id,
         "node_id": node_id,
         "backend": settings.get("backend", runtime_settings_backend()),
         "updated_at": settings.get("updated_at", ""),
         "env_file": str(Path(env_file).expanduser()),
-        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env"],
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env", "definition-default"],
+        "registry_total": registry.get("registry_total", len(fields)),
+        "registry_filters": registry.get("filters") or {},
         "items": items,
         "groups": groups,
         "scopes": {
@@ -924,7 +1147,7 @@ def save_capability_config(sop, values, scope="instance", node_id=""):
     runtime = runtime_info()
     runtime_id = str(sop.get("runtime_id") or runtime.get("runtime_id") or "")
     instance_id = str(sop.get("instance_id") or sop.get("id") or "")
-    allowed = {field["key"] for field in capability_config_fields_for_node(sop, node_id)}
+    allowed = {field["key"] for field in setting_registry_definitions()}
     changed = {}
     current = normalize_runtime_settings_values(read_runtime_management_config_values())
     for key, value in (values or {}).items():
@@ -6418,6 +6641,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return json_response(self, 200, data)
             if path == ["api", "sop", "debug", "scanned"]:
                 return json_response(self, 200, {"sops": scanned_sops()})
+            if path == ["api", "sop", "settings", "registry"]:
+                return json_response(self, 200, setting_registry_preview(query=query))
             if len(path) >= 3 and path[0] == "api" and path[1] == "sop":
                 sop = find_sop(path[2])
                 if not sop:
@@ -6432,13 +6657,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if (sop.get("instance_id") or sop.get("id")) != "runtime-management" and sop.get("sop_type") != "runtime-management":
                         return json_response(self, 404, {"detail": "Runtime management config is only available for runtime-management"})
                     return json_response(self, 200, runtime_management_config_preview(sop))
-                if len(path) == 5 and path[3] == "config" and path[4] == "capabilities":
+                if len(path) == 5 and path[3] == "settings" and path[4] == "registry":
+                    return json_response(self, 200, setting_registry_preview(sop, query=query))
+                if len(path) == 5 and path[3] == "config" and path[4] in {"capabilities", "resolved"}:
                     node_id = str((query.get("node_id") or [""])[0] or "")
-                    return json_response(self, 200, capability_config_resolution(sop, node_id))
-                if len(path) == 7 and path[3] == "nodes" and path[5] == "config" and path[6] == "capabilities":
+                    workflow_id = str((query.get("workflow_id") or [""])[0] or "")
+                    return json_response(self, 200, capability_config_resolution(sop, node_id, workflow_id=workflow_id, query=query))
+                if len(path) == 7 and path[3] == "nodes" and path[5] == "settings" and path[6] == "registry":
                     if node_registry_item(sop, path[4]) is None:
                         return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
-                    return json_response(self, 200, capability_config_resolution(sop, path[4]))
+                    return json_response(self, 200, setting_registry_preview(sop, node_id=path[4], query=query))
+                if len(path) == 7 and path[3] == "nodes" and path[5] == "config" and path[6] in {"capabilities", "resolved"}:
+                    if node_registry_item(sop, path[4]) is None:
+                        return json_response(self, 404, {"detail": f"Node {path[4]!r} not found"})
+                    workflow_id = str((query.get("workflow_id") or [""])[0] or "")
+                    return json_response(self, 200, capability_config_resolution(sop, path[4], workflow_id=workflow_id, query=query))
                 if len(path) == 4 and path[3] == "dag":
                     return json_response(self, 200, sop_dag(sop))
                 if len(path) == 4 and path[3] == "runs":
@@ -6848,8 +7081,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "config": runtime_management_config_preview(sop),
             })
 
-        # POST /api/sop/{instance}/config/capabilities  → save scoped capability config
-        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "config" and path[4] == "capabilities":
+        # POST /api/sop/{instance}/config/capabilities|values  → save scoped resolved config
+        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "config" and path[4] in {"capabilities", "values"}:
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
@@ -6862,9 +7095,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return json_response(self, 400, {"detail": str(exc)})
             return json_response(self, 200, result)
 
-        # POST /api/sop/{instance}/nodes/{node_id}/config/capabilities  → save scoped capability config for a node context
+        # POST /api/sop/{instance}/nodes/{node_id}/config/capabilities|values  → save scoped config for a node context
         if (len(path) == 7 and path[:2] == ["api", "sop"]
-                and path[3] == "nodes" and path[5] == "config" and path[6] == "capabilities"):
+                and path[3] == "nodes" and path[5] == "config" and path[6] in {"capabilities", "values"}):
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})

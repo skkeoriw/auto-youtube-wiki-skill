@@ -1527,6 +1527,50 @@ class ArtifactResolutionTest(unittest.TestCase):
         token_item = next(item for item in preview["items"] if item["key"] == "YOUTUBE_WIKI_TG_TOKEN")
         self.assertTrue(token_item["values_by_scope"]["instance"]["present"])
 
+    def test_setting_registry_exposes_workflow_node_and_capability_tags(self):
+        registry = bridge.setting_registry_preview()
+        self.assertGreater(registry["registry_total"], 6)
+        by_key = {item["key"]: item for item in registry["items"]}
+        self.assertIn("YOUTUBE_WIKI_TG_TOKEN", by_key)
+        telegram = by_key["YOUTUBE_WIKI_TG_TOKEN"]
+        self.assertIn("youtube-research-wiki", telegram["workflow_tags"])
+        self.assertIn("youtube-deep-research", telegram["node_tags"])
+        self.assertIn("telegram", telegram["capability_tags"])
+
+    def test_capability_resolution_uses_tagged_registry_not_fixed_six_fields(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "needs": ["youtube-fetch"],
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/analysis.md"},
+        }
+        preview = bridge.capability_config_resolution(sop, "youtube-deep-research")
+        keys = {item["key"] for item in preview["items"]}
+        self.assertGreater(len(keys), 6)
+        self.assertIn("YOUTUBE_CONTENT_API_URL", keys)
+        self.assertIn("YOUTUBE_RESEARCH_WORKFLOW_URL", keys)
+        self.assertEqual(preview["workflow_id"], "youtube-research-wiki")
+        worker = next(item for item in preview["items"] if item["key"] == "YOUTUBE_RESEARCH_WORKFLOW_URL")
+        self.assertIn("youtube-deep-research", worker["node_tags"])
+        self.assertIn("youtube-research-worker", worker["capability_tags"])
+
+    def test_capability_config_save_accepts_registry_key_outside_old_capability_fields(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        saved = bridge.save_capability_config(sop, {
+            "YOUTUBE_CONTENT_API_URL": "https://content-api.example",
+        }, scope="instance", node_id="youtube-deep-research")
+        self.assertEqual(saved["status"], "saved")
+        self.assertIn("instance:runtime-test:test-instance:YOUTUBE_CONTENT_API_URL", saved["changed_keys"])
+        preview = bridge.capability_config_resolution(sop, "youtube-deep-research")
+        content_api = next(item for item in preview["items"] if item["key"] == "YOUTUBE_CONTENT_API_URL")
+        self.assertEqual(content_api["source"], "instance-settings:YOUTUBE_CONTENT_API_URL")
+
     def test_real_node_run_executes_youtube_deep_research_wrapper_and_records_outputs(self):
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])
