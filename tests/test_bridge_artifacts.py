@@ -1768,6 +1768,44 @@ PY
         server.shutdown()
         server.server_close()
 
+    def test_node_run_read_backfills_telegram_history_from_stage_events(self):
+        sop = dict(self.sop)
+        sop["nodes"] = {"youtube-deep-research": {"outputs": {}}}
+        node_run_id = "node-run-history"
+        workspace = bridge.node_run_workspace(sop, node_run_id)
+        workspace.mkdir(parents=True)
+        (workspace / "result.json").write_text(json.dumps({
+            "node_run_id": node_run_id,
+            "pipeline_id": node_run_id,
+            "node_id": "youtube-deep-research",
+            "capabilities": {
+                "telegram": {
+                    "enabled": True,
+                    "status": "done",
+                    "trigger": "done",
+                    "message_preview": "done message",
+                    "api_ok": True,
+                }
+            },
+            "capability_results": [{
+                "key": "telegram",
+                "status": "done",
+                "detail": {"trigger": "done", "message_preview": "done message"},
+            }],
+        }), encoding="utf-8")
+        events = self.wiki / "logs/stage-events/node-run-history.jsonl"
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text(
+            '{"ts":"2026-06-21T10:00:00Z","event":"tg_notify_sent","stage":"youtube-deep-research","trigger":"start","ok":true}\n'
+            '{"ts":"2026-06-21T10:03:00Z","event":"tg_notify_sent","stage":"youtube-deep-research","trigger":"done","ok":true}\n',
+            encoding="utf-8",
+        )
+
+        result = bridge.read_node_run_result(sop, "youtube-deep-research", node_run_id)
+        history = result["capabilities"]["telegram"]["history"]
+        self.assertEqual([item["trigger"] for item in history], ["start", "done"])
+        self.assertEqual(result["capability_results"][0]["detail"]["history"][1]["message_preview"], "done message")
+
     @unittest.skipUnless(bridge.provision_module() is not None, "engine module not importable")
     def test_node_contract_endpoint_returns_engine_contract(self):
         # P3: run-less catalog contract endpoint serves the engine classification.

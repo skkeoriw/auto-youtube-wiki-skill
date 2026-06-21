@@ -6347,8 +6347,89 @@ def read_node_run_result(sop, node_id, node_run_id):
     result = read_json(node_run_workspace(sop, safe) / "result.json")
     if not isinstance(result, dict) or result.get("node_id") != node_id:
         return None
+    hydrate_node_run_capability_history(sop, result)
     result["detail"] = mask_data(result.get("detail") or {})
     return result
+
+
+def hydrate_node_run_capability_history(sop, result):
+    if not isinstance(result, dict):
+        return result
+    node_run_id = sanitize_node_run_id(result.get("node_run_id") or result.get("pipeline_id") or "")
+    node_id = str(result.get("node_id") or "")
+    if not node_run_id or not node_id:
+        return result
+    capabilities = result.get("capabilities") if isinstance(result.get("capabilities"), dict) else {}
+    telegram = capabilities.get("telegram") if isinstance(capabilities.get("telegram"), dict) else {}
+    if not telegram.get("history"):
+        events = read_stage_event_rows(sop, node_run_id)
+        history = []
+        for event in events:
+            event_name = str(event.get("event") or "")
+            if event_name not in {"tg_notify_sent", "tg_notify_failed", "telegram.sent", "telegram.failed"}:
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            stage = str(event.get("stage") or event.get("node_id") or data.get("stage") or "")
+            if stage and stage != node_id:
+                continue
+            trigger = str(event.get("trigger") or data.get("trigger") or "")
+            ok = event.get("ok") if "ok" in event else data.get("ok")
+            status = "done" if bool(ok) else "failed"
+            item = {
+                "capability": "telegram",
+                "status": status,
+                "trigger": trigger,
+                "sent_at": event.get("ts") or event.get("recorded_at") or "",
+                "api_ok": bool(ok),
+            }
+            if trigger and trigger == telegram.get("trigger"):
+                for key in ("message_preview", "error"):
+                    if telegram.get(key):
+                        item[key] = telegram.get(key)
+            history.append(item)
+        if history:
+            telegram = {**telegram, "history": history}
+            capabilities = {**capabilities, "telegram": telegram}
+            result["capabilities"] = capabilities
+    if capabilities:
+        merged_results = []
+        seen = set()
+        for item in result.get("capability_results") or []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or item.get("capability") or "")
+            cap = capabilities.get(key) if isinstance(capabilities.get(key), dict) else {}
+            merged_results.append({**item, "detail": {**(item.get("detail") or {}), **cap}})
+            seen.add(key)
+        for key, cap in capabilities.items():
+            if key in seen or not isinstance(cap, dict):
+                continue
+            merged_results.append({
+                "key": key,
+                "capability": key,
+                "label": cap.get("label") or key,
+                "status": cap.get("status") or "unknown",
+                "enabled": bool(cap.get("enabled", True)),
+                "required": bool(cap.get("required", False)),
+                "source": "runtime-result",
+                "reason": cap.get("error") or cap.get("reason") or "",
+                "managed_by": cap.get("managed_by") or "",
+                "detail": cap,
+            })
+        if merged_results:
+            result["capability_results"] = merged_results
+    return result
+
+
+def read_stage_event_rows(sop, run_id):
+    wiki = Path(str((sop or {}).get("wiki_local_path") or "")).expanduser()
+    rows = []
+    for path in (
+        wiki / "logs" / "stage-events" / f"{run_id}.jsonl",
+        wiki / "raw" / "pipeline-runs" / run_id / "events.jsonl",
+    ):
+        rows.extend(read_jsonl(path))
+    return rows
 
 
 def list_node_runs(sop, node_id, limit=20):
