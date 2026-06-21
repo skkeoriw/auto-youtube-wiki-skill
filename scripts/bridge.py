@@ -6423,13 +6423,10 @@ def hydrate_node_run_capability_history(sop, result):
 
 def read_stage_event_rows(sop, run_id):
     wiki = Path(str((sop or {}).get("wiki_local_path") or "")).expanduser()
-    rows = []
-    for path in (
-        wiki / "logs" / "stage-events" / f"{run_id}.jsonl",
-        wiki / "raw" / "pipeline-runs" / run_id / "events.jsonl",
-    ):
-        rows.extend(read_jsonl(path))
-    return rows
+    primary = read_jsonl(wiki / "logs" / "stage-events" / f"{run_id}.jsonl")
+    if primary:
+        return primary
+    return read_jsonl(wiki / "raw" / "pipeline-runs" / run_id / "events.jsonl")
 
 
 def list_node_runs(sop, node_id, limit=20):
