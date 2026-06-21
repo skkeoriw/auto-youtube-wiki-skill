@@ -5839,6 +5839,106 @@ def node_run_subprocess_env(sop, node_run_id, plan):
     return env
 
 
+def ordered_unique(values):
+    seen = set()
+    rows = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        rows.append(text)
+    return rows
+
+
+def safe_relative_file(wiki, path):
+    try:
+        candidate = Path(path).expanduser().resolve()
+        return candidate.relative_to(wiki).as_posix()
+    except Exception:
+        return ""
+
+
+def files_under_relative_dir(wiki, relative_dir):
+    root = safe_artifact_path(wiki, relative_dir)
+    if not root or not root.exists():
+        return []
+    if root.is_file():
+        rel = safe_relative_file(wiki, root)
+        return [rel] if rel else []
+    rows = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = safe_relative_file(wiki, path)
+        if not rel or rel.endswith("/runtime.env") or rel == "raw/pipeline-context.json":
+            continue
+        rows.append(rel)
+    return rows
+
+
+def collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    core_files = []
+    for value in (actual_outputs or {}).values():
+        values = value if isinstance(value, list) else [value]
+        for relative in values:
+            path = safe_artifact_path(wiki, relative)
+            if path and path.is_file():
+                rel = safe_relative_file(wiki, path)
+                if rel:
+                    core_files.append(rel)
+    core_files = ordered_unique(core_files)
+
+    raw_roots = []
+    for relative in core_files:
+        parts = Path(relative).parts
+        if node_run_id in parts:
+            index = parts.index(node_run_id)
+            raw_roots.append(Path(*parts[:index + 1]) / "raw")
+    for path in wiki.glob(f"raw/**/{node_run_id}/raw"):
+        rel = safe_relative_file(wiki, path)
+        if rel:
+            raw_roots.append(Path(rel))
+
+    core_set = set(core_files)
+    raw_files = []
+    for root in raw_roots:
+        raw_files.extend(files_under_relative_dir(wiki, root.as_posix()))
+    raw_files = ordered_unique(path for path in raw_files if path not in core_set)
+
+    run_records = []
+    run_records.extend(files_under_relative_dir(wiki, f"raw/pipeline-runs/{node_run_id}"))
+    run_records.extend(files_under_relative_dir(wiki, f"raw/node-runs/{node_run_id}"))
+    stage_events = safe_artifact_path(wiki, f"logs/stage-events/{node_run_id}.jsonl")
+    if stage_events and stage_events.is_file():
+        rel = safe_relative_file(wiki, stage_events)
+        if rel:
+            run_records.append(rel)
+    run_records = ordered_unique(path for path in run_records if path not in core_set and path not in set(raw_files))
+
+    return {
+        "core_outputs": {
+            "title": "核心输出",
+            "description": "节点声明 outputs 对应的业务结果。",
+            "files": core_files,
+            "count": len(core_files),
+        },
+        "raw_files": {
+            "title": "节点原始文件",
+            "description": "节点 Skill/Worker 产生的原始响应、字幕和中间文件。",
+            "files": raw_files,
+            "count": len(raw_files),
+        },
+        "run_records": {
+            "title": "运行记录",
+            "description": "Node Run 工作台、事件、状态和 capability 记录。",
+            "files": run_records,
+            "count": len(run_records),
+        },
+    }
+
+
 def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     workspace = run_workspace(sop, node_run_id)
@@ -5889,6 +5989,7 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
         "declared_outputs": declared_outputs,
         "actual_outputs": actual_outputs,
         "artifacts": artifacts,
+        "output_categories": collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs),
         "validation": {
             "status": "passed" if not missing else "failed",
             "missing_outputs": missing,
@@ -5981,6 +6082,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "log_path": str(log_path),
         "actual_outputs": output_info["actual_outputs"],
         "artifacts": output_info["artifacts"],
+        "output_categories": output_info["output_categories"],
         "validation": output_info["validation"],
         "capabilities": output_info["capabilities"],
         "detail": {
@@ -5996,6 +6098,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             "node_state": output_info["node_state"],
             "capabilities": output_info["capabilities"],
             "actual_outputs": output_info["actual_outputs"],
+            "output_categories": output_info["output_categories"],
             "validation": output_info["validation"],
         },
     }
@@ -6079,6 +6182,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "events": events,
         "artifacts": artifacts,
         "actual_outputs": (real_execution or {}).get("actual_outputs") or {},
+        "output_categories": (real_execution or {}).get("output_categories") or {},
         "validation": (real_execution or {}).get("validation") or {},
         "capabilities": (real_execution or {}).get("capabilities") or {},
         "business_artifacts": (real_execution or {}).get("artifacts") or [],

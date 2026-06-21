@@ -1728,6 +1728,20 @@ PY
         self.assertEqual(result["actual_outputs"]["transcript_file"], [
             f"raw/youtube-deep-research/{result['node_run_id']}/outputs/transcript.txt",
         ])
+        categories = result["output_categories"]
+        self.assertEqual(categories["core_outputs"]["files"], [
+            f"raw/youtube-deep-research/{result['node_run_id']}/outputs/analysis.md",
+            f"raw/youtube-deep-research/{result['node_run_id']}/outputs/transcript.txt",
+        ])
+        self.assertIn(
+            f"raw/youtube-deep-research/{result['node_run_id']}/raw/worker-analysis.md",
+            categories["raw_files"]["files"],
+        )
+        self.assertIn(
+            f"raw/pipeline-runs/{result['node_run_id']}/run.json",
+            categories["run_records"]["files"],
+        )
+        self.assertNotIn("raw/pipeline-context.json", categories["run_records"]["files"])
         self.assertEqual(
             next(step for step in result["steps"] if step["id"] == "execute-or-dry-run")["status"],
             "done",
