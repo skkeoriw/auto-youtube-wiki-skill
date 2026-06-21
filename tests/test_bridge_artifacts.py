@@ -1400,7 +1400,6 @@ class ArtifactResolutionTest(unittest.TestCase):
             "validate-outputs",
             "persist-to-github",
             "send-telegram-notification",
-            "persist-artifacts",
         ])
         detail = result["detail"]
         self.assertEqual(detail["resolved_inputs"][0]["value"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")

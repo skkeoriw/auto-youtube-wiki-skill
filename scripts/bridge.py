@@ -5670,13 +5670,6 @@ def build_node_run_steps(sop, plan):
                 "save_scope": telegram.get("save_scope") or "run",
             },
         ),
-        node_run_step(
-            "persist-artifacts",
-            "Write node run workspace snapshot",
-            "done",
-            "Initial Node Run input, result and event snapshots were written so the workbench can open while execution continues.",
-            {"artifacts": ["input.json", "result.json", "events.jsonl"]},
-        ),
     ]
     return steps
 
@@ -6051,17 +6044,6 @@ def apply_real_node_execution_to_steps(steps, execution):
             telegram.get("error") or telegram.get("reason") or "Telegram notification capability finished.",
             telegram,
         )
-    update_node_run_step(
-        steps,
-        "persist-artifacts",
-        "done",
-        "Final Node Run result, events and business artifact index were written to the workbench.",
-        {
-            "artifacts": ["input.json", "result.json", "events.jsonl", "executor.log"],
-            "business_artifact_count": len(execution.get("artifacts") or []),
-        },
-    )
-
 
 def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, inner_steps, events,
                                   artifacts, started_at, finished_at, real_execution=None, pending=False):
