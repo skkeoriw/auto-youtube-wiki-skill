@@ -5672,9 +5672,9 @@ def build_node_run_steps(sop, plan):
         ),
         node_run_step(
             "persist-artifacts",
-            "Persist node run artifacts",
+            "Write node run workspace snapshot",
             "done",
-            "Node Run diagnostic record was written to the instance workspace.",
+            "Initial Node Run input, result and event snapshots were written so the workbench can open while execution continues.",
             {"artifacts": ["input.json", "result.json", "events.jsonl"]},
         ),
     ]
@@ -6055,7 +6055,7 @@ def apply_real_node_execution_to_steps(steps, execution):
         steps,
         "persist-artifacts",
         "done",
-        "Node Run result and real node artifacts were written to the instance workspace.",
+        "Final Node Run result, events and business artifact index were written to the workbench.",
         {
             "artifacts": ["input.json", "result.json", "events.jsonl", "executor.log"],
             "business_artifact_count": len(execution.get("artifacts") or []),
