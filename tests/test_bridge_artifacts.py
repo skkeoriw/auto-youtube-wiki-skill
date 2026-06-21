@@ -1782,6 +1782,8 @@ WIKI="$1"
 RUN_ID="$2"
 PIPELINE_ID="${3:-$2}"
 RUN_DIR="$WIKI/raw/pipeline-runs/$PIPELINE_ID"
+test "${YOUTUBE_WIKI_NODE_RUN:-}" = "1"
+test "${YOUTUBE_WIKI_NODE_RUN_ID:-}" = "$RUN_ID"
 python3 - "$WIKI" "$PIPELINE_ID" "$RUN_ID" <<'PY'
 import json
 import sys

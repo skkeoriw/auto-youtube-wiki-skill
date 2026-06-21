@@ -5920,6 +5920,8 @@ def node_run_subprocess_env(sop, node_run_id, plan):
         **os.environ,
         **values,
         "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}",
+        "YOUTUBE_WIKI_NODE_RUN": "1",
+        "YOUTUBE_WIKI_NODE_RUN_ID": safe_id,
     }
     if written:
         env["YOUTUBE_WIKI_NODE_RUN_ENV_FILE"] = str(override_file)
