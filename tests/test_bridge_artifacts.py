@@ -1628,8 +1628,8 @@ class ArtifactResolutionTest(unittest.TestCase):
             "needs": ["youtube-fetch"],
             "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
             "outputs": {
-                "analysis_file": "raw/youtube-deep-research/{pipeline_id}/analysis.md",
-                "transcript_file": "raw/youtube-deep-research/{pipeline_id}/transcript.txt",
+                "analysis_file": "raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md",
+                "transcript_file": "raw/youtube-deep-research/{pipeline_id}/outputs/transcript.txt",
             },
             "infra": {"tg_notify": True, "log_record": True},
         }
@@ -1646,9 +1646,16 @@ RUN_ID="$2"
 PIPELINE_ID="${3:-$2}"
 OUT="$WIKI/raw/youtube-deep-research/$PIPELINE_ID"
 RUN_DIR="$WIKI/raw/pipeline-runs/$PIPELINE_ID"
-mkdir -p "$OUT" "$RUN_DIR/nodes/youtube-deep-research"
-printf '# Analysis\\nreal node output\\n' > "$OUT/analysis.md"
-printf 'transcript output\\n' > "$OUT/transcript.txt"
+test -n "${YOUTUBE_WIKI_NODE_RUN_ENV_FILE:-}"
+case "$YOUTUBE_WIKI_NODE_RUN_ENV_FILE" in
+  "$WIKI"/*) echo "node run env file must stay outside wiki repo" >&2; exit 9 ;;
+esac
+test -f "$YOUTUBE_WIKI_NODE_RUN_ENV_FILE"
+grep -q "YOUTUBE_RESEARCH_WORKFLOW_TOKEN" "$YOUTUBE_WIKI_NODE_RUN_ENV_FILE"
+mkdir -p "$OUT/outputs" "$OUT/raw" "$RUN_DIR/nodes/youtube-deep-research"
+printf '# Analysis\\nreal node output\\n' > "$OUT/outputs/analysis.md"
+printf 'transcript output\\n' > "$OUT/outputs/transcript.txt"
+printf '# Worker\\n' > "$OUT/raw/worker-analysis.md"
 python3 - "$WIKI" "$PIPELINE_ID" "$RUN_ID" <<'PY'
 import json
 import sys
@@ -1658,7 +1665,7 @@ pipeline_id = sys.argv[2]
 run_id = sys.argv[3]
 ctx_file = wiki / "raw" / "pipeline-context.json"
 ctx = json.loads(ctx_file.read_text(encoding="utf-8"))
-ctx.setdefault("stage_b2", {})["analysis_file"] = f"raw/youtube-deep-research/{pipeline_id}/analysis.md"
+ctx.setdefault("stage_b2", {})["analysis_file"] = f"raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md"
 run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
 (run_dir / "context.json").write_text(json.dumps(ctx), encoding="utf-8")
 (run_dir / "run.json").write_text(json.dumps({
@@ -1673,8 +1680,8 @@ run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
     "run_id": run_id,
     "status": "done",
     "actual_outputs": {
-        "analysis_file": [f"raw/youtube-deep-research/{pipeline_id}/analysis.md"],
-        "transcript_file": [f"raw/youtube-deep-research/{pipeline_id}/transcript.txt"],
+        "analysis_file": [f"raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md"],
+        "transcript_file": [f"raw/youtube-deep-research/{pipeline_id}/outputs/transcript.txt"],
     },
     "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
 }), encoding="utf-8")
@@ -1684,7 +1691,7 @@ run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
         "required": False,
         "status": "done",
         "managed_by": "runtime-harness",
-        "changed_files": [f"raw/youtube-deep-research/{pipeline_id}/analysis.md"],
+        "changed_files": [f"raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md"],
     },
     "telegram": {
         "enabled": True,
@@ -1716,10 +1723,10 @@ PY
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["validation"]["status"], "passed")
         self.assertEqual(result["actual_outputs"]["analysis_file"], [
-            f"raw/youtube-deep-research/{result['node_run_id']}/analysis.md",
+            f"raw/youtube-deep-research/{result['node_run_id']}/outputs/analysis.md",
         ])
         self.assertEqual(result["actual_outputs"]["transcript_file"], [
-            f"raw/youtube-deep-research/{result['node_run_id']}/transcript.txt",
+            f"raw/youtube-deep-research/{result['node_run_id']}/outputs/transcript.txt",
         ])
         self.assertEqual(
             next(step for step in result["steps"] if step["id"] == "execute-or-dry-run")["status"],
@@ -1730,6 +1737,7 @@ PY
             "done",
         )
         self.assertTrue((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "executor.log").exists())
+        self.assertFalse((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "runtime.env").exists())
         self.assertTrue(any(item["type"] == "research.analysis" for item in result["business_artifacts"]))
         capability_by_key = {item["key"]: item for item in result["capability_results"]}
         self.assertEqual(capability_by_key["git"]["status"], "done")

@@ -5825,7 +5825,9 @@ def node_run_resolved_env_values(sop, plan):
 
 def node_run_subprocess_env(sop, node_run_id, plan):
     values = node_run_resolved_env_values(sop, plan)
-    override_file = node_run_workspace(sop, node_run_id) / "runtime.env"
+    safe_id = sanitize_node_run_id(node_run_id) or f"node-run-{int(time.time())}"
+    override_dir = Path(os.environ.get("YOUTUBE_WIKI_NODE_RUN_ENV_DIR") or (Path.home() / ".cache" / "youtube-wiki" / "node-run-env")).expanduser()
+    override_file = override_dir / f"{safe_id}.env"
     written = write_shell_env_file(override_file, values)
     env = {
         **os.environ,
