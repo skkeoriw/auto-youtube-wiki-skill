@@ -1760,6 +1760,101 @@ PY
         self.assertIn("bot can't initiate conversation", capability_by_key["telegram"]["reason"])
         self.assertTrue(any("bot can't initiate conversation" in issue["message"] for issue in result["issues"]))
 
+    def test_real_node_run_executes_wiki_build_with_generated_report_contract(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["wiki-build"] = {
+            "title": "Wiki Build",
+            "skill": "sop-wiki-build",
+            "webhook_route": "sop-wiki-build",
+            "inputs": {"reports": "notebooklm-research.outputs.reports"},
+            "outputs": {"index": "index.md", "pages": "wiki/**"},
+        }
+
+        plugin_root = self.wiki / "_agent-brain-plugins"
+        script_dir = plugin_root / "youtube-wiki" / "skills" / "sop-wiki-build" / "scripts"
+        script_dir.mkdir(parents=True)
+        script = script_dir / "run_wiki_build.sh"
+        script.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+WIKI="$1"
+RUN_ID="$2"
+PIPELINE_ID="${3:-$2}"
+RUN_DIR="$WIKI/raw/pipeline-runs/$PIPELINE_ID"
+python3 - "$WIKI" "$PIPELINE_ID" "$RUN_ID" <<'PY'
+import json
+import sys
+from pathlib import Path
+wiki = Path(sys.argv[1])
+pipeline_id = sys.argv[2]
+run_id = sys.argv[3]
+ctx_file = wiki / "raw" / "pipeline-context.json"
+ctx = json.loads(ctx_file.read_text(encoding="utf-8"))
+reports = (ctx.get("stage_b") or {}).get("output_files") or []
+if not reports:
+    raise SystemExit("stage_b.output_files missing")
+for rel in reports:
+    if not (wiki / rel).is_file():
+        raise SystemExit(f"report missing: {rel}")
+(wiki / "index.md").write_text("# Generated Index\\n", encoding="utf-8")
+(wiki / "wiki" / "sources").mkdir(parents=True, exist_ok=True)
+(wiki / "wiki" / "sources" / "Generated.md").write_text("# Generated Source\\n", encoding="utf-8")
+run_dir = wiki / "raw" / "pipeline-runs" / pipeline_id
+(run_dir / "nodes" / "wiki-build").mkdir(parents=True, exist_ok=True)
+(run_dir / "context.json").write_text(json.dumps(ctx), encoding="utf-8")
+(run_dir / "run.json").write_text(json.dumps({
+    "pipeline_id": pipeline_id,
+    "status": "done",
+    "nodes": {"wiki-build": "done"},
+}), encoding="utf-8")
+(run_dir / "nodes" / "wiki-build.json").write_text(json.dumps({
+    "pipeline_id": pipeline_id,
+    "node_id": "wiki-build",
+    "run_id": run_id,
+    "status": "done",
+    "actual_outputs": {
+        "index": ["index.md"],
+        "pages": ["wiki/sources/Generated.md"],
+    },
+    "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+}), encoding="utf-8")
+(run_dir / "nodes" / "wiki-build" / "capabilities.json").write_text(json.dumps({
+    "git": {
+        "enabled": True,
+        "required": False,
+        "status": "done",
+        "managed_by": "runtime-harness",
+        "changed_files": ["index.md", "wiki/sources/Generated.md"],
+    }
+}), encoding="utf-8")
+PY
+""",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+
+        with patch.object(bridge, "plugin_root", return_value=plugin_root):
+            code, result = bridge.create_node_run(
+                sop,
+                "test",
+                "wiki-build",
+                {"mode": "real-node", "input_source": "generated-fixture", "sync": True},
+            )
+
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(
+            next(step for step in result["steps"] if step["id"] == "build-execution-plan")["detail"]["real_execution_enabled"],
+            True,
+        )
+        self.assertEqual(result["validation"]["status"], "passed")
+        self.assertEqual(result["actual_outputs"]["index"], ["index.md"])
+        self.assertIn("wiki/sources/Generated.md", result["actual_outputs"]["pages"])
+        ctx = json.loads((self.wiki / "raw" / "pipeline-context.json").read_text(encoding="utf-8"))
+        self.assertEqual(ctx["stage_b"]["output_files"], ["raw/notebooklm-analysis/node-test-fixture.md"])
+        self.assertTrue((self.wiki / "raw" / "notebooklm-analysis" / "node-test-fixture.md").exists())
+
     def test_node_run_routes_create_and_read_shareable_id(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

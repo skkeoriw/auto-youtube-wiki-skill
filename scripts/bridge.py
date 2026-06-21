@@ -4432,7 +4432,7 @@ def node_test_side_effects(node_id, config, static):
         "llm": llm,
         "skill": skill,
         "default_mode": "preflight",
-        "real_execution_enabled": False,
+        "real_execution_enabled": node_real_execution_supported(node_id),
     }
 
 
@@ -4486,8 +4486,12 @@ def build_node_test_plan(sop, node_id, body=None):
                 "enabled": True,
             },
             "real_execution": {
-                "enabled": False,
-                "reason": "Generic business node test currently supports preflight/dry-run only.",
+                "enabled": node_real_execution_supported(node_id),
+                "reason": (
+                    "Standard stage wrapper is available for real Node Run execution."
+                    if node_real_execution_supported(node_id)
+                    else "No standard stage wrapper is available for this node."
+                ),
             },
         },
         "status": "needs_input" if missing else "ready",
@@ -5704,8 +5708,21 @@ def node_run_status_from_steps(steps):
     return "done"
 
 
+def real_node_stage_script(node_id):
+    safe_node = str(node_id or "").strip()
+    if not safe_node or not re.match(r"^[A-Za-z0-9_-]+$", safe_node):
+        return None
+    plugin_dir = plugin_root() / "youtube-wiki"
+    skill_dir = plugin_dir / "skills" / f"sop-{safe_node}"
+    candidates = [
+        skill_dir / "scripts" / f"run_{safe_node.replace('-', '_')}.sh",
+        skill_dir / "scripts" / f"run_{safe_node}.sh",
+    ]
+    return next((path for path in candidates if path.exists()), None)
+
+
 def node_real_execution_supported(node_id):
-    return str(node_id or "") in {"youtube-deep-research"}
+    return real_node_stage_script(node_id) is not None
 
 
 def node_run_step_by_id(steps, step_id):
@@ -5729,19 +5746,6 @@ def update_node_run_step(steps, step_id, status, summary="", detail=None, starte
         step["elapsed_ms"] = elapsed_ms
 
 
-def node_run_resolved_input_value(plan, name):
-    for item in plan.get("resolved_inputs") or []:
-        if item.get("name") == name and item.get("resolved"):
-            return item.get("value")
-    return None
-
-
-def real_node_stage_script(node_id):
-    if node_id != "youtube-deep-research":
-        return None
-    return plugin_root() / "youtube-wiki" / "skills" / "sop-youtube-deep-research" / "scripts" / "run_youtube_deep_research.sh"
-
-
 def real_node_execution_timeout(plan):
     configured = os.environ.get("NODE_RUN_REAL_TIMEOUT_SECONDS", "")
     if configured:
@@ -5756,20 +5760,103 @@ def real_node_execution_timeout(plan):
         return 1500
 
 
+def node_run_resolved_input_item(plan, name):
+    for item in plan.get("resolved_inputs") or []:
+        if item.get("name") == name and item.get("resolved"):
+            return item
+    return {}
+
+
+def normalize_node_run_input_paths(value):
+    values = value if isinstance(value, list) else [value]
+    paths = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text or text.startswith(("http://", "https://")):
+            continue
+        path = Path(text)
+        if path.is_absolute() or ".." in path.parts:
+            continue
+        paths.append(path.as_posix())
+    return ordered_unique(paths)
+
+
+def ensure_generated_report_fixture(wiki, relative_path, source_url):
+    path = safe_artifact_path(wiki, relative_path)
+    if not path or path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    title = "Rick Astley - Never Gonna Give You Up"
+    path.write_text(
+        "\n".join([
+            f"# {title}",
+            "",
+            f"source_url: {source_url}",
+            "",
+            "## 摘要",
+            "",
+            "这是一份 Node Run 生成的测试分析报告，用于验证 wiki-build 节点能消费 notebooklm-research 的 reports 契约。",
+            "",
+            "## 关键实体",
+            "",
+            "- Rick Astley：英国歌手。",
+            "- Never Gonna Give You Up：1987 年流行歌曲和音乐视频。",
+            "",
+            "## 关键概念",
+            "",
+            "- 音乐视频传播",
+            "- 流行文化引用",
+            "- 互联网迷因",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+
+def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id):
+    source_item = node_run_resolved_input_item(plan, "source_url") or node_run_resolved_input_item(plan, "url")
+    source_url = source_item.get("value") if source_item else ""
+    if is_blank_value(source_url):
+        source_url = ctx.get("source_url") or ctx.get("url") or "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    ctx["source_url"] = source_url
+    ctx["source_type"] = ctx.get("source_type") or "youtube"
+    ctx["node_run_resolved_inputs"] = {
+        item.get("name"): item.get("value")
+        for item in plan.get("resolved_inputs") or []
+        if item.get("name")
+    }
+
+    reports_item = node_run_resolved_input_item(plan, "reports")
+    report_paths = normalize_node_run_input_paths(reports_item.get("value") if reports_item else [])
+    if report_paths:
+        if reports_item.get("provenance") in {"generated-fixture", "deepseek-mock-fallback"}:
+            for relative in report_paths:
+                ensure_generated_report_fixture(wiki, relative, source_url)
+        stage_b = ctx.get("stage_b") if isinstance(ctx.get("stage_b"), dict) else {}
+        stage_b["output_files"] = report_paths
+        ctx["stage_b"] = stage_b
+
+    deep_item = node_run_resolved_input_item(plan, "deep_research") or node_run_resolved_input_item(plan, "analysis_file")
+    deep_paths = normalize_node_run_input_paths(deep_item.get("value") if deep_item else [])
+    if deep_paths:
+        stage_b2 = ctx.get("stage_b2") if isinstance(ctx.get("stage_b2"), dict) else {}
+        stage_b2["analysis_file"] = deep_paths[0]
+        stage_b2["output_files"] = deep_paths
+        ctx["stage_b2"] = stage_b2
+
+    return ctx
+
+
 def prepare_real_node_context(sop, node_run_id, node_id, plan):
     wiki = Path(sop["wiki_local_path"]).expanduser()
-    source_url = node_run_resolved_input_value(plan, "source_url") or node_run_resolved_input_value(plan, "url")
-    if is_blank_value(source_url):
-        raise ValueError("source_url is required for real node execution")
-
     ctx_file = wiki / "raw" / "pipeline-context.json"
     ctx = read_json(ctx_file) or {}
     if not isinstance(ctx, dict):
         ctx = {}
+    ctx = apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id)
     ctx.update({
         "pipeline_id": node_run_id,
-        "source_url": source_url,
-        "source_type": ctx.get("source_type") or "youtube",
         "node_run": {
             "node_run_id": node_run_id,
             "node_id": node_id,
