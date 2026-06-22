@@ -6694,6 +6694,49 @@ def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
     return artifacts
 
 
+def node_run_output_manifest_records(sop, node_run_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    output_dir = node_run_output_files_dir(sop, node_run_id)
+    manifest = read_json(output_dir / "manifest.json") or {}
+    items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    records = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get("path") or "").strip()
+        output_name = str(item.get("output") or "").strip()
+        if not item_path or not output_name:
+            continue
+        path_obj = Path(item_path)
+        if path_obj.is_absolute() or ".." in path_obj.parts:
+            continue
+        rel = item_path if item_path.startswith("raw/") else safe_relative_file(wiki, output_dir / item_path)
+        path = safe_artifact_path(wiki, rel)
+        if not path or not path.is_file():
+            continue
+        records.append({
+            **item,
+            "output": output_name,
+            "path": rel,
+            "file": path,
+        })
+    return records
+
+
+def node_run_manifest_output_value(records, output_name, spec):
+    matches = [record for record in records if record.get("output") == output_name]
+    if not matches:
+        return None
+    output_type = str((spec or {}).get("type") or "").lower()
+    if output_type in {"string", "text"}:
+        first = matches[0].get("file")
+        if first and first.is_file():
+            return first.read_text(encoding="utf-8", errors="replace").strip()
+        return ""
+    paths = [record.get("path") for record in matches if record.get("path")]
+    return ordered_unique(paths)
+
+
 def node_run_input_info(sop, node_run_id, node_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     return {
@@ -6759,17 +6802,37 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     artifacts = []
 
     recorded_outputs = node_state.get("actual_outputs") if isinstance(node_state.get("actual_outputs"), dict) else {}
+    manifest_records = node_run_output_manifest_records(sop, node_run_id)
     for name, spec in declared_outputs.items():
-        paths = recorded_outputs.get(name)
-        if isinstance(paths, str):
+        recorded_value = recorded_outputs.get(name)
+        paths = recorded_value
+        if isinstance(paths, str) and str(spec.get("type") or "").lower() not in {"string", "text"}:
             paths = [paths]
         records = []
-        for relative in paths or []:
-            path = safe_artifact_path(wiki, relative)
-            if path and path.is_file():
-                record = artifact_record(sop, node_id, name, path, "recorded")
-                if record:
-                    records.append(record)
+        if isinstance(paths, list):
+            for relative in paths:
+                path = safe_artifact_path(wiki, relative)
+                if path and path.is_file():
+                    record = artifact_record(sop, node_id, name, path, "recorded")
+                    if record:
+                        records.append(record)
+        if records:
+            actual_outputs[name] = [record["path"] for record in records]
+            artifacts.extend(records)
+            continue
+
+        manifest_value = node_run_manifest_output_value(manifest_records, name, spec)
+        if manifest_value is not None and manifest_value != "" and manifest_value != []:
+            actual_outputs[name] = manifest_value
+            for record in node_run_output_manifest_artifacts(sop, node_run_id, node_id):
+                if record.get("output") == name:
+                    artifacts.append(record)
+            continue
+
+        if isinstance(recorded_value, str) and str(spec.get("type") or "").lower() in {"string", "text"}:
+            actual_outputs[name] = recorded_value
+            continue
+
         if not records:
             records = resolve_output_artifacts(
                 sop,

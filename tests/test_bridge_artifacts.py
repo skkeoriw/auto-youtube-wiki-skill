@@ -212,6 +212,43 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["actual_outputs"]["source_url"], "https://example.com/video")
         self.assertEqual(detail["validation"]["status"], "passed")
 
+    def test_real_node_outputs_accept_manifest_scalar_output(self):
+        run_id = "node-run-youtube-fetch-test"
+        output_dir = self.wiki / "raw/node-runs" / run_id / "outputs/files"
+        output_dir.mkdir(parents=True)
+        (output_dir / "source-url.txt").write_text("https://example.com/video\n", encoding="utf-8")
+        (output_dir / "metadata.json").write_text(json.dumps({"title": "Example"}), encoding="utf-8")
+        (output_dir / "manifest.json").write_text(json.dumps({
+            "version": 1,
+            "kind": "output",
+            "node_run_id": run_id,
+            "node_id": "youtube-fetch",
+            "items": [
+                {
+                    "path": "source-url.txt",
+                    "output": "source_url",
+                    "value_type": "text",
+                },
+                {
+                    "path": "metadata.json",
+                    "output": "metadata_file",
+                    "value_type": "json",
+                },
+            ],
+        }), encoding="utf-8")
+        self.sop["nodes"]["youtube-fetch"]["outputs"] = {
+            "source_url": "context.source_url",
+            "metadata_file": "raw/youtube-metadata/{pipeline_id}.json",
+        }
+
+        detail = bridge.collect_real_node_outputs(self.sop, run_id, "youtube-fetch", run_id)
+
+        self.assertEqual(detail["actual_outputs"]["source_url"], "https://example.com/video")
+        self.assertEqual(detail["actual_outputs"]["metadata_file"], [
+            f"raw/node-runs/{run_id}/outputs/files/metadata.json"
+        ])
+        self.assertEqual(detail["validation"]["status"], "passed")
+
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
 
