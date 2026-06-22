@@ -1574,6 +1574,41 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(values["YOUTUBE_WIKI_TG_TOKEN"], "telegram-instance-token-secret")
         self.assertEqual(values["YOUTUBE_WIKI_TG_CHAT_ID"], "7796171193")
 
+    def test_wiki_build_node_run_resolves_llm_gateway_settings(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["wiki-build"] = {
+            "title": "Wiki Build",
+            "skill": "sop-wiki-build",
+            "webhook_route": "sop-wiki-build",
+            "inputs": {"reports": "notebooklm-research.outputs.reports"},
+            "outputs": {"index": "index.md", "pages": "wiki/**"},
+        }
+        bridge.save_capability_config(sop, {
+            "WIKI_LLM_PROVIDER": "openai-compatible",
+            "WIKI_LLM_BASE_URL": "https://api-proxy.example/v1",
+            "WIKI_LLM_API_KEY": "llm-gateway-token-secret",
+            "WIKI_LLM_MODEL": "deepseek-v4-pro",
+        }, scope="instance", node_id="wiki-build")
+        with patch.object(bridge, "runtime_info", return_value={"runtime_id": "runtime-test", "id": "runtime-test"}):
+            plan = bridge.build_node_run_plan(sop, "test", "wiki-build", {
+                "mode": "real-node",
+                "input_source": "generated-fixture",
+            })
+            values = bridge.node_run_resolved_env_values(sop, plan)
+
+        llm = plan["resolved_config"]["llm"]
+        self.assertEqual(llm["status"], "ready")
+        self.assertEqual(llm["base_url"]["source"], "instance-settings:WIKI_LLM_BASE_URL")
+        self.assertEqual(llm["model"]["source"], "instance-settings:WIKI_LLM_MODEL")
+        self.assertEqual(llm["api_key"]["masked_value"], "llm***ret")
+        self.assertIsNone(llm["api_key"]["value"])
+        self.assertEqual(values["WIKI_LLM_BASE_URL"], "https://api-proxy.example/v1")
+        self.assertEqual(values["WIKI_LLM_API_KEY"], "llm-gateway-token-secret")
+        self.assertEqual(values["WIKI_LLM_MODEL"], "deepseek-v4-pro")
+
     def test_setting_registry_exposes_workflow_node_and_capability_tags(self):
         registry = bridge.setting_registry_preview()
         self.assertGreater(registry["registry_total"], 6)
@@ -1583,6 +1618,10 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("youtube-research-wiki", telegram["workflow_tags"])
         self.assertIn("youtube-deep-research", telegram["node_tags"])
         self.assertIn("telegram", telegram["capability_tags"])
+        llm = by_key["WIKI_LLM_API_KEY"]
+        self.assertIn("youtube-research-wiki", llm["workflow_tags"])
+        self.assertIn("wiki-build", llm["node_tags"])
+        self.assertIn("llm-gateway", llm["capability_tags"])
 
     def test_capability_resolution_uses_tagged_registry_not_fixed_six_fields(self):
         sop = dict(self.sop)
@@ -1770,6 +1809,14 @@ PY
             "inputs": {"reports": "notebooklm-research.outputs.reports"},
             "outputs": {"index": "index.md", "pages": "wiki/**"},
         }
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        bridge.save_capability_config(sop, {
+            "WIKI_LLM_PROVIDER": "openai-compatible",
+            "WIKI_LLM_BASE_URL": "https://api-proxy.example/v1",
+            "WIKI_LLM_API_KEY": "llm-gateway-token-secret",
+            "WIKI_LLM_MODEL": "deepseek-v4-pro",
+        }, scope="instance", node_id="wiki-build")
 
         plugin_root = self.wiki / "_agent-brain-plugins"
         script_dir = plugin_root / "youtube-wiki" / "skills" / "sop-wiki-build" / "scripts"

@@ -115,6 +115,9 @@ RUNTIME_CAPABILITY_ENV = {
     "GITHUB_TOKEN": ["github_token", "repo_token"],
     "DEEPSEEK_API_KEY": ["deepseek_api_key", "hermes_deepseek_api_key"],
     "WIKI_LLM_PROVIDER": ["wiki_llm_provider", "default_model_provider"],
+    "WIKI_LLM_BASE_URL": ["wiki_llm_base_url", "llm_base_url", "openai_compatible_base_url", "openai_base_url"],
+    "WIKI_LLM_API_KEY": ["wiki_llm_api_key", "llm_api_key", "wiki_llm_token"],
+    "WIKI_LLM_MODEL": ["wiki_llm_model", "llm_model", "wiki_model"],
     "WIKI_DEEPSEEK_MODEL": ["wiki_deepseek_model", "hermes_default_model"],
     "HERMES_MODEL_PROVIDER": ["hermes_model_provider"],
     "HERMES_MODEL": ["hermes_model", "hermes_default_model"],
@@ -194,6 +197,9 @@ RUNTIME_CONFIG_CATEGORIES = {
     "HERMES_OPENAI_API_KEY": "hermes",
     "OPENAI_API_KEY": "hermes",
     "WIKI_LLM_PROVIDER": "llm",
+    "WIKI_LLM_BASE_URL": "llm",
+    "WIKI_LLM_API_KEY": "llm",
+    "WIKI_LLM_MODEL": "llm",
     "WIKI_DEEPSEEK_MODEL": "llm",
     "GOOGLE_CLOUD_API_KEY": "llm",
     "GEMINI_API_KEY": "llm",
@@ -744,6 +750,9 @@ SETTING_CONFIG_LABELS = {
     "GITHUB_TOKEN": "GitHub Token",
     "DEEPSEEK_API_KEY": "DeepSeek API Key",
     "WIKI_LLM_PROVIDER": "Wiki LLM Provider",
+    "WIKI_LLM_BASE_URL": "Wiki LLM Gateway Base URL",
+    "WIKI_LLM_API_KEY": "Wiki LLM Gateway API Key",
+    "WIKI_LLM_MODEL": "Wiki LLM Model",
     "WIKI_DEEPSEEK_MODEL": "Wiki DeepSeek Model",
     "HERMES_MODEL_PROVIDER": "Hermes Model Provider",
     "HERMES_MODEL": "Hermes Default Model",
@@ -846,7 +855,7 @@ def setting_capability_tags(key, category):
     if category == "youtube":
         tags.update({"youtube-research-worker", "content-api"})
     if category == "llm":
-        tags.update({"model", "gemini", "vertex"})
+        tags.update({"model", "llm-gateway", "openai-compatible", "gemini", "vertex"})
     if category == "hermes":
         tags.update({"agent-runtime", "model-auth"})
     if category == "notebooklm":
@@ -5073,6 +5082,78 @@ def resolve_youtube_research_worker_config(node_id, context):
     }
 
 
+def resolve_wiki_llm_config(sop, node_id, context):
+    if node_id != "wiki-build":
+        return None
+    capabilities = (node_registry_item(sop, node_id) or {}).get("capabilities") or {}
+    llm_cap = capabilities.get("llm") if isinstance(capabilities.get("llm"), dict) else {}
+    enabled = bool(llm_cap.get("enabled", True))
+    required = bool(llm_cap.get("required", True))
+    provider = node_run_config_lookup(context, "WIKI_LLM_PROVIDER", RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_PROVIDER", []))
+    base_url = node_run_config_lookup(context, "WIKI_LLM_BASE_URL", RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_BASE_URL", []))
+    api_key = node_run_config_lookup(context, "WIKI_LLM_API_KEY", RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_API_KEY", []))
+    model = node_run_config_lookup(context, "WIKI_LLM_MODEL", RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", []))
+    if is_blank_value(model.get("value")):
+        model = node_run_config_lookup(context, "WIKI_DEEPSEEK_MODEL", RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", []))
+    if is_blank_value(model.get("value")):
+        model = node_run_config_lookup(context, "WIKI_GEMINI_MODEL", RUNTIME_CAPABILITY_ENV.get("WIKI_GEMINI_MODEL", []))
+
+    provider_value = str(provider.get("value") or "openai-compatible").strip() or "openai-compatible"
+    provider_source = provider.get("source") if not is_blank_value(provider.get("value")) else "default"
+    missing = []
+    if enabled and is_blank_value(base_url.get("value")):
+        missing.append("WIKI_LLM_BASE_URL")
+    if enabled and is_blank_value(api_key.get("value")):
+        missing.append("WIKI_LLM_API_KEY")
+    if enabled and is_blank_value(model.get("value")):
+        missing.append("WIKI_LLM_MODEL")
+    if not enabled:
+        status = "disabled"
+    elif missing and required:
+        status = "failed"
+    elif missing:
+        status = "warning"
+    else:
+        status = "ready"
+    return {
+        "capability": "llm",
+        "label": "Wiki LLM Gateway",
+        "enabled": enabled,
+        "required": required,
+        "status": status,
+        "managed_by": llm_cap.get("managed_by") or "runtime-harness",
+        "provider": env_config_item(
+            provider.get("key") or "WIKI_LLM_PROVIDER",
+            "Wiki LLM Provider",
+            required=False,
+            value=provider_value,
+            source=provider_source,
+        ),
+        "base_url": env_config_item(
+            base_url.get("key") or "WIKI_LLM_BASE_URL",
+            "Wiki LLM Gateway Base URL",
+            required=enabled and required,
+            value=str(base_url.get("value") or "").rstrip("/"),
+            source=base_url.get("source") or "missing:WIKI_LLM_BASE_URL",
+        ),
+        "api_key": env_config_item(
+            api_key.get("key") or "WIKI_LLM_API_KEY",
+            "Wiki LLM Gateway API Key",
+            required=enabled and required,
+            value=api_key.get("value"),
+            source=api_key.get("source") or "missing:WIKI_LLM_API_KEY",
+        ),
+        "model": env_config_item(
+            model.get("key") or "WIKI_LLM_MODEL",
+            "Wiki LLM Model",
+            required=enabled and required,
+            value=model.get("value"),
+            source=model.get("source") or "missing:WIKI_LLM_MODEL",
+        ),
+        "missing": missing,
+    }
+
+
 def resolve_git_config(_sop, context):
     token = node_run_config_lookup(context, "GITHUB_TOKEN", ["GH_TOKEN", *RUNTIME_CAPABILITY_ENV.get("GITHUB_TOKEN", [])])
     override = ((context.get("capability_overrides") or {}).get("git") or {}) if isinstance(context.get("capability_overrides"), dict) else {}
@@ -5098,6 +5179,9 @@ def node_run_config_summary(sop, node_id, static, context):
     worker = resolve_youtube_research_worker_config(node_id, context)
     if worker:
         configs["youtube_research_worker"] = worker
+    llm = resolve_wiki_llm_config(sop, node_id, context)
+    if llm:
+        configs["llm"] = llm
     return configs
 
 
@@ -5125,6 +5209,14 @@ def node_run_fix_suggestions(configs, missing_inputs):
             "title": "Fix YouTube Deep Research Worker config",
             "reason": ", ".join(worker.get("missing") or []) or "Worker config is incomplete.",
             "action": "Set YOUTUBE_RESEARCH_WORKFLOW_URL and YOUTUBE_RESEARCH_WORKFLOW_TOKEN on the Runtime, then retry the Node Run.",
+        })
+    llm = configs.get("llm") or {}
+    if llm.get("status") == "failed":
+        suggestions.append({
+            "target": "runtime-settings",
+            "title": "Fix Wiki LLM Gateway config",
+            "reason": ", ".join(llm.get("missing") or []) or "LLM gateway config is incomplete.",
+            "action": "Set WIKI_LLM_BASE_URL, WIKI_LLM_API_KEY and WIKI_LLM_MODEL in Settings or Instance overrides, then retry the Node Run.",
         })
     git = configs.get("github") or {}
     if git.get("status") == "warning":
@@ -5274,6 +5366,7 @@ def node_run_issue_rows(plan, capability_results):
         "git": "runtime-settings",
         "youtube-research-worker": "runtime-settings",
         "youtube_research_worker": "runtime-settings",
+        "llm": "runtime-settings",
     }
     for row in capability_results:
         status = str(row.get("status") or "")
@@ -5552,6 +5645,7 @@ def build_node_run_steps(sop, plan):
     missing = plan.get("missing_inputs") or []
     configs = plan.get("resolved_config") or {}
     worker = configs.get("youtube_research_worker") or {}
+    llm = configs.get("llm") or {}
     telegram = configs.get("telegram") or {}
     git = configs.get("github") or configs.get("git") or {}
     mode = plan.get("mode") or "preflight"
@@ -5561,6 +5655,9 @@ def build_node_run_steps(sop, plan):
     if worker.get("status") == "failed":
         config_status = "failed"
         config_notes.append("youtube research worker config missing")
+    if llm.get("enabled") and llm.get("status") == "failed":
+        config_status = "failed"
+        config_notes.append("wiki llm gateway config missing")
     if telegram.get("enabled") and telegram.get("status") in {"warning", "failed"}:
         if telegram.get("required"):
             config_status = "failed"
