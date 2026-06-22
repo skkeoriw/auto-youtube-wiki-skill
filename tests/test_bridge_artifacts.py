@@ -1480,6 +1480,11 @@ class ArtifactResolutionTest(unittest.TestCase):
                     "draft_type": "edit_node_definition",
                     "node_id": "wiki-build",
                     "title": "Wiki Build Edited",
+                    "executor": {"type": "agent-skill", "agent": "hermes", "skill": "sop-wiki-build", "entry": "scripts/run_wiki_build.sh"},
+                    "skill": "sop-wiki-build",
+                    "entry": "scripts/run_wiki_build.sh",
+                    "agent": "hermes",
+                    "webhook_route": "sop-wiki-build",
                     "inputs": {
                         "reports": {
                             "kind": "files",
@@ -1510,6 +1515,10 @@ class ArtifactResolutionTest(unittest.TestCase):
             self.assertFalse(edit["validation"]["production_dag_changed"])
             self.assertEqual(edit["change_request"]["save_target"], "agent-brain-plugins")
             self.assertEqual(edit["change_request"]["node_id"], "wiki-build")
+            self.assertEqual(edit["change_request"]["proposed"]["executor"]["type"], "agent-skill")
+            self.assertEqual(edit["change_request"]["proposed"]["executor"]["skill"], "sop-wiki-build")
+            self.assertEqual(edit["change_request"]["proposed"]["executor"]["entry"], "scripts/run_wiki_build.sh")
+            self.assertEqual(edit["change_request"]["proposed"]["webhook_route"], "sop-wiki-build")
             self.assertTrue((Path(edit["draft_path"]) / "change_request.json").exists())
             list_response = urllib.request.urlopen(
                 f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
@@ -1868,6 +1877,10 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(plan["relay_mode"], "auto_by_target_inputs")
         self.assertEqual(plan["relay_selection"]["matched_outputs"], ["source_url"])
         self.assertEqual(plan["relay_selection"]["skipped_outputs"], ["metadata_file"])
+        self.assertEqual(plan["resolved_inputs"], [])
+        self.assertEqual(plan["missing_inputs"], [])
+        self.assertEqual(plan["pending_materialization_inputs"][0]["name"], "source_url")
+        self.assertEqual(plan["pending_materialization_inputs"][0]["resolution_state"], "pending_materialization")
 
         bridge.prepare_real_node_context(sop, target_run, "youtube-deep-research", plan)
         input_dir = self.wiki / "raw" / "node-runs" / target_run / "inputs" / "sources"

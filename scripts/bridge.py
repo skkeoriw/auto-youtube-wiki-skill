@@ -2978,6 +2978,11 @@ def validate_node_definition_edit_input(sop, spec):
     for key, direction in (("inputs", "input"), ("optional_inputs", "input"), ("outputs", "output")):
         if key in spec:
             errors.extend(validate_contract_block(normalize_edit_contract(spec.get(key)), direction, key))
+    executor = normalize_edit_contract(spec.get("executor")) if "executor" in spec else None
+    if isinstance(executor, str) and executor in {"__invalid_yaml__", "__invalid_contract__"}:
+        errors.append({"field": "executor", "code": "invalid_contract", "message": "executor must be a JSON/YAML object"})
+    elif executor not in (None, {}) and not isinstance(executor, dict):
+        errors.append({"field": "executor", "code": "invalid_contract", "message": "executor must be a JSON/YAML object"})
     capabilities = normalize_edit_contract(spec.get("capabilities")) if "capabilities" in spec else None
     if isinstance(capabilities, str) and capabilities in {"__invalid_yaml__", "__invalid_contract__"}:
         errors.append({"field": "capabilities", "code": "invalid_contract", "message": "capabilities must be a JSON/YAML object"})
@@ -2997,7 +3002,7 @@ def proposed_node_definition_from_edit(sop, spec):
     current = copy.deepcopy((sop.get("nodes") or {}).get(node_id) or {})
     static = node_static_config(sop, node_id) or {}
     proposed = copy.deepcopy(current)
-    for key in ("title", "description", "purpose", "mode"):
+    for key in ("title", "description", "purpose", "mode", "webhook_route"):
         if key in spec and spec.get(key) not in (None, ""):
             proposed[key] = spec.get(key)
     if "needs" in spec:
@@ -3005,6 +3010,25 @@ def proposed_node_definition_from_edit(sop, spec):
         if isinstance(needs, str):
             needs = [item.strip() for item in needs.split(",") if item.strip()]
         proposed["needs"] = needs if isinstance(needs, list) else []
+    if "executor" in spec:
+        normalized_executor = normalize_edit_contract(spec.get("executor"))
+        if isinstance(normalized_executor, dict):
+            executor = copy.deepcopy(proposed.get("executor") if isinstance(proposed.get("executor"), dict) else {})
+            executor.update(normalized_executor)
+            for alias, target in (("skill", "skill"), ("entry", "entry"), ("agent", "agent")):
+                if alias in spec and spec.get(alias) not in (None, ""):
+                    executor[target] = str(spec.get(alias)).strip()
+            if executor:
+                proposed["executor"] = executor
+    else:
+        executor_updates = {}
+        for alias, target in (("skill", "skill"), ("entry", "entry"), ("agent", "agent")):
+            if alias in spec and spec.get(alias) not in (None, ""):
+                executor_updates[target] = str(spec.get(alias)).strip()
+        if executor_updates:
+            executor = copy.deepcopy(proposed.get("executor") if isinstance(proposed.get("executor"), dict) else {})
+            executor.update(executor_updates)
+            proposed["executor"] = executor
     for key in ("inputs", "optional_inputs", "outputs", "capabilities"):
         if key in spec:
             normalized = normalize_edit_contract(spec.get(key))
@@ -5014,7 +5038,7 @@ def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manua
         if source_node_run_id:
             source_node, source_output = source_ref_output(source)
             item.update({
-                "resolved": True,
+                "resolved": False,
                 "value": f"node-run:{source_node_run_id}",
                 "provenance": f"node-run:{source_node_run_id}",
                 "source_node_run_id": source_node_run_id,
@@ -5023,6 +5047,8 @@ def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manua
                 "target_input": input_name,
                 "relay_mode": normalize_node_run_relay_mode(relay_mode, source_mode),
                 "selected_outputs": normalize_selected_outputs(selected_outputs or []),
+                "resolution_state": "pending_materialization",
+                "reason": "Source Node Run selected; the target input will be resolved from materialized relay outputs before execution.",
             })
             return item
         item["reason"] = "Select a source Node Run so this run can materialize selected relay outputs."
@@ -5111,7 +5137,14 @@ def build_node_test_plan(sop, node_id, body=None):
     relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs, relay_mappings) if source_mode == "existing-node-run" and source_node_run_id else {}
     resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in inputs.items()]
     resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in optional_inputs.items()]
-    missing = [item for item in resolved_inputs if item.get("required") and not item.get("resolved")]
+    pending_materialization = [
+        item for item in resolved_inputs + resolved_optional
+        if item.get("resolution_state") == "pending_materialization"
+    ]
+    missing = [
+        item for item in resolved_inputs
+        if item.get("required") and not item.get("resolved") and item.get("resolution_state") != "pending_materialization"
+    ]
     upstream = []
     for spec in list(inputs.values()) + list(optional_inputs.values()):
         source = str((spec or {}).get("from") if isinstance(spec, dict) else spec or "")
@@ -5140,6 +5173,7 @@ def build_node_test_plan(sop, node_id, body=None):
         "required_inputs": resolved_inputs,
         "optional_inputs": resolved_optional,
         "resolved_inputs": [item for item in resolved_inputs if item.get("resolved")],
+        "pending_materialization_inputs": pending_materialization,
         "missing_inputs": missing,
         "upstream_nodes": upstream,
         "available_existing_runs": recent,
@@ -6196,6 +6230,7 @@ def node_run_lifecycle_steps(plan, steps, real_execution=None, started_at="", fi
     real_execution = real_execution if isinstance(real_execution, dict) else {}
     resolved_inputs = plan.get("resolved_inputs") or []
     missing_inputs = plan.get("missing_inputs") or []
+    pending_inputs = plan.get("pending_materialization_inputs") or []
     execute_step = node_run_step_by_id(steps, "execute-or-dry-run") or {}
     config_step = node_run_step_by_id(steps, "resolve-config") or {}
     validation = real_execution.get("validation") or {}
@@ -6253,6 +6288,7 @@ def node_run_lifecycle_steps(plan, steps, real_execution=None, started_at="", fi
                 "mode": plan.get("mode"),
                 "input_source": plan.get("input_source"),
                 "resolved_inputs": resolved_inputs,
+                "pending_materialization_inputs": pending_inputs,
                 "missing_inputs": missing_inputs,
                 "config_status": config_step.get("status"),
                 "command": command,
@@ -6306,6 +6342,7 @@ def node_run_lifecycle_steps(plan, steps, real_execution=None, started_at="", fi
 def build_node_run_steps(sop, plan):
     wiki = Path(sop.get("wiki_local_path", ""))
     missing = plan.get("missing_inputs") or []
+    pending_inputs = plan.get("pending_materialization_inputs") or []
     configs = plan.get("resolved_config") or {}
     worker = configs.get("youtube_research_worker") or {}
     llm = configs.get("llm") or {}
@@ -6357,7 +6394,7 @@ def build_node_run_steps(sop, plan):
             "resolve-inputs",
             "Resolve node inputs",
             "needs_input" if missing else "done",
-            f"{len(plan.get('resolved_inputs') or [])} resolved, {len(missing)} missing.",
+            f"{len(plan.get('resolved_inputs') or [])} resolved, {len(pending_inputs)} pending relay, {len(missing)} missing.",
             {
                 "input_source": plan.get("input_source"),
                 "base_run_id": plan.get("base_run_id"),
@@ -6367,6 +6404,7 @@ def build_node_run_steps(sop, plan):
                 "relay_mappings": plan.get("relay_mappings") or [],
                 "relay_selection": plan.get("relay_selection") or {},
                 "resolved_inputs": plan.get("resolved_inputs") or [],
+                "pending_materialization_inputs": pending_inputs,
                 "missing_inputs": missing,
             },
         ),
