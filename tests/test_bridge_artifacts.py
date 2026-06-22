@@ -248,6 +248,21 @@ class ArtifactResolutionTest(unittest.TestCase):
             f"raw/node-runs/{run_id}/outputs/files/metadata.json"
         ])
         self.assertEqual(detail["validation"]["status"], "passed")
+        self.assertEqual([item["name"] for item in detail["core_outputs"]], ["source_url", "metadata_file"])
+        self.assertEqual(detail["core_outputs"][0]["kind"], "scalar")
+        self.assertEqual(detail["core_outputs"][1]["kind"], "file")
+        self.assertEqual(
+            [artifact["path"] for artifact in detail["business_artifacts"]],
+            [f"raw/node-runs/{run_id}/outputs/files/metadata.json"],
+        )
+        self.assertEqual(detail["relay_package"]["manifest_path"], f"raw/node-runs/{run_id}/outputs/files/manifest.json")
+        self.assertEqual(
+            [(item["output"], item["path"]) for item in detail["relay_package"]["items"]],
+            [
+                ("source_url", f"raw/node-runs/{run_id}/outputs/files/source-url.txt"),
+                ("metadata_file", f"raw/node-runs/{run_id}/outputs/files/metadata.json"),
+            ],
+        )
 
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))

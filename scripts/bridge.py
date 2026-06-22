@@ -6656,6 +6656,170 @@ def collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs
     }
 
 
+def node_run_actual_output_file_paths(actual_outputs):
+    paths = []
+    for value in (actual_outputs or {}).values():
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            text = str(item or "").strip()
+            if not text or "://" in text:
+                continue
+            paths.append(text)
+    return ordered_unique(paths)
+
+
+def node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    artifact_by_path = {
+        str(artifact.get("path") or ""): artifact
+        for artifact in artifacts or []
+        if isinstance(artifact, dict) and artifact.get("path")
+    }
+    rows = []
+    for name, spec in (declared_outputs or {}).items():
+        value = (actual_outputs or {}).get(name)
+        output_type = str((spec or {}).get("type") or "").lower()
+        if isinstance(value, list):
+            files = []
+            file_artifacts = []
+            for relative in value:
+                relative = str(relative or "").strip()
+                if not relative:
+                    continue
+                files.append(relative)
+                artifact = artifact_by_path.get(relative)
+                if artifact:
+                    file_artifacts.append(artifact)
+            rows.append({
+                "name": name,
+                "kind": "files" if len(files) != 1 else "file",
+                "type": output_type or ("files" if len(files) != 1 else "file"),
+                "value": files,
+                "files": files,
+                "artifacts": file_artifacts,
+                "declared": spec,
+            })
+            continue
+        if isinstance(value, str) and value and "://" not in value:
+            path = safe_artifact_path(wiki, value)
+            if path and path.is_file():
+                artifact = artifact_by_path.get(value) or artifact_record(sop, node_id, name, path, "actual-output")
+                rows.append({
+                    "name": name,
+                    "kind": "file",
+                    "type": output_type or "file",
+                    "value": value,
+                    "files": [value],
+                    "artifacts": [artifact] if artifact else [],
+                    "declared": spec,
+                })
+                continue
+        rows.append({
+            "name": name,
+            "kind": "scalar",
+            "type": output_type or "scalar",
+            "value": value,
+            "files": [],
+            "artifacts": [],
+            "declared": spec,
+        })
+    return rows
+
+
+def node_run_business_artifacts_from_core(core_outputs):
+    seen = set()
+    rows = []
+    for output in core_outputs or []:
+        for artifact in output.get("artifacts") or []:
+            if not isinstance(artifact, dict):
+                continue
+            key = artifact.get("path") or artifact.get("id")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append(artifact)
+    return rows
+
+
+def node_run_relay_package(sop, node_run_id, node_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    output_dir = node_run_output_files_dir(sop, node_run_id)
+    manifest_path = output_dir / "manifest.json"
+    records = node_run_output_manifest_records(sop, node_run_id)
+    items = []
+    for record in records:
+        artifact = artifact_record(sop, node_id, str(record.get("output") or "files"), record.get("file"), "node-run-output-manifest")
+        items.append({
+            "output": record.get("output") or "",
+            "path": record.get("path") or "",
+            "relative_path": record.get("path", "").replace(safe_relative_file(wiki, output_dir).rstrip("/") + "/", "", 1) if record.get("path") else "",
+            "value_type": record.get("value_type") or node_run_manifest_value_type(record.get("file")),
+            "source": record.get("source") or "",
+            "source_node": record.get("source_node") or "",
+            "source_run_id": record.get("source_run_id") or "",
+            "source_path": record.get("source_path") or "",
+            "artifact": artifact,
+        })
+    return {
+        "kind": "relay-package",
+        "output_directory": safe_relative_file(wiki, output_dir),
+        "manifest_path": safe_relative_file(wiki, manifest_path),
+        "item_count": len(items),
+        "items": items,
+    }
+
+
+def node_run_execution_evidence(sop, node_run_id, node_id, artifacts):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    evidence = []
+    evidence.extend(node_run_agent_artifacts(sop, node_run_id, node_id))
+    for relative, output_name, title in (
+        (f"raw/node-runs/{node_run_id}/result.json", "node_run_result", "Node Run Result"),
+        (f"raw/node-runs/{node_run_id}/events.jsonl", "node_run_events", "Node Run Events"),
+        (f"raw/node-runs/{node_run_id}/executor.log", "executor_log", "Executor Log"),
+        (f"logs/stage-events/{node_run_id}.jsonl", "stage_events", "Stage Events"),
+    ):
+        path = safe_artifact_path(wiki, relative)
+        if not path or not path.is_file():
+            continue
+        record = artifact_record(sop, node_id, output_name, path, "execution-evidence")
+        if record:
+            record["title"] = title
+            evidence.append(record)
+    existing = {item.get("path") for item in evidence if isinstance(item, dict)}
+    for artifact in artifacts or []:
+        if not isinstance(artifact, dict):
+            continue
+        path = artifact.get("path")
+        artifact_type = str(artifact.get("type") or "")
+        resolution = str(artifact.get("resolution") or "")
+        if path in existing:
+            continue
+        if artifact_type.startswith("node-run.") or resolution in {"node-run-agent", "execution-evidence"}:
+            evidence.append(artifact)
+            existing.add(path)
+    return {"artifacts": evidence, "count": len(evidence)}
+
+
+def hydrate_node_run_result_views(sop, result):
+    if not isinstance(result, dict):
+        return result
+    node_run_id = sanitize_node_run_id(result.get("node_run_id") or result.get("pipeline_id") or "")
+    node_id = str(result.get("node_id") or "")
+    if not node_run_id or not node_id:
+        return result
+    config = (sop.get("nodes") or {}).get(node_id) or {}
+    declared_outputs = normalized_contract(config.get("outputs") or {}, "output")
+    actual_outputs = result.get("actual_outputs") if isinstance(result.get("actual_outputs"), dict) else {}
+    artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+    core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
+    result["core_outputs"] = core_outputs
+    result["business_artifacts"] = node_run_business_artifacts_from_core(core_outputs)
+    result["relay_package"] = node_run_relay_package(sop, node_run_id, node_id)
+    result["execution_evidence"] = node_run_execution_evidence(sop, node_run_id, node_id, artifacts)
+    return result
+
+
 def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     output_dir = node_run_output_files_dir(sop, node_run_id)
@@ -6855,10 +7019,15 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
         name for name, value in actual_outputs.items()
         if value is None or value == "" or value == []
     ]
+    core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
     return {
         "declared_outputs": declared_outputs,
         "actual_outputs": actual_outputs,
         "artifacts": artifacts,
+        "core_outputs": core_outputs,
+        "business_artifacts": node_run_business_artifacts_from_core(core_outputs),
+        "relay_package": node_run_relay_package(sop, node_run_id, node_id),
+        "execution_evidence": node_run_execution_evidence(sop, node_run_id, node_id, artifacts),
         "output_categories": collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs),
         "input_manifest": safe_relative_file(wiki, node_run_manifest_path(sop, node_run_id, "input")),
         "input_directory": safe_relative_file(wiki, node_run_input_sources_dir(sop, node_run_id)),
@@ -7017,6 +7186,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         artifact for artifact in agent_artifacts
         if artifact.get("path") not in {item.get("path") for item in output_info["artifacts"] if isinstance(item, dict)}
     ])
+    output_info["execution_evidence"] = node_run_execution_evidence(sop, node_run_id, node_id, output_info["artifacts"])
     return {
         "status": status,
         "summary": summary,
@@ -7026,6 +7196,10 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "log_path": str(log_path),
         "actual_outputs": output_info["actual_outputs"],
         "artifacts": output_info["artifacts"],
+        "business_artifacts": output_info["business_artifacts"],
+        "core_outputs": output_info["core_outputs"],
+        "relay_package": output_info["relay_package"],
+        "execution_evidence": output_info["execution_evidence"],
         "output_categories": output_info["output_categories"],
         "input_directory": output_info["input_directory"],
         "input_manifest": output_info["input_manifest"],
@@ -7057,6 +7231,9 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             "node_state": output_info["node_state"],
             "capabilities": output_info["capabilities"],
             "actual_outputs": output_info["actual_outputs"],
+            "core_outputs": output_info["core_outputs"],
+            "relay_package": output_info["relay_package"],
+            "execution_evidence": output_info["execution_evidence"],
             "output_categories": output_info["output_categories"],
             "validation": output_info["validation"],
         },
@@ -7150,6 +7327,9 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "events": events,
         "artifacts": artifacts,
         "actual_outputs": (real_execution or {}).get("actual_outputs") or {},
+        "core_outputs": (real_execution or {}).get("core_outputs") or [],
+        "relay_package": (real_execution or {}).get("relay_package") or {},
+        "execution_evidence": (real_execution or {}).get("execution_evidence") or {},
         "output_categories": (real_execution or {}).get("output_categories") or {},
         "input_directory": (real_execution or {}).get("input_directory") or "",
         "input_manifest": (real_execution or {}).get("input_manifest") or "",
@@ -7158,7 +7338,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "validation": (real_execution or {}).get("validation") or {},
         "capabilities": (real_execution or {}).get("capabilities") or {},
         "agent_request": (real_execution or {}).get("agent_request") or {},
-        "business_artifacts": (real_execution or {}).get("artifacts") or [],
+        "business_artifacts": (real_execution or {}).get("business_artifacts") or [],
         "runtime_context": plan.get("runtime_context") or {},
         "instance_context": plan.get("instance_context") or {},
         "definition_defaults": plan.get("definition_defaults") or {},
@@ -7170,6 +7350,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
     }
     hydrate_node_run_input_artifacts(sop, result)
+    hydrate_node_run_result_views(sop, result)
     return result
 
 
@@ -7482,6 +7663,7 @@ def read_node_run_result(sop, node_id, node_run_id):
     hydrate_node_run_input_artifacts(sop, result)
     hydrate_node_run_agent_request(sop, result)
     hydrate_node_run_capability_history(sop, result)
+    hydrate_node_run_result_views(sop, result)
     result["detail"] = mask_data(result.get("detail") or {})
     return result
 
