@@ -2179,6 +2179,9 @@ def node_static_config(sop, node_id):
     manifest = read_yaml(skill_dir / "node.yaml") if (skill_dir / "node.yaml").exists() else {}
     manifest_executor = manifest.get("executor") if isinstance(manifest.get("executor"), dict) else {}
     configured_executor = config.get("executor") if isinstance(config.get("executor"), dict) else {}
+    manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+    manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
 
     return {
         "node_id": node_id,
@@ -2194,9 +2197,9 @@ def node_static_config(sop, node_id):
             "skill": config.get("skill") or manifest_executor.get("skill", ""),
             "webhook_route": config.get("webhook_route", ""),
         },
-        "inputs": config.get("inputs", {}),
-        "outputs": config.get("outputs", {}),
-        "optional_inputs": config.get("optional_inputs", {}),
+        "inputs": merge_contracts(manifest_inputs, config.get("inputs", {}), "input"),
+        "outputs": merge_contracts(manifest_outputs, config.get("outputs", {}), "output"),
+        "optional_inputs": merge_contracts(manifest_optional_inputs, config.get("optional_inputs", {}), "input"),
         "infra": config.get("infra", {"tg_notify": True, "log_record": True}),
         "params": config.get("params") or {},
         "action_steps": config.get("actions") or manifest.get("actions") or [],
@@ -2302,6 +2305,30 @@ def normalize_contract(value, direction):
         else:
             result[name] = {"type": "files" if "*" in str(spec) else "file", "path": spec}
     return result
+
+
+def merge_contracts(definition_value, binding_value, direction):
+    definition = normalize_contract(definition_value, direction)
+    binding = normalize_contract(binding_value, direction)
+    merged = {}
+    for name in ordered_unique([*definition.keys(), *binding.keys()]):
+        item = {}
+        if isinstance(definition.get(name), dict):
+            item.update(definition[name])
+        if isinstance(binding.get(name), dict):
+            # Workflow bindings supply runtime wiring such as `from` or path. They
+            # should not erase definition-owned type/resolver metadata.
+            for key, value in binding[name].items():
+                if key in {"from", "path", "type"} or key not in item:
+                    item[key] = value
+        if direction == "input":
+            item.setdefault("required", True)
+            item.setdefault("kind", "scalar" if item.get("type") in {"string", "scalar"} else item.get("type", "auto"))
+        else:
+            item.setdefault("kind", "file" if item.get("type") in {"file", "files"} else item.get("type", "scalar"))
+            item.setdefault("relayable", True)
+        merged[name] = item
+    return merged
 
 
 def validate_node_definition(node_id, config, static):
@@ -4607,6 +4634,28 @@ def normalize_selected_outputs(value):
     return ordered_unique(result)
 
 
+def normalize_relay_mappings(value):
+    if not isinstance(value, list):
+        return []
+    rows = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        source_output = str(item.get("source_output") or item.get("sourceOutput") or item.get("output") or "").strip()
+        target_input = str(item.get("target_input") or item.get("targetInput") or item.get("input") or "").strip()
+        resolver = str(item.get("resolver") or item.get("resolver_id") or item.get("resolverId") or "").strip()
+        if not source_output or not re.match(r"^[A-Za-z0-9_.-]+$", source_output):
+            continue
+        if target_input and not re.match(r"^[A-Za-z0-9_.-]+$", target_input):
+            target_input = ""
+        rows.append({
+            "source_output": source_output,
+            "target_input": target_input,
+            "resolver": resolver,
+        })
+    return rows
+
+
 def source_ref_output(source):
     match = re.match(r"^([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)$", str(source or ""))
     if not match:
@@ -4634,12 +4683,19 @@ def node_input_binding_specs(sop, node_id):
     return rows
 
 
-def node_run_relay_selection_plan(sop, target_node_id, source_node_run_id, relay_mode="", selected_outputs=None):
+def node_run_relay_selection_plan(sop, target_node_id, source_node_run_id, relay_mode="", selected_outputs=None, relay_mappings=None):
     source_items = node_run_source_manifest_items(sop, source_node_run_id)
     selected_outputs = normalize_selected_outputs(selected_outputs or [])
+    relay_mappings = normalize_relay_mappings(relay_mappings or [])
     relay_mode = normalize_node_run_relay_mode(relay_mode, "existing-node-run")
     source_node = next((str(item.get("source_node") or "") for item in source_items if item.get("source_node")), "")
     bindings = node_input_binding_specs(sop, target_node_id)
+    static = node_static_config(sop, target_node_id) or {}
+    required_contract = normalize_contract(static.get("inputs") or {}, "input")
+    required_target_inputs = [
+        name for name, spec in required_contract.items()
+        if bool((spec or {}).get("required", True))
+    ]
     input_by_output = {}
     for binding in bindings:
         source_output = binding.get("source_output") or ""
@@ -4652,12 +4708,17 @@ def node_run_relay_selection_plan(sop, target_node_id, source_node_run_id, relay
         target_input = binding.get("target_input") or ""
         if target_input:
             input_by_output.setdefault(target_input, target_input)
+    mapping_by_output = {
+        item["source_output"]: item
+        for item in relay_mappings
+        if item.get("source_output")
+    }
 
     if relay_mode == "all_outputs":
         allowed = {str(item.get("output") or item.get("source_output") or "") for item in source_items}
         reason = "explicit-all-outputs"
     elif relay_mode == "selected_outputs":
-        allowed = set(selected_outputs)
+        allowed = set(mapping_by_output.keys()) or set(selected_outputs)
         reason = "explicit-selected-outputs"
     else:
         allowed = set(input_by_output.keys())
@@ -4673,21 +4734,39 @@ def node_run_relay_selection_plan(sop, target_node_id, source_node_run_id, relay
     for item in source_items:
         output_name = str(item.get("output") or item.get("source_output") or "").strip()
         if relay_mode == "all_outputs" or (output_name and output_name in allowed):
-            target_input = input_by_output.get(output_name) or output_name
-            matched.append({**item, "target_input": target_input, "input_name": target_input, "relay_match_reason": reason})
+            explicit = mapping_by_output.get(output_name) or {}
+            if relay_mode == "all_outputs" and len(required_target_inputs) == 1:
+                target_input = explicit.get("target_input") or required_target_inputs[0]
+            else:
+                target_input = explicit.get("target_input") or input_by_output.get(output_name)
+            target_input = target_input or output_name
+            matched.append({
+                **item,
+                "target_input": target_input,
+                "input_name": target_input,
+                "resolver": explicit.get("resolver") or "",
+                "relay_match_reason": reason,
+            })
         else:
             skipped.append({**item, "relay_skip_reason": "not-selected"})
+    available = ordered_unique([str(item.get("output") or item.get("source_output") or "") for item in source_items if item.get("output") or item.get("source_output")])
+    invalid_mappings = [
+        item for item in relay_mappings
+        if item.get("source_output") not in available
+    ]
     return {
         "relay_mode": relay_mode,
         "source_node_run_id": sanitize_node_run_id(source_node_run_id),
         "source_node": source_node,
         "selected_outputs": selected_outputs,
+        "relay_mappings": relay_mappings,
         "target_node_id": target_node_id,
         "bindings": bindings,
         "matched_outputs": ordered_unique([str(item.get("output") or item.get("source_output") or "") for item in matched if item.get("output") or item.get("source_output")]),
         "matched_items": matched,
         "skipped_outputs": ordered_unique([str(item.get("output") or item.get("source_output") or "") for item in skipped if item.get("output") or item.get("source_output")]),
-        "available_outputs": ordered_unique([str(item.get("output") or item.get("source_output") or "") for item in source_items if item.get("output") or item.get("source_output")]),
+        "available_outputs": available,
+        "invalid_mappings": invalid_mappings,
     }
 
 
@@ -4802,10 +4881,11 @@ def build_node_test_plan(sop, node_id, body=None):
     source_node_run_id = sanitize_node_run_id(body.get("source_node_run_id") or body.get("node_run_source_id") or body.get("from_node_run_id") or "")
     relay_mode = normalize_node_run_relay_mode(body.get("relay_mode") or body.get("relayMode"), source_mode)
     selected_outputs = normalize_selected_outputs(body.get("selected_outputs") or body.get("selectedOutputs") or [])
+    relay_mappings = normalize_relay_mappings(body.get("relay_mappings") or body.get("relayMappings") or [])
     manual_inputs = body.get("manual_inputs") if isinstance(body.get("manual_inputs"), dict) else {}
     inputs = normalize_contract(static.get("inputs", {}), "input")
     optional_inputs = normalize_contract(static.get("optional_inputs", {}), "input")
-    relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs) if source_mode == "existing-node-run" and source_node_run_id else {}
+    relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs, relay_mappings) if source_mode == "existing-node-run" and source_node_run_id else {}
     resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in inputs.items()]
     resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in optional_inputs.items()]
     missing = [item for item in resolved_inputs if item.get("required") and not item.get("resolved")]
@@ -4831,6 +4911,7 @@ def build_node_test_plan(sop, node_id, body=None):
         "source_node_run_id": source_node_run_id,
         "relay_mode": relay_mode,
         "selected_outputs": selected_outputs,
+        "relay_mappings": relay_mappings,
         "relay_selection": mask_data(relay_selection),
         "manual_inputs": manual_inputs,
         "required_inputs": resolved_inputs,
@@ -5038,6 +5119,12 @@ def list_generic_node_tests(sop, node_id, limit=10):
 
 def sanitize_node_run_id(value):
     return re.sub(r"[^A-Za-z0-9._-]", "", str(value or ""))
+
+
+class NodeRunInputResolutionError(RuntimeError):
+    def __init__(self, message, detail=None):
+        super().__init__(message)
+        self.detail = detail if isinstance(detail, dict) else {}
 
 
 def workflow_id_matches(sop, workflow_id):
@@ -6054,6 +6141,7 @@ def build_node_run_steps(sop, plan):
                 "source_node_run_id": plan.get("source_node_run_id"),
                 "relay_mode": plan.get("relay_mode"),
                 "selected_outputs": plan.get("selected_outputs") or [],
+                "relay_mappings": plan.get("relay_mappings") or [],
                 "relay_selection": plan.get("relay_selection") or {},
                 "resolved_inputs": plan.get("resolved_inputs") or [],
                 "missing_inputs": missing,
@@ -6116,7 +6204,7 @@ def build_node_run_steps(sop, plan):
             "Validate declared outputs",
             "waiting" if mode == "real-node" and real_supported and not missing and config_status != "failed" else "skipped",
             "Waiting for real node outputs." if mode == "real-node" and real_supported and not missing and config_status != "failed" else "No business execution occurred, so output validation is informational only.",
-            {"declared_outputs": normalize_contract((sop.get("nodes") or {}).get(plan.get("node_id"), {}).get("outputs", {}), "output")},
+            {"declared_outputs": normalize_contract((node_static_config(sop, plan.get("node_id")) or {}).get("outputs", {}), "output")},
         ),
         node_run_step(
             "persist-to-github",
@@ -6461,6 +6549,175 @@ def node_run_input_resolved_values(items):
     return values
 
 
+def json_path_lookup(data, path):
+    text = str(path or "").strip()
+    if not text.startswith("$."):
+        return None
+    current = data
+    for part in text[2:].split("."):
+        if isinstance(current, dict) and part in current:
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def node_input_resolvers(spec):
+    resolvers = spec.get("resolvers") if isinstance(spec, dict) else []
+    if isinstance(resolvers, dict):
+        resolvers = [resolvers]
+    if not isinstance(resolvers, list):
+        resolvers = []
+    rows = []
+    for item in resolvers:
+        if isinstance(item, str):
+            rows.append({"kind": item})
+        elif isinstance(item, dict):
+            rows.append(dict(item))
+    return rows
+
+
+def validate_resolved_input_value(value, spec):
+    text = str(value or "").strip()
+    if not text:
+        return False, "resolved value is blank"
+    value_type = str((spec or {}).get("value_type") or (spec or {}).get("type") or "").strip().lower()
+    if value_type == "url" and not re.match(r"^https?://\S+$", text):
+        return False, "resolved value is not a valid url"
+    if value_type == "json":
+        try:
+            json.loads(text)
+        except Exception:
+            return False, "resolved value is not valid json"
+    return True, ""
+
+
+def resolve_scalar_input_from_item(wiki, item, spec):
+    materialized = str(item.get("materialized_path") or "").strip()
+    path = safe_artifact_path(wiki, materialized)
+    if not path or not path.is_file():
+        return "", "", f"materialized input file is missing: {materialized}"
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return "", "", str(exc)
+    resolvers = node_input_resolvers(spec)
+    if not resolvers:
+        return "", "", "input contract has no resolver"
+    selected_resolver = str(item.get("resolver") or "").strip()
+    if selected_resolver:
+        preferred = []
+        fallback = []
+        for resolver in resolvers:
+            resolver_id = str(resolver.get("id") or resolver.get("name") or resolver.get("kind") or resolver.get("type") or "").strip()
+            if resolver_id == selected_resolver:
+                preferred.append(resolver)
+            else:
+                fallback.append(resolver)
+        resolvers = preferred or resolvers
+    for resolver in resolvers:
+        kind = str(resolver.get("kind") or resolver.get("type") or "").strip()
+        resolver_id = str(resolver.get("id") or resolver.get("name") or kind).strip()
+        value = None
+        if kind == "direct":
+            value = content.strip()
+        elif kind in {"whole_file", "text"}:
+            value = content
+        elif kind == "json_path":
+            try:
+                value = json_path_lookup(json.loads(content), resolver.get("path"))
+            except Exception:
+                value = None
+        elif kind == "regex":
+            pattern = str(resolver.get("pattern") or "").strip()
+            if pattern:
+                try:
+                    match = re.search(pattern, content)
+                except re.error:
+                    match = None
+                if match:
+                    value = match.group(1) if match.groups() else match.group(0)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)
+        ok, reason = validate_resolved_input_value(value, spec)
+        if ok:
+            return str(value).strip(), resolver_id, ""
+        last_reason = reason
+    return "", "", locals().get("last_reason") or "no resolver matched this input"
+
+
+def validate_materialized_node_inputs(sop, node_id, items, source_mode):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    static = node_static_config(sop, node_id) or {}
+    required = normalize_contract(static.get("inputs", {}), "input")
+    optional = normalize_contract(static.get("optional_inputs", {}), "input")
+    contracts = {**optional, **required}
+    required_names = [name for name, spec in required.items() if bool((spec or {}).get("required", True))]
+    resolved_values = {}
+    errors = []
+    resolutions = []
+    items_by_input = {}
+    for item in items or []:
+        target = str(item.get("target_input") or item.get("input_name") or item.get("source_output") or "").strip()
+        if target:
+            items_by_input.setdefault(target, []).append(item)
+    for input_name in ordered_unique([*contracts.keys(), *items_by_input.keys()]):
+        spec = contracts.get(input_name) or {"kind": "file", "required": False}
+        kind = str(spec.get("kind") or spec.get("type") or "auto").strip().lower()
+        candidates = items_by_input.get(input_name) or []
+        if not candidates:
+            if input_name in required_names:
+                errors.append({
+                    "input": input_name,
+                    "reason": "required input has no mapped source output",
+                    "source_mode": source_mode,
+                })
+            continue
+        if kind in {"scalar", "string", "text", "auto"} and node_input_resolvers(spec):
+            value = ""
+            resolver_id = ""
+            reason = ""
+            for item in candidates:
+                value, resolver_id, reason = resolve_scalar_input_from_item(wiki, item, spec)
+                if value:
+                    item["resolved_value"] = value
+                    item["resolver"] = item.get("resolver") or resolver_id
+                    resolved_values[input_name] = value
+                    resolutions.append({
+                        "input": input_name,
+                        "source_output": item.get("source_output") or item.get("output") or "",
+                        "materialized_path": item.get("materialized_path") or "",
+                        "resolver": resolver_id,
+                        "value_preview": value[:1000],
+                    })
+                    break
+            if not value:
+                errors.append({
+                    "input": input_name,
+                    "reason": reason or "mapped source output could not satisfy scalar input contract",
+                    "source_outputs": [item.get("source_output") or item.get("output") for item in candidates],
+                })
+        else:
+            paths = [str(item.get("materialized_path") or "").strip() for item in candidates if item.get("materialized_path")]
+            if paths:
+                resolved_values[input_name] = paths if len(paths) > 1 else paths[0]
+                resolutions.append({
+                    "input": input_name,
+                    "source_outputs": [item.get("source_output") or item.get("output") for item in candidates],
+                    "materialized_paths": paths,
+                })
+            elif input_name in required_names:
+                errors.append({"input": input_name, "reason": "required file input was not materialized"})
+    return {
+        "status": "failed" if errors else "passed",
+        "errors": errors,
+        "resolved_values": resolved_values,
+        "resolutions": resolutions,
+    }
+
+
 def materialize_resolved_input_value(wiki, target_dir, index, resolved, source_url):
     value = resolved.get("value")
     values = value if isinstance(value, list) else [value]
@@ -6514,7 +6771,7 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
 
     source_item = node_run_resolved_input_item(plan, "source_url") or node_run_resolved_input_item(plan, "url")
     source_url = source_item.get("value") if source_item else ""
-    if is_blank_value(source_url):
+    if is_blank_value(source_url) and (plan.get("input_source") or "generated-fixture") != "existing-node-run":
         source_url = ctx.get("source_url") or ctx.get("url") or "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
     items = []
@@ -6523,9 +6780,10 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
     if source_mode == "existing-node-run":
         relay_mode = plan.get("relay_mode") or "auto_by_target_inputs"
         selected_outputs = plan.get("selected_outputs") or []
+        relay_mappings = plan.get("relay_mappings") or []
         relay_selection = plan.get("relay_selection") if isinstance(plan.get("relay_selection"), dict) else {}
         if not relay_selection.get("matched_items"):
-            relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs)
+            relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs, relay_mappings)
         for source_item in relay_selection.get("matched_items") or []:
             source_rel = str(source_item.get("source_path") or "")
             row = copy_node_run_input_file(wiki, source_rel, target_dir, len(items) + 1, {
@@ -6554,6 +6812,7 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
         rel = safe_relative_file(wiki, target_dir / item.get("path", ""))
         if rel:
             item["materialized_path"] = rel
+    input_validation = validate_materialized_node_inputs(sop, node_id, items, source_mode)
 
     manifest_path = node_run_manifest_path(sop, node_run_id, "input")
     manifest = write_node_run_io_manifest(
@@ -6568,6 +6827,8 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
             "relay_mode": plan.get("relay_mode") or "",
             "selected_outputs": plan.get("selected_outputs") or [],
             "matched_outputs": (plan.get("relay_selection") or {}).get("matched_outputs") or [],
+            "relay_mappings": plan.get("relay_mappings") or [],
+            "input_validation": input_validation,
         },
     )
     input_files = []
@@ -6576,34 +6837,67 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
         if rel:
             input_files.append(rel)
     return {
-        "source_url": node_run_input_resolved_values(items).get("source_url") or node_run_input_resolved_values(items).get("url") or source_url,
+        "source_url": (input_validation.get("resolved_values") or {}).get("source_url") or node_run_input_resolved_values(items).get("source_url") or node_run_input_resolved_values(items).get("url") or source_url,
         "manifest": manifest,
         "manifest_path": safe_relative_file(wiki, manifest_path),
         "directory": safe_relative_file(wiki, target_dir),
         "files": ordered_unique(input_files),
         "markdown_files": [path for path in ordered_unique(input_files) if Path(path).suffix.lower() == ".md"],
         "text_files": [path for path in ordered_unique(input_files) if Path(path).suffix.lower() in {".md", ".txt"}],
-        "resolved_values": node_run_input_resolved_values(items),
+        "resolved_values": {**node_run_input_resolved_values(items), **(input_validation.get("resolved_values") or {})},
         "relay_selection": plan.get("relay_selection") or {},
+        "input_validation": input_validation,
     }
 
 
-def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run_id):
+def node_run_materialized_paths_for_inputs(input_info, input_names, suffixes=None):
+    names = set(input_names or [])
+    suffixes = {item.lower() for item in (suffixes or [])}
+    rows = []
+    manifest = input_info.get("manifest") if isinstance(input_info.get("manifest"), dict) else {}
+    for item in manifest.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        target = str(item.get("target_input") or item.get("input_name") or item.get("source_output") or "").strip()
+        if names and target not in names:
+            continue
+        relative = str(item.get("materialized_path") or "").strip()
+        if not relative:
+            continue
+        if suffixes and Path(relative).suffix.lower() not in suffixes:
+            continue
+        rows.append(relative)
+    return ordered_unique(rows)
+
+
+def apply_resolved_inputs_to_pipeline_context(sop, wiki, ctx, plan, node_id, node_run_id):
     input_info = materialize_node_run_inputs(
-        {"wiki_local_path": str(wiki), **({"id": plan.get("instance_id")} if plan.get("instance_id") else {})},
+        {**sop, "wiki_local_path": str(wiki), **({"id": plan.get("instance_id")} if plan.get("instance_id") else {})},
         node_run_id,
         node_id,
         plan,
         ctx,
     )
+    input_validation = input_info.get("input_validation") if isinstance(input_info.get("input_validation"), dict) else {}
+    if input_validation.get("status") == "failed":
+        raise NodeRunInputResolutionError(
+            "Required node inputs could not be resolved from the selected relay outputs.",
+            {
+                "input_validation": input_validation,
+                "input_manifest": input_info.get("manifest_path"),
+                "input_directory": input_info.get("directory"),
+                "relay_selection": input_info.get("relay_selection") or {},
+            },
+        )
     source_item = node_run_resolved_input_item(plan, "source_url") or node_run_resolved_input_item(plan, "url")
     source_url = input_info.get("source_url") or (source_item.get("value") if source_item else "")
     if isinstance(source_url, str) and source_url.startswith("node-run:"):
         source_url = ""
-    if is_blank_value(source_url):
+    if is_blank_value(source_url) and (plan.get("input_source") or "generated-fixture") != "existing-node-run":
         source_url = ctx.get("source_url") or ctx.get("url") or "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
-    ctx["source_url"] = source_url
+    if not is_blank_value(source_url):
+        ctx["source_url"] = source_url
     ctx["source_type"] = ctx.get("source_type") or "youtube"
     ctx["node_run_resolved_inputs"] = {
         item.get("name"): item.get("value")
@@ -6615,8 +6909,11 @@ def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run
     ctx["node_run_input_manifest"] = input_info.get("manifest_path")
     ctx["node_run_input_files"] = input_info.get("files") or []
 
+    source_mode = plan.get("input_source") or "generated-fixture"
     reports_item = node_run_resolved_input_item(plan, "reports")
-    report_paths = input_info.get("markdown_files") or normalize_node_run_input_paths(reports_item.get("value") if reports_item else [])
+    report_paths = node_run_materialized_paths_for_inputs(input_info, {"reports"}, {".md", ".txt"})
+    if not report_paths and source_mode != "existing-node-run":
+        report_paths = normalize_node_run_input_paths(reports_item.get("value") if reports_item else [])
     if report_paths:
         if (reports_item or {}).get("provenance") in {"generated-fixture", "deepseek-mock-fallback"}:
             for relative in report_paths:
@@ -6626,7 +6923,9 @@ def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run
         ctx["stage_b"] = stage_b
 
     deep_item = node_run_resolved_input_item(plan, "deep_research") or node_run_resolved_input_item(plan, "analysis_file")
-    deep_paths = input_info.get("markdown_files") or normalize_node_run_input_paths(deep_item.get("value") if deep_item else [])
+    deep_paths = node_run_materialized_paths_for_inputs(input_info, {"deep_research", "analysis_file"}, {".md", ".txt"})
+    if not deep_paths and source_mode != "existing-node-run":
+        deep_paths = normalize_node_run_input_paths(deep_item.get("value") if deep_item else [])
     if deep_paths:
         stage_b2 = ctx.get("stage_b2") if isinstance(ctx.get("stage_b2"), dict) else {}
         stage_b2["analysis_file"] = deep_paths[0]
@@ -6642,7 +6941,7 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
     ctx = read_json(ctx_file) or {}
     if not isinstance(ctx, dict):
         ctx = {}
-    ctx, input_info = apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run_id)
+    ctx, input_info = apply_resolved_inputs_to_pipeline_context(sop, wiki, ctx, plan, node_id, node_run_id)
     ctx.update({
         "pipeline_id": node_run_id,
         "node_run": {
@@ -6986,8 +7285,8 @@ def hydrate_node_run_result_views(sop, result):
     node_id = str(result.get("node_id") or "")
     if not node_run_id or not node_id:
         return result
-    config = (sop.get("nodes") or {}).get(node_id) or {}
-    declared_outputs = normalized_contract(config.get("outputs") or {}, "output")
+    static = node_static_config(sop, node_id) or {}
+    declared_outputs = normalized_contract(static.get("outputs") or {}, "output")
     actual_outputs = result.get("actual_outputs") if isinstance(result.get("actual_outputs"), dict) else {}
     artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
     core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
@@ -7141,8 +7440,8 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
         or read_json(wiki / "raw" / "pipeline-context.json")
         or {}
     )
-    config = (sop.get("nodes") or {}).get(node_id) or {}
-    declared_outputs = normalized_contract(config.get("outputs") or node_state.get("declared_outputs") or {}, "output")
+    static = node_static_config(sop, node_id) or {}
+    declared_outputs = normalized_contract(static.get("outputs") or node_state.get("declared_outputs") or {}, "output")
     actual_outputs = {}
     artifacts = []
 
@@ -7262,6 +7561,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
     if executor_kind not in {"hermes", "legacy-shell"}:
         executor_kind = "hermes"
     command_for_detail = []
+    input_resolution_error = {}
     try:
         context = prepare_real_node_context(sop, node_run_id, node_id, plan)
         env = node_run_subprocess_env(sop, node_run_id, plan)
@@ -7318,6 +7618,10 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         stderr = (stderr + f"\nnode real execution timed out after {timeout}s").strip()
         returncode = 124
+    except NodeRunInputResolutionError as exc:
+        input_resolution_error = exc.detail
+        stderr = str(exc)
+        returncode = 2
     except Exception as exc:
         stderr = str(exc)
         returncode = 1
@@ -7336,6 +7640,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
     summary = (
         "Real node execution finished and declared outputs were found."
         if execution_ok
+        else "Required node inputs could not be resolved from the selected relay outputs." if input_resolution_error
         else "Real node execution failed." if returncode != 0
         else "Real node execution finished but declared outputs are missing."
     )
@@ -7405,6 +7710,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             "context": context,
             "stdout_tail": stdout[-8000:],
             "stderr_tail": stderr[-8000:],
+            "input_resolution_error": input_resolution_error,
             "agent_request": mask_data({k: v for k, v in agent_request.items() if k != "rendered_request"} | {
                 "rendered_request": agent_request.get("rendered_request", ""),
                 "receipt": receipt,
@@ -7424,6 +7730,23 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
 def apply_real_node_execution_to_steps(steps, execution):
     status = execution.get("status")
     agent_request = execution.get("agent_request") if isinstance(execution.get("agent_request"), dict) else {}
+    detail = execution.get("detail") if isinstance(execution.get("detail"), dict) else {}
+    input_resolution_error = detail.get("input_resolution_error") if isinstance(detail.get("input_resolution_error"), dict) else {}
+    if input_resolution_error:
+        update_node_run_step(
+            steps,
+            "resolve-inputs",
+            "failed",
+            "Selected relay outputs do not satisfy this node's input contract.",
+            input_resolution_error,
+        )
+        update_node_run_step(
+            steps,
+            "generate-agent-request",
+            "skipped",
+            "Agent Request was not generated because input resolution failed.",
+            input_resolution_error,
+        )
     if agent_request:
         update_node_run_step(
             steps,
@@ -7438,7 +7761,7 @@ def apply_real_node_execution_to_steps(steps, execution):
         "execute-or-dry-run",
         execute_status,
         execution.get("summary") or "Hermes Agent Skill execution finished.",
-        execution.get("detail") or {},
+        detail,
         started_at=execution.get("started_at"),
         finished_at=execution.get("finished_at"),
         elapsed_ms=execution.get("elapsed_ms"),
@@ -7448,9 +7771,9 @@ def apply_real_node_execution_to_steps(steps, execution):
     update_node_run_step(
         steps,
         "validate-outputs",
-        "done" if validation_status == "passed" else "failed" if status == "failed" else "warning",
-        "Declared outputs were found." if validation_status == "passed" else "Declared outputs are missing.",
-        validation,
+        "done" if validation_status == "passed" else "skipped" if input_resolution_error else "failed" if status == "failed" else "warning",
+        "Declared outputs were found." if validation_status == "passed" else "Skipped because input resolution failed." if input_resolution_error else "Declared outputs are missing.",
+        {**validation, **({"input_resolution_error": input_resolution_error} if input_resolution_error else {})},
     )
     capabilities = execution.get("capabilities") if isinstance(execution.get("capabilities"), dict) else {}
     git = capabilities.get("git") if isinstance(capabilities.get("git"), dict) else {}
@@ -7498,6 +7821,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "input_source": plan.get("input_source"),
         "relay_mode": plan.get("relay_mode") or "",
         "selected_outputs": plan.get("selected_outputs") or [],
+        "relay_mappings": plan.get("relay_mappings") or [],
         "source_node_run_id": plan.get("source_node_run_id") or "",
         "relay_selection": plan.get("relay_selection") or {},
         "started_at": started_at,

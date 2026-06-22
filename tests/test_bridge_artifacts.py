@@ -264,6 +264,99 @@ class ArtifactResolutionTest(unittest.TestCase):
             ],
         )
 
+    def _add_deep_research_contract(self):
+        self.sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "inputs": {
+                "source_url": {
+                    "from": "youtube-fetch.outputs.source_url",
+                    "required": True,
+                    "kind": "scalar",
+                    "type": "string",
+                    "value_type": "url",
+                    "resolvers": [
+                        {"id": "direct-url", "kind": "direct"},
+                        {"id": "metadata-source-url", "kind": "json_path", "path": "$.source_url"},
+                        {"id": "metadata-youtube-url", "kind": "json_path", "path": "$.youtube_url"},
+                    ],
+                }
+            },
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md"},
+        }
+
+    def _write_source_node_run_manifest(self, run_id, metadata):
+        output_dir = self.wiki / "raw/node-runs" / run_id / "outputs/files"
+        output_dir.mkdir(parents=True)
+        (output_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        (output_dir / "manifest.json").write_text(json.dumps({
+            "version": 1,
+            "kind": "output",
+            "node_run_id": run_id,
+            "node_id": "youtube-fetch",
+            "items": [
+                {
+                    "path": "metadata.json",
+                    "output": "metadata_file",
+                    "value_type": "json",
+                    "source_node": "youtube-fetch",
+                    "source_run_id": run_id,
+                },
+            ],
+        }), encoding="utf-8")
+
+    def test_existing_node_run_mapping_extracts_scalar_input_by_contract(self):
+        self._add_deep_research_contract()
+        source_run_id = "node-run-fetch-source"
+        self._write_source_node_run_manifest(source_run_id, {"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"})
+        plan = {
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run_id,
+            "relay_mode": "selected_outputs",
+            "selected_outputs": ["metadata_file"],
+            "relay_mappings": [{"source_output": "metadata_file", "target_input": "source_url", "resolver": "metadata-source-url"}],
+        }
+
+        info = bridge.materialize_node_run_inputs(
+            self.sop,
+            "node-run-deep-target",
+            "youtube-deep-research",
+            plan,
+            {"source_url": "https://example.invalid/old"},
+        )
+
+        self.assertEqual(info["input_validation"]["status"], "passed")
+        self.assertEqual(info["resolved_values"]["source_url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(info["manifest"]["items"][0]["target_input"], "source_url")
+        self.assertEqual(info["manifest"]["items"][0]["resolver"], "metadata-source-url")
+
+    def test_existing_node_run_mapping_fails_before_hidden_context_fallback(self):
+        self._add_deep_research_contract()
+        source_run_id = "node-run-fetch-bad-source"
+        self._write_source_node_run_manifest(source_run_id, {"title": "No URL here"})
+        plan = {
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run_id,
+            "relay_mode": "selected_outputs",
+            "selected_outputs": ["metadata_file"],
+            "relay_mappings": [{"source_output": "metadata_file", "target_input": "source_url", "resolver": "metadata-source-url"}],
+        }
+
+        with self.assertRaises(bridge.NodeRunInputResolutionError) as raised:
+            bridge.apply_resolved_inputs_to_pipeline_context(
+                self.sop,
+                self.wiki,
+                {"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                plan,
+                "youtube-deep-research",
+                "node-run-deep-target-fail",
+            )
+
+        detail = raised.exception.detail
+        self.assertEqual(detail["input_validation"]["status"], "failed")
+        self.assertEqual(detail["input_validation"]["errors"][0]["input"], "source_url")
+        self.assertIn("source_url", json.dumps(detail))
+
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
 
@@ -1551,8 +1644,11 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(manifest["items"][0]["source_run_id"], source_run)
         self.assertEqual(manifest["items"][0]["source_path"], f"raw/node-runs/{source_run}/outputs/files/analysis.md")
         self.assertEqual((input_dir / "0001.md").read_text(encoding="utf-8"), "# Dynamic analysis\n")
-        self.assertEqual(ctx["stage_b"]["output_files"], [f"raw/node-runs/{target_run}/inputs/sources/0001.md"])
-        self.assertEqual(ctx["stage_b2"]["analysis_file"], f"raw/node-runs/{target_run}/inputs/sources/0001.md")
+        self.assertEqual(ctx["stage_b"]["output_files"], [
+            f"raw/node-runs/{target_run}/inputs/sources/0001.md",
+            f"raw/node-runs/{target_run}/inputs/sources/0002.txt",
+        ])
+        self.assertNotIn("stage_b2", ctx)
         input_artifacts = bridge.node_run_input_manifest_artifacts(sop, target_run, "wiki-build")
         self.assertEqual([item["title"] for item in input_artifacts], ["analysis.md", "transcript.txt"])
         self.assertEqual([item["path"] for item in input_artifacts], [
