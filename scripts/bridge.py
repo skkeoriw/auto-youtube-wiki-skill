@@ -4574,7 +4574,124 @@ def is_blank_value(value):
     return value is None or (isinstance(value, str) and value == "")
 
 
-def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manual_inputs=None, source_node_run_id=""):
+def normalize_node_run_relay_mode(value, input_source=""):
+    text = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto_by_target_inputs",
+        "auto_by_inputs": "auto_by_target_inputs",
+        "target_inputs": "auto_by_target_inputs",
+        "selected": "selected_outputs",
+        "manual": "selected_outputs",
+        "all": "all_outputs",
+        "package": "all_outputs",
+        "whole_package": "all_outputs",
+    }
+    text = aliases.get(text, text)
+    if text not in {"auto_by_target_inputs", "selected_outputs", "all_outputs"}:
+        text = "auto_by_target_inputs" if input_source == "existing-node-run" else ""
+    return text
+
+
+def normalize_selected_outputs(value):
+    if isinstance(value, list):
+        rows = value
+    elif isinstance(value, str):
+        rows = re.split(r"[\s,]+", value)
+    else:
+        rows = []
+    result = []
+    for item in rows:
+        text = str(item or "").strip()
+        if text and re.match(r"^[A-Za-z0-9_.-]+$", text):
+            result.append(text)
+    return ordered_unique(result)
+
+
+def source_ref_output(source):
+    match = re.match(r"^([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)$", str(source or ""))
+    if not match:
+        return "", ""
+    return match.group(1), match.group(2)
+
+
+def node_input_binding_specs(sop, node_id):
+    config = (sop.get("nodes") or {}).get(node_id) or {}
+    required = normalize_contract(config.get("inputs") or {}, "input")
+    optional = normalize_contract(config.get("optional_inputs") or {}, "input")
+    rows = []
+    for required_flag, source_map in ((True, required), (False, optional)):
+        for input_name, spec in source_map.items():
+            source = spec.get("from") if isinstance(spec, dict) else spec
+            source_node, source_output = source_ref_output(source)
+            rows.append({
+                "target_input": input_name,
+                "required": required_flag,
+                "source": str(source or ""),
+                "source_node": source_node,
+                "source_output": source_output,
+                "spec": spec,
+            })
+    return rows
+
+
+def node_run_relay_selection_plan(sop, target_node_id, source_node_run_id, relay_mode="", selected_outputs=None):
+    source_items = node_run_source_manifest_items(sop, source_node_run_id)
+    selected_outputs = normalize_selected_outputs(selected_outputs or [])
+    relay_mode = normalize_node_run_relay_mode(relay_mode, "existing-node-run")
+    source_node = next((str(item.get("source_node") or "") for item in source_items if item.get("source_node")), "")
+    bindings = node_input_binding_specs(sop, target_node_id)
+    input_by_output = {}
+    for binding in bindings:
+        source_output = binding.get("source_output") or ""
+        if not source_output:
+            continue
+        if source_node and binding.get("source_node") and binding.get("source_node") != source_node:
+            continue
+        input_by_output.setdefault(source_output, binding.get("target_input") or source_output)
+    for binding in bindings:
+        target_input = binding.get("target_input") or ""
+        if target_input:
+            input_by_output.setdefault(target_input, target_input)
+
+    if relay_mode == "all_outputs":
+        allowed = {str(item.get("output") or item.get("source_output") or "") for item in source_items}
+        reason = "explicit-all-outputs"
+    elif relay_mode == "selected_outputs":
+        allowed = set(selected_outputs)
+        reason = "explicit-selected-outputs"
+    else:
+        allowed = set(input_by_output.keys())
+        reason = "target-input-binding"
+        if not allowed and len(source_items) == 1:
+            only = str(source_items[0].get("output") or source_items[0].get("source_output") or "")
+            if only:
+                allowed.add(only)
+                reason = "single-source-output"
+
+    matched = []
+    skipped = []
+    for item in source_items:
+        output_name = str(item.get("output") or item.get("source_output") or "").strip()
+        if relay_mode == "all_outputs" or (output_name and output_name in allowed):
+            target_input = input_by_output.get(output_name) or output_name
+            matched.append({**item, "target_input": target_input, "input_name": target_input, "relay_match_reason": reason})
+        else:
+            skipped.append({**item, "relay_skip_reason": "not-selected"})
+    return {
+        "relay_mode": relay_mode,
+        "source_node_run_id": sanitize_node_run_id(source_node_run_id),
+        "source_node": source_node,
+        "selected_outputs": selected_outputs,
+        "target_node_id": target_node_id,
+        "bindings": bindings,
+        "matched_outputs": ordered_unique([str(item.get("output") or item.get("source_output") or "") for item in matched if item.get("output") or item.get("source_output")]),
+        "matched_items": matched,
+        "skipped_outputs": ordered_unique([str(item.get("output") or item.get("source_output") or "") for item in skipped if item.get("output") or item.get("source_output")]),
+        "available_outputs": ordered_unique([str(item.get("output") or item.get("source_output") or "") for item in source_items if item.get("output") or item.get("source_output")]),
+    }
+
+
+def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manual_inputs=None, source_node_run_id="", relay_mode="", selected_outputs=None):
     manual_inputs = manual_inputs if isinstance(manual_inputs, dict) else {}
     source = spec.get("from") if isinstance(spec, dict) else spec
     source = str(source or "")
@@ -4593,14 +4710,20 @@ def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manua
 
     if source_mode == "existing-node-run":
         if source_node_run_id:
+            source_node, source_output = source_ref_output(source)
             item.update({
                 "resolved": True,
-                "value": f"raw/node-runs/{source_node_run_id}/outputs/files/manifest.json",
-                "provenance": f"node-run:{source_node_run_id}:outputs/files/manifest.json",
+                "value": f"node-run:{source_node_run_id}",
+                "provenance": f"node-run:{source_node_run_id}",
                 "source_node_run_id": source_node_run_id,
+                "source_output": source_output,
+                "source_node": source_node,
+                "target_input": input_name,
+                "relay_mode": normalize_node_run_relay_mode(relay_mode, source_mode),
+                "selected_outputs": normalize_selected_outputs(selected_outputs or []),
             })
             return item
-        item["reason"] = "Select a source Node Run so this run can materialize its outputs/files manifest."
+        item["reason"] = "Select a source Node Run so this run can materialize selected relay outputs."
         return item
 
     if source_mode == "existing-run" and base_run_id:
@@ -4677,11 +4800,14 @@ def build_node_test_plan(sop, node_id, body=None):
         source_mode = "generated-fixture"
     base_run_id = sanitize_test_id(body.get("pipeline_id") or body.get("run_id") or body.get("seed_from_run_id") or "")
     source_node_run_id = sanitize_node_run_id(body.get("source_node_run_id") or body.get("node_run_source_id") or body.get("from_node_run_id") or "")
+    relay_mode = normalize_node_run_relay_mode(body.get("relay_mode") or body.get("relayMode"), source_mode)
+    selected_outputs = normalize_selected_outputs(body.get("selected_outputs") or body.get("selectedOutputs") or [])
     manual_inputs = body.get("manual_inputs") if isinstance(body.get("manual_inputs"), dict) else {}
     inputs = normalize_contract(static.get("inputs", {}), "input")
     optional_inputs = normalize_contract(static.get("optional_inputs", {}), "input")
-    resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id) for name, spec in inputs.items()]
-    resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id) for name, spec in optional_inputs.items()]
+    relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs) if source_mode == "existing-node-run" and source_node_run_id else {}
+    resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in inputs.items()]
+    resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in optional_inputs.items()]
     missing = [item for item in resolved_inputs if item.get("required") and not item.get("resolved")]
     upstream = []
     for spec in list(inputs.values()) + list(optional_inputs.values()):
@@ -4703,6 +4829,9 @@ def build_node_test_plan(sop, node_id, body=None):
         "input_source": source_mode,
         "base_run_id": base_run_id,
         "source_node_run_id": source_node_run_id,
+        "relay_mode": relay_mode,
+        "selected_outputs": selected_outputs,
+        "relay_selection": mask_data(relay_selection),
         "manual_inputs": manual_inputs,
         "required_inputs": resolved_inputs,
         "optional_inputs": resolved_optional,
@@ -5922,6 +6051,10 @@ def build_node_run_steps(sop, plan):
             {
                 "input_source": plan.get("input_source"),
                 "base_run_id": plan.get("base_run_id"),
+                "source_node_run_id": plan.get("source_node_run_id"),
+                "relay_mode": plan.get("relay_mode"),
+                "selected_outputs": plan.get("selected_outputs") or [],
+                "relay_selection": plan.get("relay_selection") or {},
                 "resolved_inputs": plan.get("resolved_inputs") or [],
                 "missing_inputs": missing,
             },
@@ -6277,15 +6410,24 @@ def copy_node_run_input_file(wiki, source_rel, target_dir, index, item=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_file, target)
     target_rel = target.relative_to(target_dir).as_posix()
+    preview = ""
+    value_type = str((item or {}).get("value_type") or node_run_manifest_value_type(target))
+    if value_type in {"text", "markdown", "json", "jsonl", "yaml", "yml", "csv", "log"}:
+        try:
+            preview = target.read_text(encoding="utf-8", errors="replace")[:1000]
+        except OSError:
+            preview = ""
     return {
         "path": target_rel,
         "source": str((item or {}).get("source") or "file"),
-        "value_type": str((item or {}).get("value_type") or node_run_manifest_value_type(target)),
+        "value_type": value_type,
         "source_path": source_rel,
         "source_node": (item or {}).get("source_node") or "",
         "source_run_id": (item or {}).get("source_run_id") or "",
         "source_output": (item or {}).get("output") or (item or {}).get("source_output") or "",
         "input_name": (item or {}).get("input_name") or "",
+        "target_input": (item or {}).get("target_input") or (item or {}).get("input_name") or "",
+        "value_preview": preview,
     }
 
 
@@ -6302,7 +6444,21 @@ def write_node_run_input_text(target_dir, index, text, item=None, suffix=".txt")
         "source_run_id": (item or {}).get("source_run_id") or "",
         "source_output": (item or {}).get("source_output") or "",
         "input_name": (item or {}).get("input_name") or "",
+        "target_input": (item or {}).get("target_input") or (item or {}).get("input_name") or "",
+        "value_preview": str(text or "")[:1000],
     }
+
+
+def node_run_input_resolved_values(items):
+    values = {}
+    for item in items or []:
+        key = str(item.get("target_input") or item.get("input_name") or item.get("source_output") or "").strip()
+        if not key:
+            continue
+        preview = item.get("value_preview")
+        if isinstance(preview, str) and preview:
+            values.setdefault(key, preview.strip())
+    return values
 
 
 def materialize_resolved_input_value(wiki, target_dir, index, resolved, source_url):
@@ -6365,7 +6521,12 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
     source_mode = plan.get("input_source") or "generated-fixture"
     source_node_run_id = sanitize_node_run_id(plan.get("source_node_run_id") or "")
     if source_mode == "existing-node-run":
-        for source_item in node_run_source_manifest_items(sop, source_node_run_id):
+        relay_mode = plan.get("relay_mode") or "auto_by_target_inputs"
+        selected_outputs = plan.get("selected_outputs") or []
+        relay_selection = plan.get("relay_selection") if isinstance(plan.get("relay_selection"), dict) else {}
+        if not relay_selection.get("matched_items"):
+            relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs)
+        for source_item in relay_selection.get("matched_items") or []:
             source_rel = str(source_item.get("source_path") or "")
             row = copy_node_run_input_file(wiki, source_rel, target_dir, len(items) + 1, {
                 **source_item,
@@ -6373,6 +6534,7 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
             })
             if row:
                 items.append(row)
+        plan["relay_selection"] = mask_data(relay_selection)
     else:
         resolved_items = list(plan.get("resolved_inputs") or []) + [
             item for item in (plan.get("optional_inputs") or [])
@@ -6396,7 +6558,12 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
         node_id=node_id,
         source_mode=source_mode,
         items=items,
-        extra={"source_node_run_id": source_node_run_id},
+        extra={
+            "source_node_run_id": source_node_run_id,
+            "relay_mode": plan.get("relay_mode") or "",
+            "selected_outputs": plan.get("selected_outputs") or [],
+            "matched_outputs": (plan.get("relay_selection") or {}).get("matched_outputs") or [],
+        },
     )
     input_files = []
     for item in items:
@@ -6404,13 +6571,15 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
         if rel:
             input_files.append(rel)
     return {
-        "source_url": source_url,
+        "source_url": node_run_input_resolved_values(items).get("source_url") or node_run_input_resolved_values(items).get("url") or source_url,
         "manifest": manifest,
         "manifest_path": safe_relative_file(wiki, manifest_path),
         "directory": safe_relative_file(wiki, target_dir),
         "files": ordered_unique(input_files),
         "markdown_files": [path for path in ordered_unique(input_files) if Path(path).suffix.lower() == ".md"],
         "text_files": [path for path in ordered_unique(input_files) if Path(path).suffix.lower() in {".md", ".txt"}],
+        "resolved_values": node_run_input_resolved_values(items),
+        "relay_selection": plan.get("relay_selection") or {},
     }
 
 
@@ -6423,9 +6592,11 @@ def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run
         ctx,
     )
     source_item = node_run_resolved_input_item(plan, "source_url") or node_run_resolved_input_item(plan, "url")
-    source_url = source_item.get("value") if source_item else input_info.get("source_url")
+    source_url = input_info.get("source_url") or (source_item.get("value") if source_item else "")
+    if isinstance(source_url, str) and source_url.startswith("node-run:"):
+        source_url = ""
     if is_blank_value(source_url):
-        source_url = input_info.get("source_url") or ctx.get("source_url") or ctx.get("url") or "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        source_url = ctx.get("source_url") or ctx.get("url") or "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
     ctx["source_url"] = source_url
     ctx["source_type"] = ctx.get("source_type") or "youtube"
@@ -6434,6 +6605,8 @@ def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run
         for item in list(plan.get("resolved_inputs") or []) + list(plan.get("optional_inputs") or [])
         if item.get("name")
     }
+    if input_info.get("resolved_values"):
+        ctx["node_run_resolved_inputs"].update(input_info.get("resolved_values") or {})
     ctx["node_run_input_manifest"] = input_info.get("manifest_path")
     ctx["node_run_input_files"] = input_info.get("files") or []
 
@@ -6903,9 +7076,12 @@ def node_run_manifest_output_value(records, output_name, spec):
 
 def node_run_input_info(sop, node_run_id, node_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    manifest_path = node_run_manifest_path(sop, node_run_id, "input")
+    manifest = read_json(manifest_path) or {}
     return {
         "input_directory": safe_relative_file(wiki, node_run_input_sources_dir(sop, node_run_id)),
-        "input_manifest": safe_relative_file(wiki, node_run_manifest_path(sop, node_run_id, "input")),
+        "input_manifest": safe_relative_file(wiki, manifest_path),
+        "input_manifest_data": mask_data(manifest) if isinstance(manifest, dict) else {},
         "input_artifacts": artifacts_with_preview(sop, node_run_input_manifest_artifacts(sop, node_run_id, node_id)),
     }
 
@@ -7315,6 +7491,10 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "status": status,
         "mode": plan.get("mode"),
         "input_source": plan.get("input_source"),
+        "relay_mode": plan.get("relay_mode") or "",
+        "selected_outputs": plan.get("selected_outputs") or [],
+        "source_node_run_id": plan.get("source_node_run_id") or "",
+        "relay_selection": plan.get("relay_selection") or {},
         "started_at": started_at,
         "finished_at": "" if pending else finished_at,
         "elapsed_ms": sum(int(step.get("elapsed_ms") or 0) for step in steps),
@@ -7369,6 +7549,8 @@ def hydrate_node_run_input_artifacts(sop, result):
         result["input_directory"] = info.get("input_directory")
     if info.get("input_manifest"):
         result["input_manifest"] = info.get("input_manifest")
+    if info.get("input_manifest_data"):
+        result["input_resolution"] = info.get("input_manifest_data")
     for step in result.get("steps") or []:
         if not isinstance(step, dict) or step.get("id") != "resolve-inputs":
             continue
@@ -7377,6 +7559,7 @@ def hydrate_node_run_input_artifacts(sop, result):
             **detail,
             "input_directory": info.get("input_directory") or detail.get("input_directory") or "",
             "input_manifest": info.get("input_manifest") or detail.get("input_manifest") or "",
+            "input_resolution": info.get("input_manifest_data") or detail.get("input_resolution") or {},
             "materialized_inputs": input_artifacts,
         }
     return result
@@ -7420,6 +7603,9 @@ def hydrate_node_run_agent_request(sop, result):
             if isinstance(step, dict) and step.get("id") == "generate-agent-request":
                 detail = step.get("detail") if isinstance(step.get("detail"), dict) else {}
                 step["detail"] = {**detail, **result["agent_request"]}
+                if request_path.exists() and step.get("status") in {"waiting", "running"}:
+                    step["status"] = "done"
+                    step["summary"] = "Hermes Agent Request was rendered and saved for this Node Run."
     return result
 
 

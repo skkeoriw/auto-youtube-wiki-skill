@@ -1527,8 +1527,10 @@ class ArtifactResolutionTest(unittest.TestCase):
             "mode": "real-node",
             "input_source": "existing-node-run",
             "source_node_run_id": source_run,
+            "relay_mode": "all_outputs",
         })
         self.assertEqual(plan["input_source"], "existing-node-run")
+        self.assertEqual(plan["relay_mode"], "all_outputs")
         self.assertEqual(plan["status"], "ready")
         self.assertEqual(plan["source_node_run_id"], source_run)
 
@@ -1538,6 +1540,7 @@ class ArtifactResolutionTest(unittest.TestCase):
 
         self.assertEqual(manifest["source_mode"], "existing-node-run")
         self.assertEqual(manifest["source_node_run_id"], source_run)
+        self.assertEqual(manifest["relay_mode"], "all_outputs")
         self.assertEqual([item["path"] for item in manifest["items"]], ["0001.md", "0002.txt"])
         self.assertEqual(manifest["items"][0]["source"], "node-run")
         self.assertEqual(manifest["items"][0]["source_node"], "youtube-deep-research")
@@ -1553,6 +1556,110 @@ class ArtifactResolutionTest(unittest.TestCase):
             f"raw/node-runs/{target_run}/inputs/sources/0002.txt",
         ])
         self.assertIn("# Dynamic analysis", input_artifacts[0]["preview"])
+
+    def test_existing_node_run_selected_outputs_only_materializes_selected_item(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md"},
+        }
+        source_run = "node-run-youtube-fetch-source"
+        source_dir = bridge.node_run_output_files_dir(sop, source_run)
+        source_dir.mkdir(parents=True)
+        (source_dir / "source-url.txt").write_text("https://www.youtube.com/watch?v=dQw4w9WgXcQ\n", encoding="utf-8")
+        (source_dir / "metadata.json").write_text('{"title":"demo"}\n', encoding="utf-8")
+        bridge.write_json(source_dir / "manifest.json", {
+            "version": 1,
+            "kind": "output",
+            "node_run_id": source_run,
+            "node_id": "youtube-fetch",
+            "items": [
+                {
+                    "path": "metadata.json",
+                    "source": "node-run",
+                    "source_node": "youtube-fetch",
+                    "source_run_id": source_run,
+                    "source_path": f"raw/node-runs/{source_run}/outputs/files/metadata.json",
+                    "output": "metadata_file",
+                    "value_type": "json",
+                },
+                {
+                    "path": "source-url.txt",
+                    "source": "node-run",
+                    "source_node": "youtube-fetch",
+                    "source_run_id": source_run,
+                    "source_path": f"raw/node-runs/{source_run}/outputs/files/source-url.txt",
+                    "output": "source_url",
+                    "value_type": "text",
+                },
+            ],
+        })
+
+        target_run = "node-run-youtube-deep-selected-relay"
+        plan = bridge.build_node_run_plan(sop, "test", "youtube-deep-research", {
+            "mode": "real-node",
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run,
+            "relay_mode": "selected_outputs",
+            "selected_outputs": ["source_url"],
+        })
+        self.assertEqual(plan["relay_selection"]["matched_outputs"], ["source_url"])
+        ctx = bridge.prepare_real_node_context(sop, target_run, "youtube-deep-research", plan)
+        input_dir = self.wiki / "raw" / "node-runs" / target_run / "inputs" / "sources"
+        manifest = json.loads((input_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["relay_mode"], "selected_outputs")
+        self.assertEqual(manifest["selected_outputs"], ["source_url"])
+        self.assertEqual([item["source_output"] for item in manifest["items"]], ["source_url"])
+        self.assertEqual(manifest["items"][0]["target_input"], "source_url")
+        self.assertIn("dQw4w9WgXcQ", manifest["items"][0]["value_preview"])
+        self.assertEqual(ctx["source_url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(ctx["node_run_resolved_inputs"]["source_url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_existing_node_run_auto_relay_matches_target_input_contract(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "inputs": {"source_url": "youtube-fetch.outputs.source_url"},
+            "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md"},
+        }
+        source_run = "node-run-youtube-fetch-auto-source"
+        source_dir = bridge.node_run_output_files_dir(sop, source_run)
+        source_dir.mkdir(parents=True)
+        (source_dir / "source-url.txt").write_text("https://www.youtube.com/watch?v=dQw4w9WgXcQ\n", encoding="utf-8")
+        (source_dir / "metadata.json").write_text('{"title":"demo"}\n', encoding="utf-8")
+        bridge.write_json(source_dir / "manifest.json", {
+            "version": 1,
+            "kind": "output",
+            "node_run_id": source_run,
+            "node_id": "youtube-fetch",
+            "items": [
+                {"path": "metadata.json", "source_node": "youtube-fetch", "source_run_id": source_run, "source_path": f"raw/node-runs/{source_run}/outputs/files/metadata.json", "output": "metadata_file", "value_type": "json"},
+                {"path": "source-url.txt", "source_node": "youtube-fetch", "source_run_id": source_run, "source_path": f"raw/node-runs/{source_run}/outputs/files/source-url.txt", "output": "source_url", "value_type": "text"},
+            ],
+        })
+
+        target_run = "node-run-youtube-deep-auto-relay"
+        plan = bridge.build_node_run_plan(sop, "test", "youtube-deep-research", {
+            "mode": "real-node",
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run,
+        })
+        self.assertEqual(plan["relay_mode"], "auto_by_target_inputs")
+        self.assertEqual(plan["relay_selection"]["matched_outputs"], ["source_url"])
+        self.assertEqual(plan["relay_selection"]["skipped_outputs"], ["metadata_file"])
+
+        bridge.prepare_real_node_context(sop, target_run, "youtube-deep-research", plan)
+        input_dir = self.wiki / "raw" / "node-runs" / target_run / "inputs" / "sources"
+        manifest = json.loads((input_dir / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["source_output"] for item in manifest["items"]], ["source_url"])
+        self.assertEqual([item["path"] for item in manifest["items"]], ["0001.txt"])
+        self.assertEqual(manifest["items"][0]["target_input"], "source_url")
 
     def test_node_run_agent_request_renders_hermes_skill_contract(self):
         sop = dict(self.sop)
