@@ -357,6 +357,51 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["input_validation"]["errors"][0]["input"], "source_url")
         self.assertIn("source_url", json.dumps(detail))
 
+    def test_real_node_run_input_failure_skips_agent_request_and_execution(self):
+        self._add_deep_research_contract()
+        source_run_id = "node-run-fetch-bad-real-source"
+        target_run_id = "node-run-deep-target-real-fail"
+        self._write_source_node_run_manifest(source_run_id, {"title": "No URL here"})
+
+        with patch.dict(os.environ, {
+            "YOUTUBE_RESEARCH_WORKFLOW_URL": "https://worker.example",
+            "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "worker-token-secret",
+            "YOUTUBE_WIKI_TG_TOKEN": "telegram-token-secret",
+            "YOUTUBE_WIKI_TG_CHAT_ID": "7796171193",
+        }, clear=False):
+            code, result = bridge.create_node_run(
+                self.sop,
+                "test",
+                "youtube-deep-research",
+                {
+                    "node_run_id": target_run_id,
+                    "mode": "real-node",
+                    "input_source": "existing-node-run",
+                    "source_node_run_id": source_run_id,
+                    "relay_mode": "selected_outputs",
+                    "selected_outputs": ["metadata_file"],
+                    "relay_mappings": [
+                        {
+                            "source_output": "metadata_file",
+                            "target_input": "source_url",
+                            "resolver": "metadata-source-url",
+                        }
+                    ],
+                    "sync": True,
+                },
+            )
+
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "failed")
+        steps = {step["id"]: step for step in result["steps"]}
+        self.assertEqual(steps["resolve-inputs"]["status"], "failed")
+        self.assertEqual(steps["generate-agent-request"]["status"], "skipped")
+        self.assertEqual(steps["execute-or-dry-run"]["status"], "skipped")
+        self.assertEqual(steps["validate-outputs"]["status"], "skipped")
+        self.assertEqual(steps["persist-to-github"]["status"], "skipped")
+        self.assertEqual(steps["send-telegram-notification"]["status"], "skipped")
+        self.assertFalse((self.wiki / "raw/node-runs" / target_run_id / "agent" / "request.md").exists())
+
     def test_path_traversal_is_rejected(self):
         self.assertIsNone(bridge.safe_artifact_path(self.wiki, "../secret.txt"))
 

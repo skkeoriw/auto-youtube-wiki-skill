@@ -7747,6 +7747,38 @@ def apply_real_node_execution_to_steps(steps, execution):
             "Agent Request was not generated because input resolution failed.",
             input_resolution_error,
         )
+        update_node_run_step(
+            steps,
+            "execute-or-dry-run",
+            "skipped",
+            "Skipped because required node inputs could not be resolved.",
+            input_resolution_error,
+            started_at=execution.get("started_at"),
+            finished_at=execution.get("finished_at"),
+            elapsed_ms=execution.get("elapsed_ms"),
+        )
+        update_node_run_step(
+            steps,
+            "validate-outputs",
+            "skipped",
+            "Skipped because input resolution failed.",
+            {"input_resolution_error": input_resolution_error},
+        )
+        update_node_run_step(
+            steps,
+            "persist-to-github",
+            "skipped",
+            "Skipped because input resolution failed.",
+            input_resolution_error,
+        )
+        update_node_run_step(
+            steps,
+            "send-telegram-notification",
+            "skipped",
+            "Skipped because input resolution failed.",
+            input_resolution_error,
+        )
+        return
     if agent_request:
         update_node_run_step(
             steps,
