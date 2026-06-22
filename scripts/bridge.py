@@ -6550,6 +6550,11 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
             "input_name": "source_url",
         }))
 
+    for item in items:
+        rel = safe_relative_file(wiki, target_dir / item.get("path", ""))
+        if rel:
+            item["materialized_path"] = rel
+
     manifest_path = node_run_manifest_path(sop, node_run_id, "input")
     manifest = write_node_run_io_manifest(
         manifest_path,

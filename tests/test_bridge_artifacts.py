@@ -1542,6 +1542,10 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(manifest["source_node_run_id"], source_run)
         self.assertEqual(manifest["relay_mode"], "all_outputs")
         self.assertEqual([item["path"] for item in manifest["items"]], ["0001.md", "0002.txt"])
+        self.assertEqual([item["materialized_path"] for item in manifest["items"]], [
+            f"raw/node-runs/{target_run}/inputs/sources/0001.md",
+            f"raw/node-runs/{target_run}/inputs/sources/0002.txt",
+        ])
         self.assertEqual(manifest["items"][0]["source"], "node-run")
         self.assertEqual(manifest["items"][0]["source_node"], "youtube-deep-research")
         self.assertEqual(manifest["items"][0]["source_run_id"], source_run)
@@ -1614,6 +1618,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(manifest["relay_mode"], "selected_outputs")
         self.assertEqual(manifest["selected_outputs"], ["source_url"])
         self.assertEqual([item["source_output"] for item in manifest["items"]], ["source_url"])
+        self.assertEqual(manifest["items"][0]["materialized_path"], f"raw/node-runs/{target_run}/inputs/sources/0001.txt")
         self.assertEqual(manifest["items"][0]["target_input"], "source_url")
         self.assertIn("dQw4w9WgXcQ", manifest["items"][0]["value_preview"])
         self.assertEqual(ctx["source_url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
@@ -1659,6 +1664,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         manifest = json.loads((input_dir / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual([item["source_output"] for item in manifest["items"]], ["source_url"])
         self.assertEqual([item["path"] for item in manifest["items"]], ["0001.txt"])
+        self.assertEqual([item["materialized_path"] for item in manifest["items"]], [f"raw/node-runs/{target_run}/inputs/sources/0001.txt"])
         self.assertEqual(manifest["items"][0]["target_input"], "source_url")
 
     def test_node_run_agent_request_renders_hermes_skill_contract(self):
