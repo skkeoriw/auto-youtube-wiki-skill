@@ -855,7 +855,13 @@ def setting_capability_tags(key, category):
     if category == "youtube":
         tags.update({"youtube-research-worker", "content-api"})
     if category == "llm":
-        tags.update({"model", "llm-gateway", "openai-compatible", "gemini", "vertex"})
+        tags.add("model")
+        if str(key or "").startswith("WIKI_LLM_"):
+            tags.update({"llm-gateway", "openai-compatible"})
+        elif str(key or "") in {"GOOGLE_CLOUD_API_KEY", "GEMINI_API_KEY", "WIKI_GEMINI_MODEL", "GOOGLE_PROJECT_ID", "VERTEX_LOCATION", "WIKI_VERTEX_MODEL"}:
+            tags.update({"gemini", "vertex"})
+        elif str(key or "") in {"WIKI_DEEPSEEK_MODEL"}:
+            tags.add("deepseek")
     if category == "hermes":
         tags.update({"agent-runtime", "model-auth"})
     if category == "notebooklm":
