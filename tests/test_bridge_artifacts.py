@@ -1394,6 +1394,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             "resolve-context",
             "resolve-inputs",
             "resolve-config",
+            "generate-agent-request",
             "probe-capabilities",
             "build-execution-plan",
             "execute-or-dry-run",
@@ -1500,6 +1501,41 @@ class ArtifactResolutionTest(unittest.TestCase):
             f"raw/node-runs/{target_run}/inputs/sources/0002.txt",
         ])
         self.assertIn("# Dynamic analysis", input_artifacts[0]["preview"])
+
+    def test_node_run_agent_request_renders_hermes_skill_contract(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["wiki-build"] = {
+            "title": "Wiki Build",
+            "skill": "sop-wiki-build",
+            "webhook_route": "sop-wiki-build",
+            "inputs": {"reports": "notebooklm-research.outputs.reports"},
+            "outputs": {"index": "index.md"},
+        }
+        node_run_id = "node-run-wiki-build-agent-contract"
+        plan = bridge.build_node_run_plan(sop, "test", "wiki-build", {
+            "mode": "real-node",
+            "input_source": "generated-fixture",
+        })
+        agent = bridge.render_node_run_agent_request(
+            sop,
+            node_run_id,
+            "wiki-build",
+            plan,
+            {"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+            ["bash", "/tmp/run_wiki_build.sh", str(self.wiki), node_run_id, node_run_id],
+            "sop-wiki-build",
+        )
+        self.assertTrue(agent["rendered_request"].startswith("Use skill sop-wiki-build to execute this Node Execution Request."))
+        self.assertIn("output_manifest_path:", agent["rendered_request"])
+        self.assertIn("receipt_path:", agent["rendered_request"])
+        self.assertTrue((self.wiki / "raw" / "node-runs" / node_run_id / "agent" / "request.md").exists())
+        self.assertTrue((self.wiki / "raw" / "node-runs" / node_run_id / "agent" / "executor.json").exists())
+        with patch.object(bridge, "hermes_agent_command", return_value="/usr/local/bin/hermes"):
+            args = bridge.hermes_agent_command_args("sop-wiki-build", "request body")
+        self.assertEqual(args, ["/usr/local/bin/hermes", "-s", "sop-wiki-build", "-z", "request body"])
 
     def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
         sop = dict(self.sop)
@@ -1828,6 +1864,7 @@ PY
             "YOUTUBE_RESEARCH_WORKFLOW_TOKEN": "worker-token-secret",
             "YOUTUBE_WIKI_TG_TOKEN": "telegram-token-secret",
             "YOUTUBE_WIKI_TG_CHAT_ID": "7796171193",
+            "NODE_RUN_AGENT_EXECUTOR": "legacy-shell",
         }, clear=False):
             code, result = bridge.create_node_run(
                 sop,
@@ -1868,6 +1905,8 @@ PY
             "done",
         )
         self.assertTrue((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "executor.log").exists())
+        self.assertTrue((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "agent" / "request.md").exists())
+        self.assertEqual(result["agent_request"]["executor"], "legacy-shell")
         self.assertFalse((self.wiki / "raw" / "node-runs" / result["node_run_id"] / "runtime.env").exists())
         self.assertTrue(any(item["type"] == "research.analysis" for item in result["business_artifacts"]))
         capability_by_key = {item["key"]: item for item in result["capability_results"]}
@@ -1961,7 +2000,9 @@ PY
         )
         script.chmod(0o755)
 
-        with patch.object(bridge, "plugin_root", return_value=plugin_root):
+        with patch.object(bridge, "plugin_root", return_value=plugin_root), patch.dict(os.environ, {
+            "NODE_RUN_AGENT_EXECUTOR": "legacy-shell",
+        }, clear=False):
             code, result = bridge.create_node_run(
                 sop,
                 "test",

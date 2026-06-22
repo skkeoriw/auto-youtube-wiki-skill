@@ -4320,6 +4320,193 @@ def node_run_manifest_path(sop, node_run_id, kind):
     return node_run_workspace(sop, node_run_id) / f"{kind}-manifest.json"
 
 
+def node_run_agent_dir(sop, node_run_id):
+    return node_run_workspace(sop, node_run_id) / "agent"
+
+
+def node_run_agent_path(sop, node_run_id, filename):
+    return node_run_agent_dir(sop, node_run_id) / filename
+
+
+def node_run_skill_name(sop, node_id, plan=None):
+    plan = plan if isinstance(plan, dict) else {}
+    node_cfg = (sop.get("nodes") or {}).get(node_id) if isinstance(sop.get("nodes"), dict) else {}
+    static = node_static_config(sop, node_id) or {}
+    for source in (
+        plan.get("executor") if isinstance(plan.get("executor"), dict) else {},
+        static.get("executor") if isinstance(static.get("executor"), dict) else {},
+        node_cfg.get("executor") if isinstance(node_cfg, dict) and isinstance(node_cfg.get("executor"), dict) else {},
+        static,
+        node_cfg if isinstance(node_cfg, dict) else {},
+    ):
+        skill = str((source or {}).get("skill") or "").strip()
+        if skill:
+            return skill
+    route = str((node_cfg or {}).get("webhook_route") or (node_cfg or {}).get("route") or "").strip()
+    return route or f"sop-{node_id}"
+
+
+def node_run_command_preview(command):
+    if not command:
+        return ""
+    return " ".join(shlex.quote(str(part)) for part in command)
+
+
+def default_agent_executor_template():
+    return "\n".join([
+        "# Node Execution Request",
+        "",
+        "Runtime context:",
+        "- runtime_id: {{runtime_id}}",
+        "- instance_id: {{instance_id}}",
+        "- workflow_id: {{workflow_id}}",
+        "- node_id: {{node_id}}",
+        "- node_run_id: {{node_run_id}}",
+        "",
+        "Input contract:",
+        "- input_manifest_path: {{input_manifest_path}}",
+        "- input_directory: {{input_directory}}",
+        "- source_url: {{source_url}}",
+        "- Only use files listed in the input manifest unless the selected skill already has a stricter rule.",
+        "",
+        "Output contract:",
+        "- output_directory: {{output_directory}}",
+        "- output_manifest_path: {{output_manifest_path}}",
+        "- receipt_path: {{receipt_path}}",
+        "- Do not report success unless the declared output manifest and receipt are written or the runtime wrapper writes equivalent state that the adapter can verify.",
+        "",
+        "Execution command:",
+        "```bash",
+        "{{stage_command}}",
+        "```",
+        "",
+        "Execution rules:",
+        "- Use the selected skill only: {{skill_name}}.",
+        "- Run the command from the Instance workspace unless the skill has an equivalent deterministic wrapper.",
+        "- Preserve the provided environment variables.",
+        "- Do not invent paths.",
+        "- If execution fails, return the failure and include stderr/log guidance.",
+    ])
+
+
+def node_run_agent_template():
+    configured = os.environ.get("NODE_RUN_AGENT_REQUEST_TEMPLATE", "").strip()
+    return configured or default_agent_executor_template()
+
+
+def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stage_command, skill_name):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    request_path = node_run_agent_path(sop, node_run_id, "request.md")
+    response_path = node_run_agent_path(sop, node_run_id, "response.txt")
+    receipt_path = node_run_agent_path(sop, node_run_id, "receipt.json")
+    executor_path = node_run_agent_path(sop, node_run_id, "executor.json")
+    output_manifest = node_run_manifest_path(sop, node_run_id, "output")
+    input_manifest = node_run_manifest_path(sop, node_run_id, "input")
+    values = {
+        "runtime_id": plan.get("runtime_id") or "",
+        "instance_id": plan.get("instance_id") or "",
+        "workflow_id": plan.get("workflow_id") or "",
+        "node_id": node_id,
+        "node_run_id": node_run_id,
+        "skill_name": skill_name,
+        "input_manifest_path": safe_relative_file(wiki, input_manifest) or str(input_manifest),
+        "input_directory": safe_relative_file(wiki, node_run_input_sources_dir(sop, node_run_id)) or str(node_run_input_sources_dir(sop, node_run_id)),
+        "output_manifest_path": safe_relative_file(wiki, output_manifest) or str(output_manifest),
+        "output_directory": safe_relative_file(wiki, node_run_output_files_dir(sop, node_run_id)) or str(node_run_output_files_dir(sop, node_run_id)),
+        "receipt_path": safe_relative_file(wiki, receipt_path) or str(receipt_path),
+        "source_url": (context or {}).get("source_url") or "",
+        "stage_command": node_run_command_preview(stage_command),
+    }
+    body = node_run_agent_template()
+    for key, value in values.items():
+        body = body.replace("{{" + key + "}}", str(value))
+    guard = f"Use skill {skill_name} to execute this Node Execution Request."
+    rendered = f"{guard}\n\n{body.rstrip()}\n"
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text(rendered, encoding="utf-8")
+    executor = {
+        "version": 1,
+        "executor": "hermes",
+        "requested_skill": skill_name,
+        "node_id": node_id,
+        "node_run_id": node_run_id,
+        "runtime_id": values["runtime_id"],
+        "instance_id": values["instance_id"],
+        "workflow_id": values["workflow_id"],
+        "template_source": "env:NODE_RUN_AGENT_REQUEST_TEMPLATE" if os.environ.get("NODE_RUN_AGENT_REQUEST_TEMPLATE", "").strip() else "default",
+        "template_version": "hermes-agent-executor.v1",
+        "request_path": safe_relative_file(wiki, request_path),
+        "response_path": safe_relative_file(wiki, response_path),
+        "receipt_path": safe_relative_file(wiki, receipt_path),
+        "input_manifest_path": values["input_manifest_path"],
+        "output_manifest_path": values["output_manifest_path"],
+        "stage_command": stage_command,
+        "stage_command_preview": values["stage_command"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(executor_path, executor)
+    return {
+        **executor,
+        "executor_path": safe_relative_file(wiki, executor_path),
+        "rendered_request": rendered,
+    }
+
+
+def node_run_agent_artifacts(sop, node_run_id, node_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    artifacts = []
+    for filename, output_name, artifact_type, title in (
+        ("request.md", "agent_request", "node-run.agent.request", "Rendered Agent Request"),
+        ("executor.json", "agent_executor", "node-run.agent.executor", "Agent Executor Metadata"),
+        ("response.txt", "agent_response", "node-run.agent.response", "Hermes Agent Response"),
+        ("receipt.json", "agent_receipt", "node-run.agent.receipt", "Agent Execution Receipt"),
+    ):
+        path = node_run_agent_path(sop, node_run_id, filename)
+        if not path.is_file():
+            continue
+        record = artifact_record(sop, node_id, output_name, path, "node-run-agent")
+        if record:
+            record["type"] = artifact_type
+            record["title"] = title
+            record["path"] = safe_relative_file(wiki, path)
+            artifacts.append(record)
+    return artifacts
+
+
+def write_node_run_agent_receipt(sop, node_run_id, node_id, payload):
+    receipt_path = node_run_agent_path(sop, node_run_id, "receipt.json")
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(receipt_path, payload)
+    return receipt_path
+
+
+def hermes_agent_command_args(skill_name, request_text):
+    command = hermes_agent_command()
+    if not command:
+        return []
+    base = shlex.split(command) if any(ch.isspace() for ch in command) else [command]
+    return base + ["-s", skill_name, "-z", request_text]
+
+
+def wait_for_real_node_completion(sop, node_run_id, node_id, timeout_seconds, started_at):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    deadline = time.monotonic() + max(5, timeout_seconds)
+    last_state = {}
+    while time.monotonic() < deadline:
+        workspace = run_workspace(sop, node_run_id)
+        state = read_json(workspace / "nodes" / f"{node_id}.json") or {}
+        if state:
+            last_state = state
+        status = str(state.get("status") or "").lower()
+        if status in {"done", "failed", "skipped"}:
+            return status, state
+        manifest = node_run_manifest_path(sop, node_run_id, "output")
+        if manifest.exists() and state.get("validation", {}).get("status") == "passed":
+            return "done", state
+        time.sleep(2)
+    return "timeout", last_state
+
+
 def sanitize_test_id(value):
     return re.sub(r"[^A-Za-z0-9._-]", "", str(value or ""))
 
@@ -5752,6 +5939,17 @@ def build_node_run_steps(sop, plan):
             },
         ),
         node_run_step(
+            "generate-agent-request",
+            "Generate Agent Request",
+            "waiting" if mode == "real-node" and real_supported and not missing and config_status != "failed" else "skipped",
+            "Waiting to render the Hermes skill request." if mode == "real-node" and real_supported and not missing and config_status != "failed" else "No Agent Request is generated outside real-node execution.",
+            {
+                "executor": "hermes",
+                "skill": node_run_skill_name(sop, plan.get("node_id"), plan),
+                "template_version": "hermes-agent-executor.v1",
+            },
+        ),
+        node_run_step(
             "probe-capabilities",
             "Probe attached capabilities",
             "done" if mode == "probe" and config_status in {"done", "warning"} else "skipped" if mode != "probe" else "failed",
@@ -5767,7 +5965,7 @@ def build_node_run_steps(sop, plan):
                 "mode": mode,
                 "real_execution_enabled": mode == "real-node" and real_supported,
                 "reason": (
-                    "Real execution will call the existing stage wrapper for this node."
+                    "Real execution will call the configured Agent Executor for this node."
                     if mode == "real-node" and real_supported
                     else "Real execution is only enabled for nodes with an explicit executor adapter."
                 ),
@@ -5777,7 +5975,7 @@ def build_node_run_steps(sop, plan):
             "execute-or-dry-run",
             "Execute or dry-run node",
             "waiting" if mode == "real-node" and real_supported and not missing and config_status != "failed" else "blocked" if mode == "real-node" else "skipped",
-            "Waiting for real stage wrapper execution." if mode == "real-node" and real_supported and not missing and config_status != "failed" else "Real node execution is not available for this node." if mode == "real-node" else "No business node was executed in this diagnostic run.",
+            "Waiting for Hermes Agent Skill execution." if mode == "real-node" and real_supported and not missing and config_status != "failed" else "Real node execution is not available for this node." if mode == "real-node" else "No business node was executed in this diagnostic run.",
             {"mode": mode, "side_effects": plan.get("side_effects") or {}},
         ),
         node_run_step(
@@ -6638,27 +6836,69 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
 
     started = datetime.now(timezone.utc)
     log_path = node_run_workspace(sop, node_run_id) / "executor.log"
-    command = ["bash", str(script), str(wiki), node_run_id, node_run_id]
+    stage_command = ["bash", str(script), str(wiki), node_run_id, node_run_id]
     timeout = real_node_execution_timeout(plan)
     context = {}
+    agent_request = {}
+    receipt = {}
     stdout = ""
     stderr = ""
     returncode = 1
     timed_out = False
+    executor_kind = str(os.environ.get("NODE_RUN_AGENT_EXECUTOR") or "hermes").strip().lower()
+    if executor_kind not in {"hermes", "legacy-shell"}:
+        executor_kind = "hermes"
+    command_for_detail = []
     try:
         context = prepare_real_node_context(sop, node_run_id, node_id, plan)
         env = node_run_subprocess_env(sop, node_run_id, plan)
-        completed = subprocess.run(
-            command,
-            cwd=str(wiki),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        skill_name = node_run_skill_name(sop, node_id, plan)
+        agent_request = render_node_run_agent_request(
+            sop,
+            node_run_id,
+            node_id,
+            plan,
+            context,
+            stage_command,
+            skill_name,
         )
+        if executor_kind == "legacy-shell":
+            command_for_detail = stage_command
+            completed = subprocess.run(
+                stage_command,
+                cwd=str(wiki),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        else:
+            request_text = agent_request.get("rendered_request") or node_run_agent_path(sop, node_run_id, "request.md").read_text(encoding="utf-8")
+            hermes_args = hermes_agent_command_args(skill_name, request_text)
+            if not hermes_args:
+                raise RuntimeError("Hermes CLI is not installed or is not on PATH for this Runtime")
+            command_for_detail = hermes_args[:]
+            command_for_detail[-1] = "<request.md>"
+            completed = subprocess.run(
+                hermes_args,
+                cwd=str(wiki),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
         returncode = completed.returncode
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
+        try:
+            node_run_agent_path(sop, node_run_id, "response.txt").write_text(
+                (stdout + ("\n" if stdout and stderr else "") + stderr),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        if executor_kind == "hermes" and returncode == 0:
+            wait_for_real_node_completion(sop, node_run_id, node_id, min(timeout, 300), started)
     except subprocess.TimeoutExpired as exc:
         timed_out = True
         stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
@@ -6686,6 +6926,34 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         else "Real node execution failed." if returncode != 0
         else "Real node execution finished but declared outputs are missing."
     )
+    receipt = {
+        "version": 1,
+        "executor": executor_kind,
+        "requested_skill": agent_request.get("requested_skill") or node_run_skill_name(sop, node_id, plan),
+        "executed_skill": agent_request.get("requested_skill") or node_run_skill_name(sop, node_id, plan),
+        "node_id": node_id,
+        "node_run_id": node_run_id,
+        "request_id": node_run_id,
+        "status": status,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "validation": output_info["validation"],
+        "input_manifest": output_info["input_manifest"],
+        "output_manifest": output_info["output_manifest"],
+        "started_at": started.isoformat(),
+        "finished_at": finished.isoformat(),
+        "legacy_fallback": executor_kind == "legacy-shell",
+        "error": "" if status == "done" else (stderr[-1000:] or "declared outputs missing"),
+    }
+    try:
+        write_node_run_agent_receipt(sop, node_run_id, node_id, receipt)
+    except Exception:
+        pass
+    agent_artifacts = node_run_agent_artifacts(sop, node_run_id, node_id)
+    output_info["artifacts"].extend([
+        artifact for artifact in agent_artifacts
+        if artifact.get("path") not in {item.get("path") for item in output_info["artifacts"] if isinstance(item, dict)}
+    ])
     return {
         "status": status,
         "summary": summary,
@@ -6702,8 +6970,15 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "output_manifest": output_info["output_manifest"],
         "validation": output_info["validation"],
         "capabilities": output_info["capabilities"],
+        "agent_request": mask_data({k: v for k, v in agent_request.items() if k != "rendered_request"} | {
+            "rendered_request": agent_request.get("rendered_request", ""),
+            "executor": executor_kind,
+            "receipt": receipt,
+        }),
         "detail": {
-            "command": command,
+            "executor": executor_kind,
+            "command": command_for_detail or stage_command,
+            "stage_command": stage_command,
             "returncode": returncode,
             "timeout_seconds": timeout,
             "timed_out": timed_out,
@@ -6712,6 +6987,10 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             "context": context,
             "stdout_tail": stdout[-8000:],
             "stderr_tail": stderr[-8000:],
+            "agent_request": mask_data({k: v for k, v in agent_request.items() if k != "rendered_request"} | {
+                "rendered_request": agent_request.get("rendered_request", ""),
+                "receipt": receipt,
+            }),
             "node_state": output_info["node_state"],
             "capabilities": output_info["capabilities"],
             "actual_outputs": output_info["actual_outputs"],
@@ -6723,12 +7002,21 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
 
 def apply_real_node_execution_to_steps(steps, execution):
     status = execution.get("status")
+    agent_request = execution.get("agent_request") if isinstance(execution.get("agent_request"), dict) else {}
+    if agent_request:
+        update_node_run_step(
+            steps,
+            "generate-agent-request",
+            "done" if agent_request.get("request_path") else "warning",
+            "Hermes Agent Request was rendered and saved for this Node Run.",
+            agent_request,
+        )
     execute_status = "done" if status == "done" else "failed" if status == "failed" else "blocked"
     update_node_run_step(
         steps,
         "execute-or-dry-run",
         execute_status,
-        execution.get("summary") or "Real node execution finished.",
+        execution.get("summary") or "Hermes Agent Skill execution finished.",
         execution.get("detail") or {},
         started_at=execution.get("started_at"),
         finished_at=execution.get("finished_at"),
@@ -6806,6 +7094,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "output_manifest": (real_execution or {}).get("output_manifest") or "",
         "validation": (real_execution or {}).get("validation") or {},
         "capabilities": (real_execution or {}).get("capabilities") or {},
+        "agent_request": (real_execution or {}).get("agent_request") or {},
         "business_artifacts": (real_execution or {}).get("artifacts") or [],
         "runtime_context": plan.get("runtime_context") or {},
         "instance_context": plan.get("instance_context") or {},
@@ -6846,6 +7135,47 @@ def hydrate_node_run_input_artifacts(sop, result):
             "input_manifest": info.get("input_manifest") or detail.get("input_manifest") or "",
             "materialized_inputs": input_artifacts,
         }
+    return result
+
+
+def hydrate_node_run_agent_request(sop, result):
+    if not isinstance(result, dict):
+        return result
+    node_run_id = sanitize_node_run_id(result.get("node_run_id") or result.get("pipeline_id") or "")
+    node_id = str(result.get("node_id") or "")
+    if not node_run_id or not node_id:
+        return result
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    request_path = node_run_agent_path(sop, node_run_id, "request.md")
+    executor_path = node_run_agent_path(sop, node_run_id, "executor.json")
+    response_path = node_run_agent_path(sop, node_run_id, "response.txt")
+    receipt_path = node_run_agent_path(sop, node_run_id, "receipt.json")
+    agent = result.get("agent_request") if isinstance(result.get("agent_request"), dict) else {}
+    if request_path.is_file() and not agent.get("rendered_request"):
+        try:
+            agent["rendered_request"] = request_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    executor = read_json(executor_path) or {}
+    receipt = read_json(receipt_path) or {}
+    if executor:
+        agent.update({k: v for k, v in executor.items() if k not in {"rendered_request"}})
+    if receipt:
+        agent["receipt"] = receipt
+    if request_path.exists():
+        agent["request_path"] = safe_relative_file(wiki, request_path)
+    if executor_path.exists():
+        agent["executor_path"] = safe_relative_file(wiki, executor_path)
+    if response_path.exists():
+        agent["response_path"] = safe_relative_file(wiki, response_path)
+    if receipt_path.exists():
+        agent["receipt_path"] = safe_relative_file(wiki, receipt_path)
+    if agent:
+        result["agent_request"] = mask_data(agent)
+        for step in result.get("steps") or []:
+            if isinstance(step, dict) and step.get("id") == "generate-agent-request":
+                detail = step.get("detail") if isinstance(step.get("detail"), dict) else {}
+                step["detail"] = {**detail, **result["agent_request"]}
     return result
 
 
@@ -7087,6 +7417,7 @@ def read_node_run_result(sop, node_id, node_run_id):
     if not isinstance(result, dict) or result.get("node_id") != node_id:
         return None
     hydrate_node_run_input_artifacts(sop, result)
+    hydrate_node_run_agent_request(sop, result)
     hydrate_node_run_capability_history(sop, result)
     result["detail"] = mask_data(result.get("detail") or {})
     return result
