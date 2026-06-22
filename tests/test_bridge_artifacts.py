@@ -1419,6 +1419,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             self.assertEqual(schema["schema_id"], "node-draft-schema/v1")
             self.assertTrue(fields["skill_install_command"]["required"])
             self.assertEqual(fields["output_path"]["type"], "path_pattern")
+            self.assertIn("edit_node_definition", [item["id"] for item in schema["draft_types"]])
             self.assertFalse(schema["safety"]["production_dag_changed"])
             request = urllib.request.Request(
                 f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
@@ -1472,6 +1473,74 @@ class ArtifactResolutionTest(unittest.TestCase):
             conflict = json.loads(conflict_ctx.exception.read())
             self.assertEqual(conflict["validation"]["status"], "failed")
             self.assertIn("node_exists", [error["code"] for error in conflict["validation"]["errors"]])
+            edit_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
+                method="POST",
+                data=json.dumps({
+                    "draft_type": "edit_node_definition",
+                    "node_id": "wiki-build",
+                    "title": "Wiki Build Edited",
+                    "inputs": {
+                        "reports": {
+                            "kind": "files",
+                            "type": "files",
+                            "value_type": "markdown",
+                            "required": True,
+                            "accepts": ["file:markdown", "file:text"],
+                        }
+                    },
+                    "outputs": {
+                        "index": {
+                            "kind": "file",
+                            "type": "file",
+                            "value_type": "markdown",
+                            "path": "index.md",
+                            "relayable": True,
+                        }
+                    },
+                    "capabilities": {"git": {"enabled": True, "paths": ["wiki/**"]}},
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(edit_request, timeout=3) as response:
+                self.assertEqual(response.status, 201)
+                edit = json.loads(response.read())
+            self.assertEqual(edit["draft_type"], "edit_node_definition")
+            self.assertEqual(edit["validation"]["status"], "passed")
+            self.assertFalse(edit["validation"]["production_dag_changed"])
+            self.assertEqual(edit["change_request"]["save_target"], "agent-brain-plugins")
+            self.assertEqual(edit["change_request"]["node_id"], "wiki-build")
+            self.assertTrue((Path(edit["draft_path"]) / "change_request.json").exists())
+            list_response = urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
+                timeout=3,
+            )
+            listed = json.loads(list_response.read())
+            listed_edit = next(item for item in listed["drafts"] if item.get("change_request", {}).get("node_id") == "wiki-build")
+            self.assertEqual(listed_edit["draft_type"], "edit_node_definition")
+            self.assertEqual(listed_edit["draft_path"], edit["draft_path"])
+            bad_edit_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/node-drafts",
+                method="POST",
+                data=json.dumps({
+                    "draft_type": "edit_node_definition",
+                    "node_id": "wiki-build",
+                    "inputs": {
+                        "source_url": {
+                            "kind": "scalar",
+                            "value_type": "url",
+                            "resolvers": [{"id": "missing-path", "kind": "json_path"}],
+                        }
+                    },
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as bad_edit_ctx:
+                urllib.request.urlopen(bad_edit_request, timeout=3)
+            self.assertEqual(bad_edit_ctx.exception.code, 422)
+            bad_edit = json.loads(bad_edit_ctx.exception.read())
+            self.assertEqual(bad_edit["validation"]["status"], "failed")
+            self.assertIn("missing_path", [error["code"] for error in bad_edit["validation"]["errors"]])
         self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
         server.shutdown()
         server.server_close()

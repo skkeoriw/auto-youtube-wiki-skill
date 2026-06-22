@@ -1,5 +1,6 @@
 import http.server
 import base64
+import copy
 import hashlib
 import hmac
 import importlib.util
@@ -2785,8 +2786,21 @@ def node_draft_schema():
     return {
         "schema_id": NODE_DRAFT_SCHEMA_VERSION,
         "title": "Node Draft from Skill",
-        "description": "把一个 Skill 安装命令转换成可验证的 SOP 节点草稿；不会修改生产 DAG。",
+        "description": "创建新节点或编辑现有节点定义的草稿；不会修改生产 DAG。",
+        "draft_types": [
+            {
+                "id": "create_node",
+                "title": "Create Node Draft",
+                "description": "把一个 Skill 安装命令转换成可验证的 SOP 节点草稿。",
+            },
+            {
+                "id": "edit_node_definition",
+                "title": "Edit Existing Node Definition",
+                "description": "为现有节点生成 definition change request，保存目标是 agent-brain-plugins，不直接改 runtime sop.yaml。",
+            },
+        ],
         "fields": [
+            {"name": "draft_type", "label": "Draft Type", "type": "enum", "required": False, "default": "create_node", "maps_to": "draft_type"},
             {
                 "name": "skill_install_command",
                 "label": "Skill install command",
@@ -2812,6 +2826,17 @@ def node_draft_schema():
                 "maps_to": "outputs.*.path",
             },
         ],
+        "edit_fields": [
+            {"name": "node_id", "label": "Node ID", "type": "node_id", "required": True, "maps_to": "id"},
+            {"name": "title", "label": "Title", "type": "string", "required": False, "maps_to": "title"},
+            {"name": "description", "label": "Description", "type": "text", "required": False, "maps_to": "description"},
+            {"name": "mode", "label": "Mode", "type": "enum", "required": False, "maps_to": "mode"},
+            {"name": "needs", "label": "Needs", "type": "list", "required": False, "maps_to": "needs"},
+            {"name": "inputs", "label": "Inputs Contract", "type": "json", "required": False, "maps_to": "inputs"},
+            {"name": "optional_inputs", "label": "Optional Inputs Contract", "type": "json", "required": False, "maps_to": "optional_inputs"},
+            {"name": "outputs", "label": "Outputs Contract", "type": "json", "required": False, "maps_to": "outputs"},
+            {"name": "capabilities", "label": "Capabilities", "type": "json", "required": False, "maps_to": "capabilities"},
+        ],
         "defaults": {
             "executor_type": "agent-skill",
             "agent": "hermes",
@@ -2834,6 +2859,13 @@ def node_draft_schema():
 
 
 def validate_node_draft_input(spec, existing_nodes=None):
+    if str(spec.get("draft_type") or "create_node") == "edit_node_definition":
+        return {
+            "schema_id": NODE_DRAFT_SCHEMA_VERSION,
+            "status": "passed",
+            "errors": [],
+            "missing_fields": [],
+        }
     errors = []
     existing_nodes = existing_nodes or set()
     for field in node_draft_schema()["fields"]:
@@ -2868,7 +2900,198 @@ def validate_node_draft_input(spec, existing_nodes=None):
     }
 
 
+def node_definition_project_targets(sop, node_id):
+    plugin_dir = Path(os.environ.get(
+        "YOUTUBE_WIKI_PLUGIN_DIR",
+        str(Path.home() / "agent-brain-plugins" / "youtube-wiki"),
+    )).expanduser()
+    return {
+        "runtime_sop_file": str(sop.get("sop_file") or ""),
+        "project_skill_node_yaml": str(plugin_dir / "skills" / f"sop-{node_id}" / "node.yaml"),
+        "project_template_sop_yaml": str(plugin_dir / "templates" / "wiki-repo" / "sop.yaml"),
+        "save_owner": "agent-brain-plugins",
+    }
+
+
+def normalize_edit_contract(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            value = yaml.safe_load(text)
+        except Exception:
+            return "__invalid_yaml__"
+    return value if isinstance(value, dict) else "__invalid_contract__"
+
+
+def validate_contract_block(block, direction, label):
+    errors = []
+    if block in (None, {}):
+        return errors
+    if isinstance(block, str) and block in {"__invalid_yaml__", "__invalid_contract__"}:
+        return [{"field": label, "code": "invalid_contract", "message": f"{label} must be a JSON/YAML object"}]
+    if not isinstance(block, dict):
+        return [{"field": label, "code": "invalid_contract", "message": f"{label} must be a JSON/YAML object"}]
+    for name, spec in block.items():
+        field = f"{label}.{name}"
+        if not str(name or "").strip():
+            errors.append({"field": label, "code": "empty_name", "message": f"{label} contains an empty contract name"})
+            continue
+        if not isinstance(spec, (dict, str)):
+            errors.append({"field": field, "code": "invalid_spec", "message": f"{field} must be a string or object"})
+            continue
+        spec_obj = normalize_contract({name: spec}, direction).get(name, {}) if not isinstance(spec, dict) else spec
+        if direction == "input":
+            resolvers = spec_obj.get("resolvers") if isinstance(spec_obj.get("resolvers"), list) else []
+            for index, resolver in enumerate(resolvers):
+                resolver_field = f"{field}.resolvers[{index}]"
+                if not isinstance(resolver, dict):
+                    errors.append({"field": resolver_field, "code": "invalid_resolver", "message": f"{resolver_field} must be an object"})
+                    continue
+                kind = str(resolver.get("kind") or resolver.get("type") or "").strip()
+                if not kind:
+                    errors.append({"field": resolver_field, "code": "missing_kind", "message": f"{resolver_field} must declare kind"})
+                if kind == "json_path" and not str(resolver.get("path") or "").strip():
+                    errors.append({"field": resolver_field, "code": "missing_path", "message": f"{resolver_field} json_path resolver requires path"})
+                if kind == "regex" and not str(resolver.get("pattern") or "").strip():
+                    errors.append({"field": resolver_field, "code": "missing_pattern", "message": f"{resolver_field} regex resolver requires pattern"})
+        if direction == "output":
+            path = str(spec_obj.get("path") or "").strip()
+            if path:
+                path_obj = Path(path)
+                if path_obj.is_absolute() or ".." in path_obj.parts:
+                    errors.append({"field": field, "code": "unsafe_path", "message": f"{field} path must be relative and stay inside the workspace"})
+    return errors
+
+
+def validate_node_definition_edit_input(sop, spec):
+    node_id = str(spec.get("node_id") or "").strip()
+    errors = []
+    nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
+    if not node_id:
+        errors.append({"field": "node_id", "code": "required", "message": "Node ID is required"})
+    elif node_id not in nodes:
+        errors.append({"field": "node_id", "code": "node_not_found", "message": f"node_id {node_id} does not exist in this workflow"})
+    for key, direction in (("inputs", "input"), ("optional_inputs", "input"), ("outputs", "output")):
+        if key in spec:
+            errors.extend(validate_contract_block(normalize_edit_contract(spec.get(key)), direction, key))
+    capabilities = normalize_edit_contract(spec.get("capabilities")) if "capabilities" in spec else None
+    if isinstance(capabilities, str) and capabilities in {"__invalid_yaml__", "__invalid_contract__"}:
+        errors.append({"field": "capabilities", "code": "invalid_contract", "message": "capabilities must be a JSON/YAML object"})
+    elif capabilities not in (None, {}) and not isinstance(capabilities, dict):
+        errors.append({"field": "capabilities", "code": "invalid_contract", "message": "capabilities must be a JSON/YAML object"})
+    return {
+        "schema_id": NODE_DRAFT_SCHEMA_VERSION,
+        "status": "passed" if not errors else "failed",
+        "errors": errors,
+        "missing_fields": [error["field"] for error in errors if error["code"] == "required"],
+        "production_dag_changed": False,
+    }
+
+
+def proposed_node_definition_from_edit(sop, spec):
+    node_id = str(spec.get("node_id") or "").strip()
+    current = copy.deepcopy((sop.get("nodes") or {}).get(node_id) or {})
+    static = node_static_config(sop, node_id) or {}
+    proposed = copy.deepcopy(current)
+    for key in ("title", "description", "purpose", "mode"):
+        if key in spec and spec.get(key) not in (None, ""):
+            proposed[key] = spec.get(key)
+    if "needs" in spec:
+        needs = spec.get("needs")
+        if isinstance(needs, str):
+            needs = [item.strip() for item in needs.split(",") if item.strip()]
+        proposed["needs"] = needs if isinstance(needs, list) else []
+    for key in ("inputs", "optional_inputs", "outputs", "capabilities"):
+        if key in spec:
+            normalized = normalize_edit_contract(spec.get(key))
+            if isinstance(normalized, dict):
+                proposed[key] = normalized
+    return {
+        "node_id": node_id,
+        "before": current,
+        "before_merged": {
+            "inputs": normalize_contract(static.get("inputs", {}), "input"),
+            "optional_inputs": normalize_contract(static.get("optional_inputs", {}), "input"),
+            "outputs": normalize_contract(static.get("outputs", {}), "output"),
+            "capabilities": node_registry_item(sop, node_id, "").get("capabilities") if node_registry_item(sop, node_id, "") else {},
+        },
+        "proposed": proposed,
+    }
+
+
+def summarize_definition_changes(before, proposed):
+    keys = ordered_unique([*(before or {}).keys(), *(proposed or {}).keys()])
+    rows = []
+    for key in keys:
+        if (before or {}).get(key) != (proposed or {}).get(key):
+            rows.append({
+                "field": key,
+                "before": mask_data((before or {}).get(key)),
+                "after": mask_data((proposed or {}).get(key)),
+            })
+    return rows
+
+
+def create_node_definition_edit_draft(sop, spec):
+    validation = validate_node_definition_edit_input(sop, spec)
+    if validation["errors"]:
+        return {
+            "draft_id": "",
+            "draft_type": "edit_node_definition",
+            "draft_path": "",
+            "node": {},
+            "change_request": {},
+            "validation": validation,
+        }
+    wiki = Path(sop["wiki_local_path"])
+    node_id = str(spec.get("node_id") or "").strip()
+    proposal = proposed_node_definition_from_edit(sop, spec)
+    draft_id = f"{node_id}-definition-edit-{int(time.time())}"
+    draft_dir = wiki / "raw" / "node-drafts" / draft_id
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    (draft_dir / "node.yaml").write_text(yaml.safe_dump(proposal["proposed"], allow_unicode=True, sort_keys=False), encoding="utf-8")
+    targets = node_definition_project_targets(sop, node_id)
+    change_request = {
+        "version": 1,
+        "draft_type": "edit_node_definition",
+        "draft_id": draft_id,
+        "node_id": node_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "save_target": "agent-brain-plugins",
+        "targets": targets,
+        "change_summary": summarize_definition_changes(proposal["before"], proposal["proposed"]),
+        "before": mask_data(proposal["before"]),
+        "before_merged": mask_data(proposal["before_merged"]),
+        "proposed": mask_data(proposal["proposed"]),
+        "notes": [
+            "This draft does not modify runtime sop.yaml.",
+            "Apply/publish must be handled by a repo-first change in agent-brain-plugins.",
+        ],
+    }
+    (draft_dir / "change_request.json").write_text(json.dumps(change_request, ensure_ascii=False, indent=2), encoding="utf-8")
+    validation = {
+        **validation,
+        "change_count": len(change_request["change_summary"]),
+        "targets": targets,
+    }
+    (draft_dir / "validation.json").write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "draft_id": draft_id,
+        "draft_type": "edit_node_definition",
+        "draft_path": str(draft_dir),
+        "node": proposal["proposed"],
+        "change_request": change_request,
+        "validation": validation,
+    }
+
+
 def create_node_draft(sop, spec):
+    if str(spec.get("draft_type") or "create_node") == "edit_node_definition":
+        return create_node_definition_edit_draft(sop, spec)
     existing_nodes = set((sop.get("nodes") or {}).keys()) if isinstance(sop.get("nodes"), dict) else set()
     input_validation = validate_node_draft_input(spec, existing_nodes)
     if input_validation["errors"]:
@@ -9053,7 +9276,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if draft_dir.is_dir():
                                 drafts.append({
                                     "draft_id": draft_dir.name,
+                                    "draft_type": (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "create_node"),
+                                    "draft_path": str(draft_dir),
                                     "node": read_yaml(draft_dir / "node.yaml"),
+                                    "change_request": read_json(draft_dir / "change_request.json") or {},
                                     "validation": read_json(draft_dir / "validation.json") or {},
                                 })
                     return json_response(self, 200, {"sop_id": sop.get("id", ""), "drafts": drafts})
