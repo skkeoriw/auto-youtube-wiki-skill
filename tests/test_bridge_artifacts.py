@@ -1493,6 +1493,13 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual((input_dir / "0001.md").read_text(encoding="utf-8"), "# Dynamic analysis\n")
         self.assertEqual(ctx["stage_b"]["output_files"], [f"raw/node-runs/{target_run}/inputs/sources/0001.md"])
         self.assertEqual(ctx["stage_b2"]["analysis_file"], f"raw/node-runs/{target_run}/inputs/sources/0001.md")
+        input_artifacts = bridge.node_run_input_manifest_artifacts(sop, target_run, "wiki-build")
+        self.assertEqual([item["title"] for item in input_artifacts], ["analysis.md", "transcript.txt"])
+        self.assertEqual([item["path"] for item in input_artifacts], [
+            f"raw/node-runs/{target_run}/inputs/sources/0001.md",
+            f"raw/node-runs/{target_run}/inputs/sources/0002.txt",
+        ])
+        self.assertIn("# Dynamic analysis", input_artifacts[0]["preview"])
 
     def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
         sop = dict(self.sop)

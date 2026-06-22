@@ -6496,6 +6496,55 @@ def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
     return artifacts
 
 
+def node_run_input_info(sop, node_run_id, node_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    return {
+        "input_directory": safe_relative_file(wiki, node_run_input_sources_dir(sop, node_run_id)),
+        "input_manifest": safe_relative_file(wiki, node_run_manifest_path(sop, node_run_id, "input")),
+        "input_artifacts": artifacts_with_preview(sop, node_run_input_manifest_artifacts(sop, node_run_id, node_id)),
+    }
+
+
+def node_run_input_manifest_artifacts(sop, node_run_id, node_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    input_dir = node_run_input_sources_dir(sop, node_run_id)
+    manifest = read_json(input_dir / "manifest.json") or {}
+    items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    artifacts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get("path") or "").strip()
+        if not item_path:
+            continue
+        path_obj = Path(item_path)
+        if path_obj.is_absolute() or ".." in path_obj.parts:
+            continue
+        rel = item_path if item_path.startswith("raw/") else safe_relative_file(wiki, input_dir / item_path)
+        path = safe_artifact_path(wiki, rel)
+        if not path or not path.is_file():
+            continue
+        output_name = str(item.get("source_output") or item.get("output") or item.get("input_name") or "input")
+        record = artifact_record(sop, node_id, output_name, path, "node-run-input-manifest")
+        if not record:
+            continue
+        source_path = str(item.get("source_path") or "").strip()
+        if source_path:
+            record["title"] = Path(source_path).name
+        record["metadata"] = {
+            **(record.get("metadata") or {}),
+            "manifest_item": mask_data(item),
+            "source_path": source_path,
+            "source_node": item.get("source_node") or "",
+            "source_run_id": item.get("source_run_id") or "",
+            "source_output": item.get("source_output") or item.get("output") or "",
+            "input_name": item.get("input_name") or "",
+            "input_path": rel,
+        }
+        artifacts.append(record)
+    return artifacts
+
+
 def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     workspace = run_workspace(sop, node_run_id)
@@ -6727,7 +6776,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
     environment_snapshot = node_run_environment_snapshot(plan)
     capability_results = node_run_capability_results(plan, real_execution)
     issues = node_run_issue_rows(plan, capability_results)
-    return {
+    result = {
         "node_run_id": node_run_id,
         "pipeline_id": node_run_id,
         "runtime_id": plan.get("runtime_id"),
@@ -6768,6 +6817,36 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "issues": issues,
         "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
     }
+    hydrate_node_run_input_artifacts(sop, result)
+    return result
+
+
+def hydrate_node_run_input_artifacts(sop, result):
+    if not isinstance(result, dict):
+        return result
+    node_run_id = sanitize_node_run_id(result.get("node_run_id") or result.get("pipeline_id") or "")
+    node_id = str(result.get("node_id") or "")
+    if not node_run_id or not node_id:
+        return result
+    info = node_run_input_info(sop, node_run_id, node_id)
+    input_artifacts = info.get("input_artifacts") or []
+    if input_artifacts:
+        result["input_artifacts"] = input_artifacts
+    if info.get("input_directory"):
+        result["input_directory"] = info.get("input_directory")
+    if info.get("input_manifest"):
+        result["input_manifest"] = info.get("input_manifest")
+    for step in result.get("steps") or []:
+        if not isinstance(step, dict) or step.get("id") != "resolve-inputs":
+            continue
+        detail = step.get("detail") if isinstance(step.get("detail"), dict) else {}
+        step["detail"] = {
+            **detail,
+            "input_directory": info.get("input_directory") or detail.get("input_directory") or "",
+            "input_manifest": info.get("input_manifest") or detail.get("input_manifest") or "",
+            "materialized_inputs": input_artifacts,
+        }
+    return result
 
 
 def persist_node_run_result(sop, node_run_id, body, result, events):
@@ -7007,6 +7086,7 @@ def read_node_run_result(sop, node_id, node_run_id):
     result = read_json(node_run_workspace(sop, safe) / "result.json")
     if not isinstance(result, dict) or result.get("node_id") != node_id:
         return None
+    hydrate_node_run_input_artifacts(sop, result)
     hydrate_node_run_capability_history(sop, result)
     result["detail"] = mask_data(result.get("detail") or {})
     return result
