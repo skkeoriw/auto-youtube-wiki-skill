@@ -4304,6 +4304,22 @@ def node_run_workspace(sop, node_run_id):
     return Path(sop["wiki_local_path"]) / "raw" / "node-runs" / node_run_id
 
 
+def node_run_input_sources_dir(sop, node_run_id):
+    return node_run_workspace(sop, node_run_id) / "inputs" / "sources"
+
+
+def node_run_output_files_dir(sop, node_run_id):
+    return node_run_workspace(sop, node_run_id) / "outputs" / "files"
+
+
+def node_run_manifest_path(sop, node_run_id, kind):
+    if kind == "input":
+        return node_run_input_sources_dir(sop, node_run_id) / "manifest.json"
+    if kind == "output":
+        return node_run_output_files_dir(sop, node_run_id) / "manifest.json"
+    return node_run_workspace(sop, node_run_id) / f"{kind}-manifest.json"
+
+
 def sanitize_test_id(value):
     return re.sub(r"[^A-Za-z0-9._-]", "", str(value or ""))
 
@@ -4371,7 +4387,7 @@ def is_blank_value(value):
     return value is None or (isinstance(value, str) and value == "")
 
 
-def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manual_inputs=None):
+def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manual_inputs=None, source_node_run_id=""):
     manual_inputs = manual_inputs if isinstance(manual_inputs, dict) else {}
     source = spec.get("from") if isinstance(spec, dict) else spec
     source = str(source or "")
@@ -4386,6 +4402,18 @@ def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manua
     }
     if source_mode == "manual" and input_name in manual_inputs and str(manual_inputs[input_name]).strip():
         item.update({"resolved": True, "value": manual_inputs[input_name], "provenance": "manual"})
+        return item
+
+    if source_mode == "existing-node-run":
+        if source_node_run_id:
+            item.update({
+                "resolved": True,
+                "value": f"raw/node-runs/{source_node_run_id}/outputs/files/manifest.json",
+                "provenance": f"node-run:{source_node_run_id}:outputs/files/manifest.json",
+                "source_node_run_id": source_node_run_id,
+            })
+            return item
+        item["reason"] = "Select a source Node Run so this run can materialize its outputs/files manifest."
         return item
 
     if source_mode == "existing-run" and base_run_id:
@@ -4458,14 +4486,15 @@ def build_node_test_plan(sop, node_id, body=None):
         return None
     static = node_static_config(sop, node_id) or {}
     source_mode = str(body.get("input_source") or body.get("source_mode") or "generated-fixture")
-    if source_mode not in {"existing-run", "generated-fixture", "manual", "deepseek-mock"}:
+    if source_mode not in {"existing-run", "existing-node-run", "generated-fixture", "manual", "deepseek-mock"}:
         source_mode = "generated-fixture"
     base_run_id = sanitize_test_id(body.get("pipeline_id") or body.get("run_id") or body.get("seed_from_run_id") or "")
+    source_node_run_id = sanitize_node_run_id(body.get("source_node_run_id") or body.get("node_run_source_id") or body.get("from_node_run_id") or "")
     manual_inputs = body.get("manual_inputs") if isinstance(body.get("manual_inputs"), dict) else {}
     inputs = normalize_contract(static.get("inputs", {}), "input")
     optional_inputs = normalize_contract(static.get("optional_inputs", {}), "input")
-    resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs) for name, spec in inputs.items()]
-    resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs) for name, spec in optional_inputs.items()]
+    resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id) for name, spec in inputs.items()]
+    resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id) for name, spec in optional_inputs.items()]
     missing = [item for item in resolved_inputs if item.get("required") and not item.get("resolved")]
     upstream = []
     for spec in list(inputs.values()) + list(optional_inputs.values()):
@@ -4486,6 +4515,8 @@ def build_node_test_plan(sop, node_id, body=None):
         "mode": "preflight",
         "input_source": source_mode,
         "base_run_id": base_run_id,
+        "source_node_run_id": source_node_run_id,
+        "manual_inputs": manual_inputs,
         "required_inputs": resolved_inputs,
         "optional_inputs": resolved_optional,
         "resolved_inputs": [item for item in resolved_inputs if item.get("resolved")],
@@ -5432,7 +5463,7 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
     input_source = str(body.get("input_source") or body.get("source_mode") or "generated-fixture")
     if input_source == "artifact":
         input_source = "manual"
-    if input_source not in {"existing-run", "generated-fixture", "manual", "deepseek-mock"}:
+    if input_source not in {"existing-run", "existing-node-run", "generated-fixture", "manual", "deepseek-mock"}:
         input_source = "generated-fixture"
     test_plan = build_node_test_plan(sop, node_id, {
         **body,
@@ -5916,24 +5947,302 @@ def ensure_generated_report_fixture(wiki, relative_path, source_url):
     )
 
 
-def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id):
+def ensure_generated_deep_research_fixture(wiki, relative_path, source_url):
+    path = safe_artifact_path(wiki, relative_path)
+    if not path or path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join([
+            "# YouTube 深度研究补充：Rick Astley - Never Gonna Give You Up",
+            "",
+            f"- YouTube: {source_url}",
+            "",
+            "## 摘要",
+            "",
+            "这是一份 Node Run 生成的测试深度研究报告，用于验证下游 wiki-build 能消费任意上游 Node Run 产物。",
+            "",
+            "## 关键要点",
+            "",
+            "- 音乐视频在流行文化中的长期传播。",
+            "- 互联网语境会重新激活旧内容的知识价值。",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+
+def node_run_manifest_value_type(path):
+    suffix = Path(str(path or "")).suffix.lower()
+    if suffix in {".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".csv", ".log"}:
+        return TEXT_FORMATS.get(suffix, suffix.lstrip("."))
+    return "binary" if suffix else "text"
+
+
+def node_run_target_file(target_dir, index, source_path="", default_suffix=".txt"):
+    suffix = Path(str(source_path or "")).suffix.lower() or default_suffix
+    if suffix and not suffix.startswith("."):
+        suffix = f".{suffix}"
+    return target_dir / f"{index:04d}{suffix or default_suffix}"
+
+
+def write_node_run_io_manifest(path, *, kind, node_run_id, node_id, source_mode, items, extra=None):
+    payload = {
+        "version": 1,
+        "kind": kind,
+        "node_run_id": node_run_id,
+        "node_id": node_id,
+        "source_mode": source_mode,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "items": items,
+    }
+    if isinstance(extra, dict):
+        payload.update({k: v for k, v in extra.items() if v not in (None, "")})
+    write_json(path, payload)
+    return payload
+
+
+def node_run_source_manifest_items(sop, source_node_run_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    source_node_run_id = sanitize_node_run_id(source_node_run_id)
+    if not source_node_run_id:
+        return []
+
+    output_dir = node_run_output_files_dir(sop, source_node_run_id)
+    manifest = read_json(output_dir / "manifest.json") or {}
+    rows = []
+    raw_items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get("path") or "").strip()
+        if not item_path:
+            continue
+        path_obj = Path(item_path)
+        if path_obj.is_absolute() or ".." in path_obj.parts:
+            continue
+        source_rel = item_path if item_path.startswith("raw/") else safe_relative_file(wiki, output_dir / item_path)
+        source_file = safe_artifact_path(wiki, source_rel)
+        if not source_file or not source_file.is_file():
+            continue
+        rows.append({
+            **item,
+            "source_path": source_rel,
+            "source_node": item.get("source_node") or manifest.get("node_id") or "",
+            "source_run_id": item.get("source_run_id") or source_node_run_id,
+        })
+    if rows:
+        return rows
+
+    if output_dir.exists():
+        for path in sorted(output_dir.rglob("*")):
+            if not path.is_file() or path.name == "manifest.json":
+                continue
+            rel = safe_relative_file(wiki, path)
+            if rel:
+                rows.append({
+                    "path": path.relative_to(output_dir).as_posix(),
+                    "source": "node-run",
+                    "source_run_id": source_node_run_id,
+                    "source_path": rel,
+                    "value_type": node_run_manifest_value_type(path),
+                })
+    if rows:
+        return rows
+
+    result = read_json(node_run_workspace(sop, source_node_run_id) / "result.json") or {}
+    source_node = str(result.get("node_id") or "")
+    for artifact in result.get("business_artifacts") or result.get("artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        source_rel = str(artifact.get("path") or "").strip()
+        source_file = safe_artifact_path(wiki, source_rel)
+        if not source_file or not source_file.is_file():
+            continue
+        rows.append({
+            "path": source_file.name,
+            "source": "node-run",
+            "source_node": source_node,
+            "source_run_id": source_node_run_id,
+            "source_path": source_rel,
+            "value_type": artifact.get("format") or node_run_manifest_value_type(source_file),
+            "output": artifact.get("output") or "",
+        })
+    return rows
+
+
+def copy_node_run_input_file(wiki, source_rel, target_dir, index, item=None):
+    source_file = safe_artifact_path(wiki, source_rel)
+    if not source_file or not source_file.is_file():
+        return None
+    target = node_run_target_file(target_dir, index, source_file.name, ".txt")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_file, target)
+    target_rel = target.relative_to(target_dir).as_posix()
+    return {
+        "path": target_rel,
+        "source": str((item or {}).get("source") or "file"),
+        "value_type": str((item or {}).get("value_type") or node_run_manifest_value_type(target)),
+        "source_path": source_rel,
+        "source_node": (item or {}).get("source_node") or "",
+        "source_run_id": (item or {}).get("source_run_id") or "",
+        "source_output": (item or {}).get("output") or (item or {}).get("source_output") or "",
+        "input_name": (item or {}).get("input_name") or "",
+    }
+
+
+def write_node_run_input_text(target_dir, index, text, item=None, suffix=".txt"):
+    target = node_run_target_file(target_dir, index, suffix, suffix)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(str(text or ""), encoding="utf-8")
+    return {
+        "path": target.relative_to(target_dir).as_posix(),
+        "source": str((item or {}).get("source") or "manual"),
+        "value_type": "text",
+        "source_path": "",
+        "source_node": (item or {}).get("source_node") or "",
+        "source_run_id": (item or {}).get("source_run_id") or "",
+        "source_output": (item or {}).get("source_output") or "",
+        "input_name": (item or {}).get("input_name") or "",
+    }
+
+
+def materialize_resolved_input_value(wiki, target_dir, index, resolved, source_url):
+    value = resolved.get("value")
+    values = value if isinstance(value, list) else [value]
+    rows = []
+    for raw in values:
+        if is_blank_value(raw):
+            continue
+        text = str(raw).strip()
+        if resolved.get("provenance") in {"generated-fixture", "deepseek-mock-fallback"}:
+            if resolved.get("name") == "reports":
+                ensure_generated_report_fixture(wiki, text, source_url)
+            if resolved.get("name") in {"deep_research", "analysis_file"}:
+                ensure_generated_deep_research_fixture(wiki, text, source_url)
+        source_file = safe_artifact_path(wiki, text)
+        if source_file and source_file.is_file():
+            row = copy_node_run_input_file(wiki, text, target_dir, index + len(rows), {
+                "source": resolved.get("provenance") or "resolved-input",
+                "input_name": resolved.get("name") or "",
+                "source_path": text,
+            })
+            if row:
+                rows.append(row)
+            continue
+        if source_file and source_file.is_dir():
+            for child in sorted(source_file.rglob("*")):
+                if not child.is_file():
+                    continue
+                rel = safe_relative_file(wiki, child)
+                row = copy_node_run_input_file(wiki, rel, target_dir, index + len(rows), {
+                    "source": resolved.get("provenance") or "resolved-input",
+                    "input_name": resolved.get("name") or "",
+                    "source_path": rel,
+                })
+                if row:
+                    rows.append(row)
+            continue
+        row = write_node_run_input_text(target_dir, index + len(rows), text, {
+            "source": resolved.get("provenance") or "resolved-input",
+            "input_name": resolved.get("name") or "",
+        })
+        rows.append(row)
+    return rows
+
+
+def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    target_dir = node_run_input_sources_dir(sop, node_run_id)
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
     source_item = node_run_resolved_input_item(plan, "source_url") or node_run_resolved_input_item(plan, "url")
     source_url = source_item.get("value") if source_item else ""
     if is_blank_value(source_url):
         source_url = ctx.get("source_url") or ctx.get("url") or "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
+    items = []
+    source_mode = plan.get("input_source") or "generated-fixture"
+    source_node_run_id = sanitize_node_run_id(plan.get("source_node_run_id") or "")
+    if source_mode == "existing-node-run":
+        for source_item in node_run_source_manifest_items(sop, source_node_run_id):
+            source_rel = str(source_item.get("source_path") or "")
+            row = copy_node_run_input_file(wiki, source_rel, target_dir, len(items) + 1, {
+                **source_item,
+                "source": "node-run",
+            })
+            if row:
+                items.append(row)
+    else:
+        resolved_items = list(plan.get("resolved_inputs") or []) + [
+            item for item in (plan.get("optional_inputs") or [])
+            if item.get("resolved")
+        ]
+        for resolved in resolved_items:
+            rows = materialize_resolved_input_value(wiki, target_dir, len(items) + 1, resolved, str(source_url or ""))
+            items.extend(rows)
+
+    if not items and source_url:
+        items.append(write_node_run_input_text(target_dir, 1, source_url, {
+            "source": source_mode,
+            "input_name": "source_url",
+        }))
+
+    manifest_path = node_run_manifest_path(sop, node_run_id, "input")
+    manifest = write_node_run_io_manifest(
+        manifest_path,
+        kind="input",
+        node_run_id=node_run_id,
+        node_id=node_id,
+        source_mode=source_mode,
+        items=items,
+        extra={"source_node_run_id": source_node_run_id},
+    )
+    input_files = []
+    for item in items:
+        rel = safe_relative_file(wiki, target_dir / item.get("path", ""))
+        if rel:
+            input_files.append(rel)
+    return {
+        "source_url": source_url,
+        "manifest": manifest,
+        "manifest_path": safe_relative_file(wiki, manifest_path),
+        "directory": safe_relative_file(wiki, target_dir),
+        "files": ordered_unique(input_files),
+        "markdown_files": [path for path in ordered_unique(input_files) if Path(path).suffix.lower() == ".md"],
+        "text_files": [path for path in ordered_unique(input_files) if Path(path).suffix.lower() in {".md", ".txt"}],
+    }
+
+
+def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run_id):
+    input_info = materialize_node_run_inputs(
+        {"wiki_local_path": str(wiki), **({"id": plan.get("instance_id")} if plan.get("instance_id") else {})},
+        node_run_id,
+        node_id,
+        plan,
+        ctx,
+    )
+    source_item = node_run_resolved_input_item(plan, "source_url") or node_run_resolved_input_item(plan, "url")
+    source_url = source_item.get("value") if source_item else input_info.get("source_url")
+    if is_blank_value(source_url):
+        source_url = input_info.get("source_url") or ctx.get("source_url") or ctx.get("url") or "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
     ctx["source_url"] = source_url
     ctx["source_type"] = ctx.get("source_type") or "youtube"
     ctx["node_run_resolved_inputs"] = {
         item.get("name"): item.get("value")
-        for item in plan.get("resolved_inputs") or []
+        for item in list(plan.get("resolved_inputs") or []) + list(plan.get("optional_inputs") or [])
         if item.get("name")
     }
+    ctx["node_run_input_manifest"] = input_info.get("manifest_path")
+    ctx["node_run_input_files"] = input_info.get("files") or []
 
     reports_item = node_run_resolved_input_item(plan, "reports")
-    report_paths = normalize_node_run_input_paths(reports_item.get("value") if reports_item else [])
+    report_paths = input_info.get("markdown_files") or normalize_node_run_input_paths(reports_item.get("value") if reports_item else [])
     if report_paths:
-        if reports_item.get("provenance") in {"generated-fixture", "deepseek-mock-fallback"}:
+        if (reports_item or {}).get("provenance") in {"generated-fixture", "deepseek-mock-fallback"}:
             for relative in report_paths:
                 ensure_generated_report_fixture(wiki, relative, source_url)
         stage_b = ctx.get("stage_b") if isinstance(ctx.get("stage_b"), dict) else {}
@@ -5941,14 +6250,14 @@ def apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id):
         ctx["stage_b"] = stage_b
 
     deep_item = node_run_resolved_input_item(plan, "deep_research") or node_run_resolved_input_item(plan, "analysis_file")
-    deep_paths = normalize_node_run_input_paths(deep_item.get("value") if deep_item else [])
+    deep_paths = input_info.get("markdown_files") or normalize_node_run_input_paths(deep_item.get("value") if deep_item else [])
     if deep_paths:
         stage_b2 = ctx.get("stage_b2") if isinstance(ctx.get("stage_b2"), dict) else {}
         stage_b2["analysis_file"] = deep_paths[0]
         stage_b2["output_files"] = deep_paths
         ctx["stage_b2"] = stage_b2
 
-    return ctx
+    return ctx, input_info
 
 
 def prepare_real_node_context(sop, node_run_id, node_id, plan):
@@ -5957,7 +6266,7 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
     ctx = read_json(ctx_file) or {}
     if not isinstance(ctx, dict):
         ctx = {}
-    ctx = apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id)
+    ctx, input_info = apply_resolved_inputs_to_pipeline_context(wiki, ctx, plan, node_id, node_run_id)
     ctx.update({
         "pipeline_id": node_run_id,
         "node_run": {
@@ -5966,6 +6275,10 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
             "mode": plan.get("mode"),
             "input_source": plan.get("input_source"),
             "base_run_id": plan.get("base_run_id"),
+            "source_node_run_id": plan.get("source_node_run_id"),
+            "input_manifest": input_info.get("manifest_path"),
+            "input_directory": input_info.get("directory"),
+            "input_files": input_info.get("files") or [],
             "capability_overrides": plan.get("capability_overrides") or {},
             "definition_scope_reports": plan.get("definition_scope_reports") or {},
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -6016,6 +6329,8 @@ def node_run_resolved_env_values(sop, plan):
 def node_run_subprocess_env(sop, node_run_id, plan):
     values = node_run_resolved_env_values(sop, plan)
     safe_id = sanitize_node_run_id(node_run_id) or f"node-run-{int(time.time())}"
+    input_dir = node_run_input_sources_dir(sop, safe_id)
+    output_dir = node_run_output_files_dir(sop, safe_id)
     override_dir = Path(os.environ.get("YOUTUBE_WIKI_NODE_RUN_ENV_DIR") or (Path.home() / ".cache" / "youtube-wiki" / "node-run-env")).expanduser()
     override_file = override_dir / f"{safe_id}.env"
     written = write_shell_env_file(override_file, values)
@@ -6025,6 +6340,10 @@ def node_run_subprocess_env(sop, node_run_id, plan):
         "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}",
         "YOUTUBE_WIKI_NODE_RUN": "1",
         "YOUTUBE_WIKI_NODE_RUN_ID": safe_id,
+        "YOUTUBE_WIKI_NODE_RUN_INPUT_DIR": str(input_dir),
+        "YOUTUBE_WIKI_NODE_RUN_INPUT_MANIFEST": str(input_dir / "manifest.json"),
+        "YOUTUBE_WIKI_NODE_RUN_OUTPUT_DIR": str(output_dir),
+        "YOUTUBE_WIKI_NODE_RUN_OUTPUT_MANIFEST": str(output_dir / "manifest.json"),
     }
     if written:
         env["YOUTUBE_WIKI_NODE_RUN_ENV_FILE"] = str(override_file)
@@ -6108,6 +6427,8 @@ def collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs
         if rel:
             run_records.append(rel)
     run_records = ordered_unique(path for path in run_records if path not in core_set and path not in set(raw_files))
+    node_run_outputs = files_under_relative_dir(wiki, f"raw/node-runs/{node_run_id}/outputs/files")
+    node_run_outputs = ordered_unique(node_run_outputs)
 
     return {
         "core_outputs": {
@@ -6128,7 +6449,51 @@ def collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs
             "files": run_records,
             "count": len(run_records),
         },
+        "node_run_outputs": {
+            "title": "统一输出目录",
+            "description": "本次 Node Run 写入 outputs/files 的可中继产物，供下游节点作为目录输入。",
+            "files": node_run_outputs,
+            "count": len(node_run_outputs),
+        },
     }
+
+
+def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    output_dir = node_run_output_files_dir(sop, node_run_id)
+    manifest = read_json(output_dir / "manifest.json") or {}
+    items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    artifacts = []
+    if not items and output_dir.exists():
+        items = [
+            {"path": path.relative_to(output_dir).as_posix(), "output": "files"}
+            for path in sorted(output_dir.rglob("*"))
+            if path.is_file() and path.name != "manifest.json"
+        ]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get("path") or "").strip()
+        if not item_path:
+            continue
+        path_obj = Path(item_path)
+        if path_obj.is_absolute() or ".." in path_obj.parts:
+            continue
+        rel = item_path if item_path.startswith("raw/") else safe_relative_file(wiki, output_dir / item_path)
+        path = safe_artifact_path(wiki, rel)
+        if not path or not path.is_file():
+            continue
+        record = artifact_record(sop, node_id, str(item.get("output") or "files"), path, "node-run-output-manifest")
+        if record:
+            record["metadata"] = {**(record.get("metadata") or {}), "manifest_item": mask_data(item)}
+            artifacts.append(record)
+    manifest_rel = safe_relative_file(wiki, output_dir / "manifest.json")
+    manifest_path = safe_artifact_path(wiki, manifest_rel)
+    if manifest_path and manifest_path.is_file():
+        record = artifact_record(sop, node_id, "manifest", manifest_path, "node-run-output-manifest")
+        if record:
+            artifacts.append(record)
+    return artifacts
 
 
 def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
@@ -6172,6 +6537,9 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
             )
         actual_outputs[name] = [record["path"] for record in records]
         artifacts.extend(records)
+    manifest_artifacts = node_run_output_manifest_artifacts(sop, node_run_id, node_id)
+    existing_artifact_paths = {artifact.get("path") for artifact in artifacts if isinstance(artifact, dict)}
+    artifacts.extend([artifact for artifact in manifest_artifacts if artifact.get("path") not in existing_artifact_paths])
 
     missing = [
         name for name, value in actual_outputs.items()
@@ -6182,6 +6550,10 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
         "actual_outputs": actual_outputs,
         "artifacts": artifacts,
         "output_categories": collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs),
+        "input_manifest": safe_relative_file(wiki, node_run_manifest_path(sop, node_run_id, "input")),
+        "input_directory": safe_relative_file(wiki, node_run_input_sources_dir(sop, node_run_id)),
+        "output_manifest": safe_relative_file(wiki, node_run_manifest_path(sop, node_run_id, "output")),
+        "output_directory": safe_relative_file(wiki, node_run_output_files_dir(sop, node_run_id)),
         "validation": {
             "status": "passed" if not missing else "failed",
             "missing_outputs": missing,
@@ -6275,6 +6647,10 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "actual_outputs": output_info["actual_outputs"],
         "artifacts": output_info["artifacts"],
         "output_categories": output_info["output_categories"],
+        "input_directory": output_info["input_directory"],
+        "input_manifest": output_info["input_manifest"],
+        "output_directory": output_info["output_directory"],
+        "output_manifest": output_info["output_manifest"],
         "validation": output_info["validation"],
         "capabilities": output_info["capabilities"],
         "detail": {
@@ -6375,6 +6751,10 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "artifacts": artifacts,
         "actual_outputs": (real_execution or {}).get("actual_outputs") or {},
         "output_categories": (real_execution or {}).get("output_categories") or {},
+        "input_directory": (real_execution or {}).get("input_directory") or "",
+        "input_manifest": (real_execution or {}).get("input_manifest") or "",
+        "output_directory": (real_execution or {}).get("output_directory") or "",
+        "output_manifest": (real_execution or {}).get("output_manifest") or "",
         "validation": (real_execution or {}).get("validation") or {},
         "capabilities": (real_execution or {}).get("capabilities") or {},
         "business_artifacts": (real_execution or {}).get("artifacts") or [],

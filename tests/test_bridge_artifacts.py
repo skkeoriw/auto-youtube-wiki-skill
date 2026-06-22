@@ -1322,7 +1322,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(plan["resolved_inputs"][0]["name"], "source_url")
         self.assertEqual(plan["resolved_inputs"][0]["value"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         self.assertEqual(plan["upstream_nodes"][0]["node_id"], "youtube-fetch")
-        self.assertFalse(plan["actions"]["real_execution"]["enabled"])
+        self.assertTrue(plan["actions"]["real_execution"]["enabled"])
 
     def test_business_node_preflight_is_recorded_outside_pipeline_runs(self):
         code, result = bridge.create_node_preflight_test(
@@ -1422,6 +1422,77 @@ class ArtifactResolutionTest(unittest.TestCase):
         listed = bridge.list_node_runs(sop, "youtube-deep-research")[0]
         self.assertEqual(listed["node_run_id"], result["node_run_id"])
         self.assertEqual(listed["retry_of"], "node-run-old")
+
+    def test_existing_node_run_materializes_dynamic_input_manifest(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["wiki-build"] = {
+            "title": "Wiki Build",
+            "skill": "sop-wiki-build",
+            "inputs": {
+                "reports": "notebooklm-research.outputs.reports",
+            },
+            "optional_inputs": {
+                "deep_research": "youtube-deep-research.outputs.analysis_file",
+            },
+            "outputs": {"index": "index.md", "pages": "wiki/**"},
+        }
+        source_run = "node-run-youtube-deep-research-source"
+        source_dir = bridge.node_run_output_files_dir(sop, source_run)
+        source_dir.mkdir(parents=True)
+        (source_dir / "analysis.md").write_text("# Dynamic analysis\n", encoding="utf-8")
+        (source_dir / "transcript.txt").write_text("transcript\n", encoding="utf-8")
+        bridge.write_json(source_dir / "manifest.json", {
+            "version": 1,
+            "kind": "output",
+            "node_run_id": source_run,
+            "node_id": "youtube-deep-research",
+            "items": [
+                {
+                    "path": "analysis.md",
+                    "source": "node-run",
+                    "source_node": "youtube-deep-research",
+                    "source_run_id": source_run,
+                    "source_path": f"raw/node-runs/{source_run}/outputs/files/analysis.md",
+                    "output": "analysis_file",
+                    "value_type": "markdown",
+                },
+                {
+                    "path": "transcript.txt",
+                    "source": "node-run",
+                    "source_node": "youtube-deep-research",
+                    "source_run_id": source_run,
+                    "source_path": f"raw/node-runs/{source_run}/outputs/files/transcript.txt",
+                    "output": "transcript_file",
+                    "value_type": "text",
+                },
+            ],
+        })
+
+        target_run = "node-run-wiki-build-relay"
+        plan = bridge.build_node_run_plan(sop, "test", "wiki-build", {
+            "mode": "real-node",
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run,
+        })
+        self.assertEqual(plan["input_source"], "existing-node-run")
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["source_node_run_id"], source_run)
+
+        ctx = bridge.prepare_real_node_context(sop, target_run, "wiki-build", plan)
+        input_dir = self.wiki / "raw" / "node-runs" / target_run / "inputs" / "sources"
+        manifest = json.loads((input_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["source_mode"], "existing-node-run")
+        self.assertEqual(manifest["source_node_run_id"], source_run)
+        self.assertEqual([item["path"] for item in manifest["items"]], ["0001.md", "0002.txt"])
+        self.assertEqual(manifest["items"][0]["source"], "node-run")
+        self.assertEqual(manifest["items"][0]["source_node"], "youtube-deep-research")
+        self.assertEqual(manifest["items"][0]["source_run_id"], source_run)
+        self.assertEqual(manifest["items"][0]["source_path"], f"raw/node-runs/{source_run}/outputs/files/analysis.md")
+        self.assertEqual((input_dir / "0001.md").read_text(encoding="utf-8"), "# Dynamic analysis\n")
+        self.assertEqual(ctx["stage_b"]["output_files"], [f"raw/node-runs/{target_run}/inputs/sources/0001.md"])
+        self.assertEqual(ctx["stage_b2"]["analysis_file"], f"raw/node-runs/{target_run}/inputs/sources/0001.md")
 
     def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
         sop = dict(self.sop)
@@ -1901,7 +1972,13 @@ PY
         self.assertEqual(result["actual_outputs"]["index"], ["index.md"])
         self.assertIn("wiki/sources/Generated.md", result["actual_outputs"]["pages"])
         ctx = json.loads((self.wiki / "raw" / "pipeline-context.json").read_text(encoding="utf-8"))
-        self.assertEqual(ctx["stage_b"]["output_files"], ["raw/notebooklm-analysis/node-test-fixture.md"])
+        self.assertEqual(ctx["stage_b"]["output_files"], [
+            f"raw/node-runs/{result['node_run_id']}/inputs/sources/0001.md",
+        ])
+        input_manifest = json.loads(
+            (self.wiki / "raw" / "node-runs" / result["node_run_id"] / "inputs" / "sources" / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(input_manifest["items"][0]["source_path"], "raw/notebooklm-analysis/node-test-fixture.md")
         self.assertTrue((self.wiki / "raw" / "notebooklm-analysis" / "node-test-fixture.md").exists())
 
     def test_node_run_routes_create_and_read_shareable_id(self):
