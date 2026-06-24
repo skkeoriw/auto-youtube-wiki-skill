@@ -5123,8 +5123,8 @@ def edge_handoff_node_payload(sop, node_id):
         "node_id": node_id,
         "title": item.get("title") or cfg.get("title") or node_id,
         "skill_id": skill.get("id") or executor.get("skill") or cfg.get("skill") or item.get("skill_id") or node_id,
-        "skill_summary": skill.get("summary") or item.get("description") or cfg.get("description") or "",
-        "skill_readme": skill.get("summary") or item.get("skill_readme") or "",
+        "skill_summary": edge_handoff_compact_text(skill.get("summary") or item.get("description") or cfg.get("description") or "", 1200),
+        "skill_readme": edge_handoff_compact_text(skill.get("summary") or item.get("skill_readme") or "", 1800),
         "inputs": item.get("inputs") or normalize_contract(cfg.get("inputs") or {}, "input"),
         "optional_inputs": item.get("optional_inputs") or normalize_contract(cfg.get("optional_inputs") or {}, "input"),
         "outputs": item.get("outputs") or normalize_contract(cfg.get("outputs") or {}, "output"),
@@ -5132,6 +5132,23 @@ def edge_handoff_node_payload(sop, node_id):
         "capabilities": item.get("capabilities") or cfg.get("capabilities") or {},
         "infra": item.get("infra") or cfg.get("infra") or {},
     }
+
+
+def edge_handoff_compact_text(value, limit=1800):
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...[truncated for Edge Handoff evaluation]"
+
+
+def edge_handoff_compact_node_context(node):
+    node = node if isinstance(node, dict) else {}
+    if not node:
+        return {}
+    result = dict(node)
+    result["skill_summary"] = edge_handoff_compact_text(result.get("skill_summary") or result.get("description") or "", 1200)
+    result["skill_readme"] = edge_handoff_compact_text(result.get("skill_readme") or result.get("readme") or "", 1800)
+    return result
 
 
 def edge_handoff_request_payload(sop, workflow_id, data):
@@ -5157,6 +5174,8 @@ def edge_handoff_request_payload(sop, workflow_id, data):
         upstream = edge_handoff_node_payload(sop, upstream_node_id)
     if downstream_node_id and not downstream:
         downstream = edge_handoff_node_payload(sop, downstream_node_id)
+    upstream = edge_handoff_compact_node_context(upstream)
+    downstream = edge_handoff_compact_node_context(downstream)
     runtime_id = sop.get("runtime_id") or os.environ.get("SOP_RUNTIME_ID") or ""
     return {
         "runtime_id": data.get("runtime_id") or runtime_id,
@@ -5206,6 +5225,8 @@ def edge_handoff_evaluator_env(sop, data):
         env["EDGE_HANDOFF_LLM_API_KEY"] = str(api_key.get("value"))
     if not is_blank_value(model.get("value")):
         env["EDGE_HANDOFF_LLM_MODEL"] = str(model.get("value"))
+    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "20")
+    env.setdefault("EDGE_HANDOFF_LLM_MAX_TOKENS", "2048")
     return env, {
         "base_url": env_config_item(
             base_url.get("key") or "EDGE_HANDOFF_LLM_BASE_URL",
