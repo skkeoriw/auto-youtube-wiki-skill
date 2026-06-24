@@ -8440,6 +8440,11 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "issues": issues,
         "detail": mask_data({**plan, "inner_steps": inner_steps, "real_execution": real_execution or {}}),
     }
+    matched_items = ((plan.get("relay_selection") or {}).get("matched_items") or []) if isinstance(plan.get("relay_selection"), dict) else []
+    if matched_items and not result["resolution_trace"]:
+        result["resolution_trace"] = relay_resolution_trace(plan, matched_items, {})
+        result["relay_context"] = relay_context_payload(plan, matched_items, {"status": "matched"})
+        result["relay_context_brief"] = result["relay_context"].get("brief") or result.get("relay_context_brief") or ""
     hydrate_node_run_input_artifacts(sop, result)
     input_resolution = result.get("input_resolution") if isinstance(result.get("input_resolution"), dict) else {}
     if input_resolution:

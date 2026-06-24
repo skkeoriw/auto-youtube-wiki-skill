@@ -1931,6 +1931,25 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("Extract URL from metadata", plan["relay_context_brief"])
         self.assertTrue(plan["workflow_revision"]["hash"])
 
+        dry_steps = bridge.build_node_run_steps(self.sop, plan)
+        dry_result = bridge.build_node_run_result_payload(
+            self.sop,
+            "node-run-deep-edge-dry",
+            "youtube-deep-research",
+            {"mode": "dry-run"},
+            plan,
+            dry_steps,
+            [],
+            [],
+            [],
+            "2026-06-01T00:00:00Z",
+            "2026-06-01T00:00:01Z",
+        )
+        self.assertEqual(dry_result["edge_contract"]["id"], "edge-fetch-metadata-to-deep")
+        self.assertEqual(dry_result["relay_context"]["edge_id"], "edge-fetch-metadata-to-deep")
+        self.assertEqual(dry_result["resolution_trace"][0]["source_output"], "metadata_file")
+        self.assertEqual(dry_result["resolution_trace"][0]["status"], "matched")
+
         target_run_id = "node-run-deep-edge-target"
         ctx = bridge.prepare_real_node_context(self.sop, target_run_id, "youtube-deep-research", plan)
         manifest = json.loads((self.wiki / "raw/node-runs" / target_run_id / "inputs/sources/manifest.json").read_text(encoding="utf-8"))
