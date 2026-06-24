@@ -1,6 +1,7 @@
 import http.server
 import base64
 import copy
+import difflib
 import hashlib
 import hmac
 import importlib.util
@@ -3367,6 +3368,190 @@ def create_workflow_edge_draft(sop, workflow_id, spec):
         "change_request": change_request,
         "validation": validation,
     }
+
+
+def apply_workflow_edge_draft(sop, workflow_id, data):
+    workflow_id = workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or ""
+    draft_id = str((data or {}).get("draft_id") or "").strip()
+    draft_path = str((data or {}).get("draft_path") or "").strip()
+    if not draft_id and not draft_path:
+        return {
+            "status": "failed",
+            "reason": "draft_id or draft_path is required",
+            "errors": [
+                {"code": "missing_draft", "message": "draft_id or draft_path is required"},
+            ],
+            "edge": {},
+            "targets": {},
+        }
+
+    wiki = Path(sop["wiki_local_path"])
+    candidates = []
+    if draft_path:
+        candidates.append(draft_path)
+    if draft_id:
+        candidates.append(str(wiki / "raw" / "workflow-drafts" / draft_id))
+    resolved = None
+    for raw_path in candidates:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = (wiki / path).resolve()
+        if path.exists() and path.is_dir():
+            resolved = str(path)
+            break
+    if not resolved:
+        return {
+            "status": "failed",
+            "reason": "workflow edge draft not found",
+            "errors": [{"code": "draft_not_found", "message": "workflow edge draft path is missing"}],
+            "edge": {},
+            "targets": {},
+        }
+
+    resolved_path = Path(resolved)
+    draft = read_json(resolved_path / "change_request.json") or {}
+    draft_workflow_id = str(draft.get("workflow_id") or "").strip()
+    if draft_workflow_id and draft_workflow_id != workflow_id:
+        return {
+            "status": "failed",
+            "reason": "workflow id mismatch",
+            "errors": [{"code": "workflow_mismatch", "message": f"draft workflow {draft_workflow_id!r} does not match {workflow_id!r}"}],
+            "edge": {},
+            "targets": workflow_definition_project_targets(sop, workflow_id),
+        }
+
+    proposed = read_yaml(resolved_path / "edge.yaml")
+    if not isinstance(proposed, dict):
+        return {
+            "status": "failed",
+            "reason": "invalid draft payload",
+            "errors": [{"code": "invalid_edge_draft", "message": "edge.yaml is missing or malformed"}],
+            "edge": {},
+            "targets": workflow_definition_project_targets(sop, workflow_id),
+        }
+    source = str(proposed.get("from") or "").strip()
+    target = str(proposed.get("to") or "").strip()
+    edge_id = str(proposed.get("id") or f"{source}-to-{target}").strip()
+    if not source or not target:
+        return {
+            "status": "failed",
+            "reason": "invalid edge",
+            "errors": [{"code": "invalid_edge", "message": "edge.from and edge.to are required"}],
+            "edge": proposed,
+            "targets": workflow_definition_project_targets(sop, workflow_id),
+        }
+
+    if source == target:
+        return {
+            "status": "failed",
+            "reason": "invalid edge",
+            "errors": [{"code": "self_edge", "message": "upstream and downstream must be different"}],
+            "edge": proposed,
+            "targets": workflow_definition_project_targets(sop, workflow_id),
+        }
+
+    targets = workflow_definition_project_targets(sop, workflow_id)
+    template_path = Path(targets["project_template_sop_yaml"])
+    if not template_path.exists():
+        return {
+            "status": "failed",
+            "reason": "project template missing",
+            "errors": [{"code": "template_missing", "message": "agent-brain-plugins template SOP is missing"}],
+            "edge": proposed,
+            "targets": targets,
+        }
+
+    original_text = template_path.read_text(encoding="utf-8")
+    template_doc = read_yaml(template_path)
+    if not isinstance(template_doc, dict):
+        template_doc = {}
+
+    nodes = template_doc.get("nodes") if isinstance(template_doc.get("nodes"), dict) else {}
+    if source not in nodes:
+        return {
+            "status": "failed",
+            "reason": "edge source node not found in template",
+            "errors": [{"code": "source_node_not_found", "message": f"source node {source!r} not found in template"}],
+            "edge": proposed,
+            "targets": targets,
+        }
+    if target not in nodes:
+        return {
+            "status": "failed",
+            "reason": "edge target node not found in template",
+            "errors": [{"code": "target_node_not_found", "message": f"target node {target!r} not found in template"}],
+            "edge": proposed,
+            "targets": targets,
+        }
+
+    edges = template_doc.get("edges") if isinstance(template_doc.get("edges"), list) else []
+    if not isinstance(edges, list):
+        edges = []
+    existing = next((i for i, item in enumerate(edges) if isinstance(item, dict) and str(item.get("id") or "").strip() == edge_id), None)
+    replacement = copy.deepcopy(proposed)
+    replacement.setdefault("id", edge_id)
+    replacement["from"] = source
+    replacement["to"] = target
+
+    if existing is None:
+        existing = next((
+            i for i, item in enumerate(edges)
+            if isinstance(item, dict) and str(item.get("from") or "").strip() == source and str(item.get("to") or "").strip() == target
+        ), None)
+    before_edges = copy.deepcopy(edges)
+    before_snapshot = json.dumps(before_edges, ensure_ascii=False, sort_keys=True)
+    if existing is None:
+        edges.append(replacement)
+        status = "patch_ready"
+    else:
+        if edges[existing] == replacement:
+            status = "unchanged"
+        else:
+            edges[existing] = replacement
+            status = "patch_ready"
+    template_doc["edges"] = edges
+    after_edges = copy.deepcopy(edges)
+    after_snapshot = json.dumps(edges, ensure_ascii=False, sort_keys=True)
+
+    candidate_text = yaml.safe_dump(template_doc, allow_unicode=True, sort_keys=False)
+    patch_text = "" if status == "unchanged" else "".join(difflib.unified_diff(
+        original_text.splitlines(keepends=True),
+        candidate_text.splitlines(keepends=True),
+        fromfile=str(template_path),
+        tofile=f"{template_path} (candidate)",
+    ))
+    candidate_path = resolved_path / "candidate_sop.yaml"
+    patch_path = resolved_path / "template_patch.diff"
+    result_path = resolved_path / "apply_result.json"
+    if status == "patch_ready":
+        candidate_path.write_text(candidate_text, encoding="utf-8")
+        patch_path.write_text(patch_text, encoding="utf-8")
+
+    result = {
+        "status": status,
+        "workflow_id": workflow_id,
+        "draft_id": draft_id or resolved_path.name,
+        "draft_path": str(resolved_path),
+        "targets": targets,
+        "edge": replacement,
+        "before": before_edges,
+        "after": after_edges,
+        "hash_before": hashlib.sha256(before_snapshot.encode("utf-8")).hexdigest()[:16] if before_snapshot else "",
+        "hash_after": hashlib.sha256(after_snapshot.encode("utf-8")).hexdigest()[:16] if after_snapshot else "",
+        "change_count": 0 if status == "unchanged" else 1,
+        "production_dag_changed": False,
+        "repo_first_required": True,
+        "candidate_sop_path": str(candidate_path) if status == "patch_ready" else "",
+        "patch_path": str(patch_path) if status == "patch_ready" else "",
+        "patch": patch_text,
+        "message": (
+            "repo-first patch prepared; apply this diff in the development checkout, commit, push, then git pull on runtime machines"
+            if status == "patch_ready" else
+            "edge already matches the project template; no source change is required"
+        ),
+    }
+    result_path.write_text(json.dumps(mask_data(result), ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
 
 
 def list_workflow_edge_drafts(sop):
@@ -10718,6 +10903,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             draft = create_workflow_edge_draft(sop, path[4], data)
             status = 422 if (draft.get("validation") or {}).get("status") == "failed" else 201
             return json_response(self, status, draft)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/edges/apply
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "edges" and path[6] == "apply"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = apply_workflow_edge_draft(sop, path[4], data)
+            status = 422 if result.get("status") == "failed" else 200
+            if result.get("status") == "failed":
+                return json_response(self, 422, result)
+            return json_response(self, 200, result)
 
         env = {**os.environ}
         for k, v in data.items():

@@ -1730,10 +1730,140 @@ class ArtifactResolutionTest(unittest.TestCase):
                 timeout=3,
             ) as response:
                 listed = json.loads(response.read())
-            self.assertEqual(listed["drafts"][0]["draft_id"], draft["draft_id"])
+        self.assertEqual(listed["drafts"][0]["draft_id"], draft["draft_id"])
         server.shutdown()
         server.server_close()
         self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
+
+    def test_workflow_edge_apply_route_prepares_repo_first_patch(self):
+        plugin = self.wiki / "plugin"
+        template_dir = plugin / "templates" / "wiki-repo"
+        template_dir.mkdir(parents=True, exist_ok=True)
+        template_path = template_dir / "sop.yaml"
+        before_template_text = json.dumps(
+            {
+                "nodes": {
+                    "youtube-fetch": {"title": "YouTube Fetch", "skill": "sop-youtube-fetch"},
+                    "youtube-deep-research": {"title": "YouTube Deep Research", "skill": "sop-youtube-deep-research"},
+                },
+                "edges": [
+                    {
+                        "id": "keep-edge",
+                        "from": "youtube-fetch",
+                        "to": "youtube-notify",
+                    }
+                ],
+            }
+        )
+        template_path.write_text(
+            before_template_text,
+            encoding="utf-8",
+        )
+
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "outputs": {
+                "analysis_file": {"kind": "file", "value_type": "markdown"},
+                "transcript_file": {"kind": "file", "value_type": "text"},
+            },
+        }
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop), patch.dict(os.environ, {"YOUTUBE_WIKI_PLUGIN_DIR": str(plugin)}):
+            thread.start()
+            approved_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/drafts",
+                method="POST",
+                data=json.dumps({
+                    "edge": {
+                        "id": "youtube-fetch-to-youtube-deep-research",
+                        "from": "youtube-fetch",
+                        "to": "youtube-deep-research",
+                        "relayMode": "auto_by_target_inputs",
+                    },
+                    "edge_handoff_instruction": "把 source_url 传给 youtube-deep-research。",
+                    "evaluation": {
+                        "status": "ready",
+                        "score": 0.93,
+                        "confidence": 0.88,
+                        "summary": "source_url 可以稳定传给下游。",
+                        "decision": "can_run",
+                        "agent": {"provider": "openai-compatible", "model": "deepseek-v4-flash", "used_ai": True},
+                        "node_execution_guide": {
+                            "format": "markdown",
+                            "prompt": "Use the materialized source_url as target URL.",
+                        },
+                        "resolved_handoff": {"primary_artifacts": [{"from": "youtube-fetch.outputs.source_url"}]},
+                    },
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(approved_request, timeout=3) as response:
+                self.assertEqual(response.status, 201)
+                draft = json.loads(response.read())
+
+            apply_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/apply",
+                method="POST",
+                data=json.dumps({"draft_id": draft["draft_id"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(apply_request, timeout=3) as response:
+                applied = json.loads(response.read())
+
+            self.assertEqual(applied["status"], "patch_ready")
+            self.assertEqual(applied["draft_id"], draft["draft_id"])
+            self.assertTrue(applied["repo_first_required"])
+            self.assertFalse(applied["production_dag_changed"])
+            self.assertIn("youtube-fetch-to-youtube-deep-research", applied["patch"])
+            self.assertTrue(Path(applied["candidate_sop_path"]).exists())
+            self.assertTrue(Path(applied["patch_path"]).exists())
+            self.assertEqual(template_path.read_text(encoding="utf-8"), before_template_text)
+
+            candidate = bridge.read_yaml(Path(applied["candidate_sop_path"]))
+            self.assertEqual(candidate["edges"][-1]["id"], "youtube-fetch-to-youtube-deep-research")
+            self.assertEqual(candidate["edges"][-1]["from"], "youtube-fetch")
+            self.assertEqual(candidate["edges"][-1]["to"], "youtube-deep-research")
+
+            apply_again_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/apply",
+                method="POST",
+                data=json.dumps({"draft_id": draft["draft_id"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(apply_again_request, timeout=3) as response:
+                reapplied = json.loads(response.read())
+        server.shutdown()
+        server.server_close()
+
+        self.assertEqual(reapplied["status"], "patch_ready")
+        self.assertEqual(reapplied["patch_path"], applied["patch_path"])
+        self.assertEqual(template_path.read_text(encoding="utf-8"), before_template_text)
+
+    def test_workflow_edge_apply_route_requires_valid_draft(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=self.sop):
+            thread.start()
+            missing_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/apply",
+                method="POST",
+                data=json.dumps({"draft_id": "missing-draft-id"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(missing_request, timeout=3)
+            self.assertEqual(ctx.exception.code, 422)
+            payload = json.loads(ctx.exception.read())
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["errors"][0]["code"], "draft_not_found")
+        server.shutdown()
+        server.server_close()
 
     def test_business_node_test_plan_resolves_generated_fixture(self):
         sop = dict(self.sop)
