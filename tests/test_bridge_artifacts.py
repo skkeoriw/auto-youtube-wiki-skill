@@ -946,6 +946,8 @@ class ArtifactResolutionTest(unittest.TestCase):
                 "HERMES_SMOKE_ROUTE": "sop-runtime-hermes-smoke",
                 "HERMES_WEBHOOK_TOKEN": "secret-token",
             }, clear=False),
+            patch.object(bridge, "read_env_file_values", return_value={}),
+            patch.object(bridge, "read_runtime_management_config", return_value={"values": {}, "backend": "file"}),
             patch.object(bridge, "runtime_info", return_value={
                 "runtime_id": "runtime-test",
                 "channel_url": "https://runtime-test.example",
@@ -963,6 +965,57 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertNotIn("secret-token", json.dumps(result, ensure_ascii=False))
         self.assertIn("$HERMES_WEBHOOK_TOKEN", result["curl"])
         self.assertEqual(captured["timeout"], 60)
+
+    def test_hermes_smoke_check_reads_runtime_env_file(self):
+        captured = {}
+
+        class FakeResponse:
+            status = 202
+            headers = {"content-type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"status":"accepted"}'
+
+        def fake_urlopen(request, timeout=0):
+            captured["request"] = request
+            captured["body"] = request.data
+            return FakeResponse()
+
+        with (
+            patch.dict(os.environ, {
+                "HERMES_WEBHOOK_URL": "",
+                "WEBHOOK_PUBLIC_HOST": "",
+                "HERMES_WEBHOOK_TOKEN": "",
+                "YOUTUBE_WIKI_ENV_FILE": "/tmp/runtime-env-for-hermes-smoke",
+            }, clear=False),
+            patch.object(bridge, "read_env_file_values", return_value={
+                "WEBHOOK_PUBLIC_HOST": "hermes-env.example",
+                "HERMES_WEBHOOK_TOKEN": "env-secret-token",
+            }),
+            patch.object(bridge, "read_runtime_management_config", return_value={"values": {}, "backend": "file"}),
+            patch.object(bridge, "runtime_info", return_value={
+                "runtime_id": "runtime-test",
+                "channel_url": "https://runtime-test.example",
+                "spi_base_url": "https://runtime-test.example/api/sop",
+            }),
+            patch.object(bridge.urllib.request, "urlopen", side_effect=fake_urlopen),
+        ):
+            status, result = bridge.hermes_smoke_check("你好 你是谁")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["target_url"], "https://hermes-env.example/webhooks/sop-runtime-hermes-smoke")
+        self.assertTrue(result["token_present"])
+        self.assertEqual(result["config"]["target"]["source"], "runtime-env-file:WEBHOOK_PUBLIC_HOST")
+        self.assertEqual(result["config"]["token"]["source"], "runtime-env-file:HERMES_WEBHOOK_TOKEN")
+        self.assertNotIn("env-secret-token", json.dumps(result, ensure_ascii=False))
+        self.assertIn("x-hub-signature-256", {key.lower(): value for key, value in captured["request"].headers.items()})
 
     def test_hermes_agent_check_runs_local_cli_with_prompt(self):
         captured = {}
@@ -1603,7 +1656,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             "out=args[args.index('--output-json')+1]\n"
             "assert os.environ.get('EDGE_HANDOFF_LLM_BASE_URL') == 'https://api-proxy.example/v1'\n"
             "assert os.environ.get('EDGE_HANDOFF_LLM_API_KEY') == 'secret-edge-key'\n"
-            "assert os.environ.get('EDGE_HANDOFF_LLM_MODEL') == 'deepseek-v4-flash'\n"
+            "assert os.environ.get('EDGE_HANDOFF_LLM_MODEL') == 'deepseek-v4-pro'\n"
             "evaluation={'status':'needs_instruction','summary':'fake ai eval','node_execution_guide':{'format':'markdown','prompt':''},'agent':{'used_ai':True}}\n"
             "json.dump(evaluation, open(out,'w',encoding='utf-8'))\n"
             "print(json.dumps(evaluation))\n",
@@ -1640,7 +1693,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(response["request"]["downstream"]["skill_id"], "sop-tg-notify")
         self.assertEqual(response["config"]["base_url"]["value"], "https://api-proxy.example/v1")
         self.assertEqual(response["config"]["api_key"]["masked_value"], "sec***key")
-        self.assertEqual(response["config"]["model"]["value"], "deepseek-v4-flash")
+        self.assertEqual(response["config"]["model"]["value"], "deepseek-v4-pro")
         self.assertNotIn("secret-edge-key", json.dumps(response["config"]))
 
     def test_workflow_edge_draft_route_requires_ai_approved_evaluation(self):

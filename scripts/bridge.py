@@ -3910,14 +3910,9 @@ def hermes_smoke_route():
     return (os.environ.get("HERMES_SMOKE_ROUTE") or "sop-runtime-hermes-smoke").strip().strip("/") or "sop-runtime-hermes-smoke"
 
 
-def hermes_webhook_url():
-    route = hermes_smoke_route()
-    raw = (
-        os.environ.get("HERMES_WEBHOOK_URL")
-        or os.environ.get("WEBHOOK_PUBLIC_HOST")
-        or os.environ.get("HERMES_PUBLIC_HOST")
-        or ""
-    ).strip().rstrip("/")
+def normalize_hermes_webhook_url(raw, route):
+    raw = str(raw or "").strip().rstrip("/")
+    route = str(route or "sop-runtime-hermes-smoke").strip().strip("/") or "sop-runtime-hermes-smoke"
     if not raw:
         return ""
     if not raw.startswith(("http://", "https://")):
@@ -3925,6 +3920,17 @@ def hermes_webhook_url():
     if "/webhooks/" in raw:
         return raw
     return f"{raw}/webhooks/{route}"
+
+
+def hermes_webhook_url():
+    route = hermes_smoke_route()
+    raw = (
+        os.environ.get("HERMES_WEBHOOK_URL")
+        or os.environ.get("WEBHOOK_PUBLIC_HOST")
+        or os.environ.get("HERMES_PUBLIC_HOST")
+        or ""
+    )
+    return normalize_hermes_webhook_url(raw, route)
 
 
 def shell_quote_single(value):
@@ -4092,8 +4098,18 @@ def hermes_post_with_retry(target, data, headers, attempts=3, opener=None, sleep
 
 
 def hermes_smoke_check(message):
-    target = hermes_webhook_url()
-    token = os.environ.get("HERMES_WEBHOOK_TOKEN", "")
+    context = node_run_config_context({}, None)
+    route_item = node_run_config_lookup(context, "HERMES_SMOKE_ROUTE", RUNTIME_CAPABILITY_ENV.get("HERMES_SMOKE_ROUTE", []))
+    route = str(route_item.get("value") or "sop-runtime-hermes-smoke").strip().strip("/") or "sop-runtime-hermes-smoke"
+    target_item = node_run_config_lookup(context, "HERMES_WEBHOOK_URL", [
+        *RUNTIME_CAPABILITY_ENV.get("HERMES_WEBHOOK_URL", []),
+        "WEBHOOK_PUBLIC_HOST",
+        *RUNTIME_CAPABILITY_ENV.get("WEBHOOK_PUBLIC_HOST", []),
+        "HERMES_PUBLIC_HOST",
+    ])
+    token_item = node_run_config_lookup(context, "HERMES_WEBHOOK_TOKEN", RUNTIME_CAPABILITY_ENV.get("HERMES_WEBHOOK_TOKEN", []))
+    target = normalize_hermes_webhook_url(target_item.get("value"), route)
+    token = str(token_item.get("value") or "")
     info = runtime_info()
     payload = {
         "message": message or "你好 你是谁",
@@ -4105,9 +4121,34 @@ def hermes_smoke_check(message):
     }
     base = {
         "target_url": target,
-        "route": hermes_smoke_route(),
+        "route": route,
         "curl": hermes_manual_curl(target or "https://<WEBHOOK_PUBLIC_HOST>/webhooks/sop-runtime-hermes-smoke", payload),
         "token_present": bool(token),
+        "config": {
+            "target": env_config_item(
+                target_item.get("key") or "HERMES_WEBHOOK_URL",
+                "Hermes Webhook URL",
+                required=True,
+                value=target_item.get("value"),
+                source=target_item.get("source") or "missing:HERMES_WEBHOOK_URL",
+            ),
+            "token": env_config_item(
+                token_item.get("key") or "HERMES_WEBHOOK_TOKEN",
+                "Hermes Webhook Token",
+                required=True,
+                value=token,
+                source=token_item.get("source") or "missing:HERMES_WEBHOOK_TOKEN",
+            ),
+            "route": env_config_item(
+                route_item.get("key") or "HERMES_SMOKE_ROUTE",
+                "Hermes Smoke Route",
+                required=False,
+                value=route,
+                source=route_item.get("source") or "default",
+            ),
+            "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
+            "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env"],
+        },
         "payload": payload,
     }
     if not target:
@@ -5841,9 +5882,9 @@ def edge_handoff_evaluator_env(sop, data):
 def edge_handoff_model_lookup(context):
     groups = [
         ["EDGE_HANDOFF_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", [])],
+        ["WIKI_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", [])],
         ["HERMES_MODEL", *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", [])],
         ["WIKI_DEEPSEEK_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", [])],
-        ["WIKI_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", [])],
     ]
     for group in groups:
         resolved = node_run_config_lookup(context, group[0], group[1:])

@@ -57,6 +57,14 @@ if [[ ! -f "$LOCAL_SCRIPT" ]]; then
   echo "local-script.sh not found at $LOCAL_SCRIPT" >&2; exit 1
 fi
 
+ENV_FILE="${YOUTUBE_WIKI_ENV_FILE:-$HOME/.agent-brain-plugins.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 export BRIDGE_PORT BRIDGE_SCRIPT BRIDGE_PY_FILE
 BRIDGE_PORT="$PORT"
 BRIDGE_SCRIPT="$LOCAL_SCRIPT"
