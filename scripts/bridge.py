@@ -5850,7 +5850,7 @@ def edge_handoff_evaluator_env(sop, data):
         env["EDGE_HANDOFF_LLM_API_KEY"] = str(api_key.get("value"))
     if not is_blank_value(model.get("value")):
         env["EDGE_HANDOFF_LLM_MODEL"] = str(model.get("value"))
-    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "20")
+    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "120")
     env.setdefault("EDGE_HANDOFF_LLM_MAX_TOKENS", "2048")
     return env, {
         "base_url": env_config_item(
