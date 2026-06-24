@@ -121,6 +121,9 @@ RUNTIME_CAPABILITY_ENV = {
     "WIKI_LLM_API_KEY": ["wiki_llm_api_key", "llm_api_key", "wiki_llm_token"],
     "WIKI_LLM_MODEL": ["wiki_llm_model", "llm_model", "wiki_model"],
     "WIKI_DEEPSEEK_MODEL": ["wiki_deepseek_model", "hermes_default_model"],
+    "EDGE_HANDOFF_LLM_BASE_URL": ["edge_handoff_llm_base_url"],
+    "EDGE_HANDOFF_LLM_API_KEY": ["edge_handoff_llm_api_key", "edge_handoff_llm_token"],
+    "EDGE_HANDOFF_LLM_MODEL": ["edge_handoff_llm_model"],
     "HERMES_MODEL_PROVIDER": ["hermes_model_provider"],
     "HERMES_MODEL": ["hermes_model", "hermes_default_model"],
     "HERMES_MODEL_BASE_URL": ["hermes_model_base_url", "hermes_base_url", "openai_base_url"],
@@ -5169,6 +5172,67 @@ def edge_handoff_request_payload(sop, workflow_id, data):
     }
 
 
+def edge_handoff_evaluator_env(sop, data):
+    context = node_run_config_context(data, sop)
+    base_url = node_run_config_lookup(context, "EDGE_HANDOFF_LLM_BASE_URL", [
+        *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_BASE_URL", []),
+        "HERMES_MODEL_BASE_URL",
+        *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL_BASE_URL", []),
+        "WIKI_LLM_BASE_URL",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_BASE_URL", []),
+    ])
+    api_key = node_run_config_lookup(context, "EDGE_HANDOFF_LLM_API_KEY", [
+        *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_API_KEY", []),
+        "HERMES_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        *RUNTIME_CAPABILITY_ENV.get("HERMES_OPENAI_API_KEY", []),
+        *RUNTIME_CAPABILITY_ENV.get("OPENAI_API_KEY", []),
+        "WIKI_LLM_API_KEY",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_API_KEY", []),
+    ])
+    model = node_run_config_lookup(context, "EDGE_HANDOFF_LLM_MODEL", [
+        *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", []),
+        "HERMES_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", []),
+        "WIKI_LLM_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", []),
+        "WIKI_DEEPSEEK_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", []),
+    ])
+    env = os.environ.copy()
+    if not is_blank_value(base_url.get("value")):
+        env["EDGE_HANDOFF_LLM_BASE_URL"] = str(base_url.get("value")).rstrip("/")
+    if not is_blank_value(api_key.get("value")):
+        env["EDGE_HANDOFF_LLM_API_KEY"] = str(api_key.get("value"))
+    if not is_blank_value(model.get("value")):
+        env["EDGE_HANDOFF_LLM_MODEL"] = str(model.get("value"))
+    return env, {
+        "base_url": env_config_item(
+            base_url.get("key") or "EDGE_HANDOFF_LLM_BASE_URL",
+            "Edge Handoff LLM Base URL",
+            required=True,
+            value=str(base_url.get("value") or "").rstrip("/"),
+            source=base_url.get("source") or "missing:EDGE_HANDOFF_LLM_BASE_URL",
+        ),
+        "api_key": env_config_item(
+            api_key.get("key") or "EDGE_HANDOFF_LLM_API_KEY",
+            "Edge Handoff LLM API Key",
+            required=True,
+            value=api_key.get("value"),
+            source=api_key.get("source") or "missing:EDGE_HANDOFF_LLM_API_KEY",
+        ),
+        "model": env_config_item(
+            model.get("key") or "EDGE_HANDOFF_LLM_MODEL",
+            "Edge Handoff LLM Model",
+            required=True,
+            value=model.get("value"),
+            source=model.get("source") or "missing:EDGE_HANDOFF_LLM_MODEL",
+        ),
+        "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env"],
+    }
+
+
 def evaluate_edge_handoff(sop, workflow_id, data):
     request_payload = edge_handoff_request_payload(sop, workflow_id, data)
     if not (request_payload.get("upstream") or {}).get("node_id") or not (request_payload.get("downstream") or {}).get("node_id"):
@@ -5185,6 +5249,7 @@ def evaluate_edge_handoff(sop, workflow_id, data):
             "request": request_payload,
         }
     allow_deterministic = bool(data.get("allow_deterministic") or data.get("allow_fallback"))
+    evaluator_env, evaluator_config = edge_handoff_evaluator_env(sop, data)
     with tempfile.TemporaryDirectory(prefix="edge-handoff-") as temp_dir:
         request_path = Path(temp_dir) / "request.json"
         output_path = Path(temp_dir) / "evaluation.json"
@@ -5192,7 +5257,7 @@ def evaluate_edge_handoff(sop, workflow_id, data):
         command = ["python3", str(script), "--request-json", str(request_path), "--output-json", str(output_path), "--require-ai"]
         if allow_deterministic:
             command.append("--allow-deterministic")
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "180") or "180"))
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "180") or "180"), env=evaluator_env)
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
         if output_path.is_file():
@@ -5214,6 +5279,7 @@ def evaluate_edge_handoff(sop, workflow_id, data):
             "edge_id": request_payload.get("edge_id", ""),
             "mode": "edge-handoff-agent-evaluation",
             "request": request_payload,
+            "config": evaluator_config,
             "evaluation": evaluation,
             "stderr": stderr[-4000:],
         }

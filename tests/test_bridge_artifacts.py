@@ -1597,10 +1597,13 @@ class ArtifactResolutionTest(unittest.TestCase):
         }
         fake_script = self.wiki / "fake-edge-evaluator.py"
         fake_script.write_text(
-            "import json, sys\n"
+            "import json, os, sys\n"
             "args=sys.argv\n"
             "req=json.load(open(args[args.index('--request-json')+1], encoding='utf-8'))\n"
             "out=args[args.index('--output-json')+1]\n"
+            "assert os.environ.get('EDGE_HANDOFF_LLM_BASE_URL') == 'https://api-proxy.example/v1'\n"
+            "assert os.environ.get('EDGE_HANDOFF_LLM_API_KEY') == 'secret-edge-key'\n"
+            "assert os.environ.get('EDGE_HANDOFF_LLM_MODEL') == 'deepseek-v4-pro'\n"
             "evaluation={'status':'needs_instruction','summary':'fake ai eval','node_execution_guide':{'format':'markdown','prompt':''},'agent':{'used_ai':True}}\n"
             "json.dump(evaluation, open(out,'w',encoding='utf-8'))\n"
             "print(json.dumps(evaluation))\n",
@@ -1618,6 +1621,11 @@ class ArtifactResolutionTest(unittest.TestCase):
                     "downstream_node_id": "tg-notify",
                     "edge_handoff_instruction": "",
                     "allow_deterministic": True,
+                    "overrides": {
+                        "WIKI_LLM_BASE_URL": "https://api-proxy.example/v1",
+                        "WIKI_LLM_API_KEY": "secret-edge-key",
+                        "WIKI_LLM_MODEL": "deepseek-v4-pro",
+                    },
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
@@ -1629,6 +1637,9 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(response["evaluation"]["status"], "needs_instruction")
         self.assertEqual(response["request"]["upstream"]["skill_id"], "sop-youtube-deep-research")
         self.assertEqual(response["request"]["downstream"]["skill_id"], "sop-tg-notify")
+        self.assertEqual(response["config"]["base_url"]["value"], "https://api-proxy.example/v1")
+        self.assertEqual(response["config"]["api_key"]["masked_value"], "sec***key")
+        self.assertNotIn("secret-edge-key", json.dumps(response["config"]))
 
     def test_business_node_test_plan_resolves_generated_fixture(self):
         sop = dict(self.sop)
