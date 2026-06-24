@@ -1890,6 +1890,131 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual([item["materialized_path"] for item in manifest["items"]], [f"raw/node-runs/{target_run}/inputs/sources/0001.txt"])
         self.assertEqual(manifest["items"][0]["target_input"], "source_url")
 
+    def test_edge_contract_auto_relay_writes_context_trace_and_brief(self):
+        self._add_deep_research_contract()
+        self.sop["edges"] = [
+            {
+                "id": "edge-fetch-metadata-to-deep",
+                "from": "youtube-fetch",
+                "to": "youtube-deep-research",
+                "relay": {
+                    "intent": {
+                        "title": "Extract URL from metadata",
+                        "brief": "Use metadata_file.source_url as the downstream source_url.",
+                    },
+                    "bindings": [
+                        {
+                            "target_input": "source_url",
+                            "required": True,
+                            "source": {
+                                "node": "youtube-fetch",
+                                "output": "metadata_file",
+                                "extractor": {"id": "metadata-source-url", "kind": "json_path", "path": "$.source_url"},
+                            },
+                        }
+                    ],
+                },
+            }
+        ]
+        source_run_id = "node-run-fetch-edge-source"
+        self._write_source_node_run_manifest(source_run_id, {"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"})
+
+        plan = bridge.build_node_run_plan(self.sop, "test", "youtube-deep-research", {
+            "mode": "real-node",
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run_id,
+        })
+
+        self.assertEqual(plan["relay_mode"], "selected_outputs")
+        self.assertEqual(plan["relay_selection"]["edge_contract"]["id"], "edge-fetch-metadata-to-deep")
+        self.assertEqual(plan["relay_selection"]["matched_outputs"], ["metadata_file"])
+        self.assertIn("Extract URL from metadata", plan["relay_context_brief"])
+        self.assertTrue(plan["workflow_revision"]["hash"])
+
+        target_run_id = "node-run-deep-edge-target"
+        ctx = bridge.prepare_real_node_context(self.sop, target_run_id, "youtube-deep-research", plan)
+        manifest = json.loads((self.wiki / "raw/node-runs" / target_run_id / "inputs/sources/manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(ctx["source_url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(manifest["edge_contract"]["id"], "edge-fetch-metadata-to-deep")
+        self.assertEqual(manifest["relay_context"]["edge_id"], "edge-fetch-metadata-to-deep")
+        self.assertEqual(manifest["resolution_trace"][0]["source_output"], "metadata_file")
+        self.assertEqual(manifest["resolution_trace"][0]["target_input"], "source_url")
+        self.assertEqual(manifest["resolution_trace"][0]["status"], "resolved")
+
+    def test_edge_contract_failure_is_reported_as_resolution_trace(self):
+        self._add_deep_research_contract()
+        self.sop["edges"] = [
+            {
+                "id": "edge-fetch-bad-metadata-to-deep",
+                "from": "youtube-fetch",
+                "to": "youtube-deep-research",
+                "relay": {
+                    "intent": {"title": "Extract URL from metadata"},
+                    "bindings": [
+                        {
+                            "target_input": "source_url",
+                            "required": True,
+                            "source": {
+                                "node": "youtube-fetch",
+                                "output": "metadata_file",
+                                "extractor": {"id": "metadata-source-url", "kind": "json_path", "path": "$.source_url"},
+                            },
+                        }
+                    ],
+                },
+            }
+        ]
+        source_run_id = "node-run-fetch-edge-bad-source"
+        self._write_source_node_run_manifest(source_run_id, {"title": "No URL here"})
+        plan = bridge.build_node_run_plan(self.sop, "test", "youtube-deep-research", {
+            "mode": "real-node",
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run_id,
+        })
+
+        with self.assertRaises(bridge.NodeRunInputResolutionError) as raised:
+            bridge.apply_resolved_inputs_to_pipeline_context(
+                self.sop,
+                self.wiki,
+                {"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                plan,
+                "youtube-deep-research",
+                "node-run-deep-edge-fail",
+            )
+
+        detail = raised.exception.detail
+        self.assertEqual(detail["edge_contract"]["id"], "edge-fetch-bad-metadata-to-deep")
+        self.assertEqual(detail["relay_context"]["status"], "failed")
+        self.assertEqual(detail["resolution_trace"][0]["status"], "failed")
+        self.assertIn("source_url", detail["relay_context_brief"])
+
+    def test_sop_dag_exposes_first_class_edges_and_revision(self):
+        self._add_deep_research_contract()
+        self.sop["edges"] = [
+            {
+                "id": "edge-fetch-to-deep",
+                "from": "youtube-fetch",
+                "to": "youtube-deep-research",
+                "relay": {
+                    "intent": {"title": "Pass URL"},
+                    "bindings": [
+                        {
+                            "target_input": "source_url",
+                            "source": {"node": "youtube-fetch", "output": "source_url", "extractor": {"id": "direct-url"}},
+                        }
+                    ],
+                },
+            }
+        ]
+        dag = bridge.sop_dag(self.sop)
+
+        edge = next(item for item in dag["edges"] if item["id"] == "edge-fetch-to-deep")
+        self.assertEqual(edge["source"], "youtube-fetch")
+        self.assertEqual(edge["target"], "youtube-deep-research")
+        self.assertEqual(edge["intent"]["title"], "Pass URL")
+        self.assertTrue(dag["workflow_revision"]["hash"])
+
     def test_node_run_agent_request_renders_hermes_skill_contract(self):
         sop = dict(self.sop)
         sop["runtime_id"] = "runtime-test"
@@ -1924,6 +2049,41 @@ class ArtifactResolutionTest(unittest.TestCase):
         with patch.object(bridge, "hermes_agent_command", return_value="/usr/local/bin/hermes"):
             args = bridge.hermes_agent_command_args("sop-wiki-build", "request body")
         self.assertEqual(args, ["/usr/local/bin/hermes", "-s", "sop-wiki-build", "-z", "request body"])
+
+    def test_node_run_agent_request_includes_relay_context_brief(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["wiki-build"] = {
+            "title": "Wiki Build",
+            "skill": "sop-wiki-build",
+            "webhook_route": "sop-wiki-build",
+            "inputs": {"reports": "notebooklm-research.outputs.reports"},
+            "outputs": {"index": "index.md"},
+        }
+        node_run_id = "node-run-wiki-build-agent-relay-brief"
+        plan = bridge.build_node_run_plan(sop, "test", "wiki-build", {
+            "mode": "real-node",
+            "input_source": "generated-fixture",
+        })
+        context = {
+            "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "node_run": {
+                "relay_context_brief": "Edge: edge-youtube-deep-research-to-wiki-build\nInstruction: pass analysis_file as deep_research",
+            },
+        }
+        agent = bridge.render_node_run_agent_request(
+            sop,
+            node_run_id,
+            "wiki-build",
+            plan,
+            context,
+            ["bash", "/tmp/run_wiki_build.sh", str(self.wiki), node_run_id, node_run_id],
+            "sop-wiki-build",
+        )
+        self.assertIn("Relay context:", agent["rendered_request"])
+        self.assertIn("edge-youtube-deep-research-to-wiki-build", agent["rendered_request"])
 
     def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
         sop = dict(self.sop)
