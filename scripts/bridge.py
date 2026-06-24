@@ -5134,6 +5134,91 @@ def node_run_agent_artifacts(sop, node_run_id, node_id):
     return artifacts
 
 
+def node_run_audit_evidence_paths(sop, node_run_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    node_run_id = sanitize_node_run_id(node_run_id)
+    if not node_run_id:
+        return []
+    paths = []
+
+    def add_relative(relative):
+        safe = safe_artifact_path(wiki, relative)
+        if safe and safe.is_file():
+            rel = safe_relative_file(wiki, safe)
+            if rel and rel not in paths:
+                paths.append(rel)
+
+    for relative in (
+        f"raw/node-runs/{node_run_id}/input.json",
+        f"raw/node-runs/{node_run_id}/result.json",
+        f"raw/node-runs/{node_run_id}/events.jsonl",
+        f"raw/node-runs/{node_run_id}/executor.log",
+        f"raw/node-runs/{node_run_id}/agent/request.md",
+        f"raw/node-runs/{node_run_id}/agent/executor.json",
+        f"raw/node-runs/{node_run_id}/agent/response.txt",
+        f"raw/node-runs/{node_run_id}/agent/receipt.json",
+    ):
+        add_relative(relative)
+
+    input_dir = wiki / "raw" / "node-runs" / node_run_id / "inputs" / "sources"
+    if input_dir.exists():
+        for child in sorted(input_dir.rglob("*")):
+            if child.is_file():
+                rel = safe_relative_file(wiki, child)
+                if rel and rel not in paths:
+                    paths.append(rel)
+    return paths
+
+
+def persist_node_run_audit_evidence_to_git(sop, node_run_id):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    repo = str(sop.get("repo") or "")
+    if not repo or "/" not in repo or not (wiki / ".git").exists():
+        return {"status": "skipped", "reason": "wiki repo is not configured"}
+    paths = node_run_audit_evidence_paths(sop, node_run_id)
+    if not paths:
+        return {"status": "skipped", "reason": "no node run audit evidence found"}
+    remote_ok, remote_error = configure_instance_repo_remote(wiki, repo)
+    if not remote_ok:
+        return {"status": "failed", "paths": paths, "error": remote_error}
+    subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=str(wiki), capture_output=True, text=True, timeout=60)
+    add = subprocess.run(["git", "add", "--", *paths], cwd=str(wiki), capture_output=True, text=True)
+    if add.returncode != 0:
+        return {"status": "failed", "paths": paths, "error": add.stderr[:300] or "git add failed"}
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet", "--", *paths], cwd=str(wiki), capture_output=True)
+    if diff.returncode == 0:
+        return {"status": "done", "paths": paths, "pushed": False, "reason": "no changes"}
+    changed_files = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--", *paths],
+        cwd=str(wiki),
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    commit_msg = f"chore: node-run audit evidence [run:{node_run_id}]"
+    commit = subprocess.run(["git", "commit", "-m", commit_msg], cwd=str(wiki), capture_output=True, text=True)
+    commit_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(wiki), capture_output=True, text=True).stdout.strip()
+    if commit.returncode != 0:
+        return {"status": "failed", "paths": paths, "changed_files": changed_files, "error": commit.stderr[:300] or "git commit failed"}
+    pushed = False
+    push_error = ""
+    for attempt in range(1, 4):
+        push = subprocess.run(["git", "push", "origin", "main"], cwd=str(wiki), capture_output=True, text=True, timeout=60)
+        if push.returncode == 0:
+            pushed = True
+            break
+        push_error = push.stderr[:300]
+        subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=str(wiki), capture_output=True, text=True, timeout=60)
+    return {
+        "status": "done" if pushed else "failed",
+        "paths": paths,
+        "changed_files": changed_files,
+        "commit": commit_hash,
+        "commit_message": commit_msg,
+        "pushed": pushed,
+        "error": "" if pushed else push_error,
+    }
+
+
 def write_node_run_agent_receipt(sop, node_run_id, node_id, payload):
     receipt_path = node_run_agent_path(sop, node_run_id, "receipt.json")
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9200,6 +9285,8 @@ def persist_node_run_result(sop, node_run_id, body, result, events):
     write_json(workspace / "input.json", body if isinstance(body, dict) else {})
     write_json(workspace / "result.json", result)
     write_jsonl(workspace / "events.jsonl", events)
+    if isinstance(result, dict) and result.get("mode") == "real-node" and not result.get("pending"):
+        persist_node_run_audit_evidence_to_git(sop, node_run_id)
 
 
 def complete_real_node_run_async(sop, workflow_id, node_id, node_run_id, body, started_at):

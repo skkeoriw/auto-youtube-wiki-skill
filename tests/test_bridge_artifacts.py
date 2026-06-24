@@ -2492,6 +2492,37 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(manifest["node_execution_guide"]["draft_id"], draft["draft_id"])
         self.assertEqual(context["node_run"]["node_execution_guide"]["edge_id"], "youtube-fetch-to-youtube-deep-research")
 
+    def test_node_run_audit_evidence_paths_include_agent_outputs(self):
+        sop = dict(self.sop)
+        node_run_id = "node-run-audit-evidence"
+        files = {
+            "input.json": "{}\n",
+            "result.json": "{}\n",
+            "events.jsonl": "{}\n",
+            "executor.log": "ok\n",
+            "agent/request.md": "Use skill sop-youtube-deep-research\n",
+            "agent/executor.json": "{}\n",
+            "agent/response.txt": "done\n",
+            "agent/receipt.json": "{}\n",
+            "inputs/sources/manifest.json": "{}\n",
+            "inputs/sources/0001.txt": "https://www.youtube.com/watch?v=dQw4w9WgXcQ\n",
+            "runtime.env": "SECRET=value\n",
+        }
+        root = self.wiki / "raw" / "node-runs" / node_run_id
+        for relative, content in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        paths = bridge.node_run_audit_evidence_paths(sop, node_run_id)
+        self.assertIn(f"raw/node-runs/{node_run_id}/agent/request.md", paths)
+        self.assertIn(f"raw/node-runs/{node_run_id}/agent/executor.json", paths)
+        self.assertIn(f"raw/node-runs/{node_run_id}/agent/response.txt", paths)
+        self.assertIn(f"raw/node-runs/{node_run_id}/agent/receipt.json", paths)
+        self.assertIn(f"raw/node-runs/{node_run_id}/inputs/sources/manifest.json", paths)
+        self.assertIn(f"raw/node-runs/{node_run_id}/inputs/sources/0001.txt", paths)
+        self.assertIn(f"raw/node-runs/{node_run_id}/result.json", paths)
+        self.assertNotIn(f"raw/node-runs/{node_run_id}/runtime.env", paths)
+
     def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])
