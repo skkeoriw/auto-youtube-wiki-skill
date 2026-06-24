@@ -5213,10 +5213,10 @@ def edge_handoff_evaluator_env(sop, data):
         *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", []),
         "HERMES_MODEL",
         *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", []),
-        "WIKI_LLM_MODEL",
-        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", []),
         "WIKI_DEEPSEEK_MODEL",
         *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", []),
+        "WIKI_LLM_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", []),
     ])
     env = os.environ.copy()
     if not is_blank_value(base_url.get("value")):
