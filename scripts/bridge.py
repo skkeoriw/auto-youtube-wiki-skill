@@ -2438,6 +2438,7 @@ def node_classification_for(node_id):
 
 NODE_MODULE_CONTRACT_VERSION = "node-module-contract/v1"
 NODE_DRAFT_SCHEMA_VERSION = "node-draft-schema/v1"
+WORKFLOW_EDGE_DRAFT_SCHEMA_VERSION = "workflow-edge-draft-schema/v1"
 
 NODE_MODULE_DEFINITIONS = [
     {
@@ -3159,6 +3160,230 @@ def create_node_draft(sop, spec):
     }
     (draft_dir / "validation.json").write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"draft_id": draft_id, "draft_path": str(draft_dir), "node": draft, "validation": validation}
+
+
+def workflow_definition_project_targets(sop, workflow_id):
+    plugin_dir = Path(os.environ.get(
+        "YOUTUBE_WIKI_PLUGIN_DIR",
+        str(Path.home() / "agent-brain-plugins" / "youtube-wiki"),
+    )).expanduser()
+    return {
+        "runtime_sop_file": str(sop.get("sop_file") or ""),
+        "project_template_sop_yaml": str(plugin_dir / "templates" / "wiki-repo" / "sop.yaml"),
+        "project_workflow_id": workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or "",
+        "save_owner": "agent-brain-plugins",
+    }
+
+
+def workflow_edge_draft_schema():
+    return {
+        "schema_id": WORKFLOW_EDGE_DRAFT_SCHEMA_VERSION,
+        "title": "Workflow Edge Definition Draft",
+        "description": "保存通过 Edge Handoff Agent 评估的 Edge 变更草稿；不会直接修改生产 sop.yaml。",
+        "draft_types": [
+            {
+                "id": "save_evaluated_edge",
+                "title": "Save Evaluated Edge",
+                "description": "把 Edge Handoff Instruction、Agent 评估结果和 Node Execution Guide 保存为 repo-first change request。",
+            }
+        ],
+        "required_evaluation": {
+            "statuses": ["ready", "trial_ready"],
+            "used_ai": True,
+            "guide_required": True,
+        },
+        "safety": {
+            "production_dag_changed": False,
+            "writes": [
+                "raw/workflow-drafts/{draft_id}/edge.yaml",
+                "raw/workflow-drafts/{draft_id}/evaluation.json",
+                "raw/workflow-drafts/{draft_id}/node_execution_guide.md",
+                "raw/workflow-drafts/{draft_id}/change_request.json",
+                "raw/workflow-drafts/{draft_id}/validation.json",
+            ],
+            "publish_enabled": False,
+        },
+    }
+
+
+def edge_evaluation_used_ai(evaluation):
+    agent = evaluation.get("agent") if isinstance(evaluation.get("agent"), dict) else {}
+    return bool(agent.get("used_ai"))
+
+
+def edge_evaluation_guide_prompt(evaluation):
+    guide = evaluation.get("node_execution_guide") if isinstance(evaluation.get("node_execution_guide"), dict) else {}
+    return str(guide.get("prompt") or "").strip()
+
+
+def validate_workflow_edge_draft_input(sop, workflow_id, spec):
+    errors = []
+    edge = spec.get("edge") if isinstance(spec.get("edge"), dict) else {}
+    evaluation = spec.get("evaluation") if isinstance(spec.get("evaluation"), dict) else {}
+    upstream = str(spec.get("upstream_node_id") or edge.get("from") or edge.get("source") or "").strip()
+    downstream = str(spec.get("downstream_node_id") or edge.get("to") or edge.get("target") or "").strip()
+    instruction = str(spec.get("edge_handoff_instruction") or edge.get("instruction") or "").strip()
+    nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
+    if not upstream:
+        errors.append({"field": "upstream_node_id", "code": "required", "message": "upstream_node_id is required"})
+    elif upstream not in nodes:
+        errors.append({"field": "upstream_node_id", "code": "node_not_found", "message": f"upstream node {upstream!r} does not exist"})
+    if not downstream:
+        errors.append({"field": "downstream_node_id", "code": "required", "message": "downstream_node_id is required"})
+    elif downstream not in nodes:
+        errors.append({"field": "downstream_node_id", "code": "node_not_found", "message": f"downstream node {downstream!r} does not exist"})
+    if upstream and downstream and upstream == downstream:
+        errors.append({"field": "downstream_node_id", "code": "self_edge", "message": "upstream and downstream must be different nodes"})
+    if not instruction:
+        errors.append({"field": "edge_handoff_instruction", "code": "required", "message": "Edge Handoff Instruction is required before saving"})
+    status = str(evaluation.get("status") or "").strip()
+    if status not in {"ready", "trial_ready"}:
+        errors.append({
+            "field": "evaluation.status",
+            "code": "not_approved",
+            "message": "Only ready/trial_ready Edge Handoff Agent evaluations can be saved",
+        })
+    if not edge_evaluation_used_ai(evaluation):
+        errors.append({
+            "field": "evaluation.agent.used_ai",
+            "code": "ai_required",
+            "message": "Saved Edge drafts require a real AI Edge Handoff Agent evaluation",
+        })
+    if not edge_evaluation_guide_prompt(evaluation):
+        errors.append({
+            "field": "evaluation.node_execution_guide.prompt",
+            "code": "guide_required",
+            "message": "Node Execution Guide is required before saving this Edge",
+        })
+    return {
+        "schema_id": WORKFLOW_EDGE_DRAFT_SCHEMA_VERSION,
+        "status": "passed" if not errors else "failed",
+        "errors": errors,
+        "missing_fields": [error["field"] for error in errors if error["code"] == "required"],
+        "production_dag_changed": False,
+        "workflow_id": workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or "",
+    }
+
+
+def proposed_workflow_edge_from_draft(sop, workflow_id, spec):
+    edge = spec.get("edge") if isinstance(spec.get("edge"), dict) else {}
+    evaluation = spec.get("evaluation") if isinstance(spec.get("evaluation"), dict) else {}
+    upstream = str(spec.get("upstream_node_id") or edge.get("from") or edge.get("source") or "").strip()
+    downstream = str(spec.get("downstream_node_id") or edge.get("to") or edge.get("target") or "").strip()
+    edge_id = slugify(spec.get("edge_id") or edge.get("id") or f"{upstream}-to-{downstream}")
+    instruction = str(spec.get("edge_handoff_instruction") or edge.get("instruction") or "").strip()
+    relay_mappings = spec.get("relay_mappings")
+    if not isinstance(relay_mappings, list):
+        relay_mappings = edge.get("relayMappings") if isinstance(edge.get("relayMappings"), list) else []
+    relay_mode = str(spec.get("relay_mode") or edge.get("relayMode") or "auto_by_target_inputs")
+    guide = evaluation.get("node_execution_guide") if isinstance(evaluation.get("node_execution_guide"), dict) else {}
+    return {
+        "id": edge_id,
+        "from": upstream,
+        "to": downstream,
+        "relay": {
+            "mode": relay_mode,
+            "mappings": relay_mappings,
+            "handoff_instruction": instruction,
+            "node_execution_guide": {
+                "format": guide.get("format") or "markdown",
+                "prompt": edge_evaluation_guide_prompt(evaluation),
+            },
+            "evaluation": {
+                "status": evaluation.get("status"),
+                "score": evaluation.get("score"),
+                "confidence": evaluation.get("confidence"),
+                "summary": evaluation.get("summary"),
+                "decision": evaluation.get("decision"),
+                "evaluated_at": evaluation.get("evaluated_at"),
+                "agent": mask_data(evaluation.get("agent") if isinstance(evaluation.get("agent"), dict) else {}),
+            },
+            "resolved_handoff": evaluation.get("resolved_handoff") if isinstance(evaluation.get("resolved_handoff"), dict) else {},
+            "test_plan": evaluation.get("test_plan") if isinstance(evaluation.get("test_plan"), list) else [],
+        },
+    }
+
+
+def create_workflow_edge_draft(sop, workflow_id, spec):
+    validation = validate_workflow_edge_draft_input(sop, workflow_id, spec)
+    if validation["errors"]:
+        return {
+            "draft_id": "",
+            "draft_type": "save_evaluated_edge",
+            "draft_path": "",
+            "edge": {},
+            "change_request": {},
+            "validation": validation,
+        }
+    wiki = Path(sop["wiki_local_path"])
+    proposed = proposed_workflow_edge_from_draft(sop, workflow_id, spec)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    draft_id = f"{proposed['id']}-edge-{timestamp}"
+    draft_dir = wiki / "raw" / "workflow-drafts" / draft_id
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    evaluation = spec.get("evaluation") if isinstance(spec.get("evaluation"), dict) else {}
+    (draft_dir / "edge.yaml").write_text(yaml.safe_dump(proposed, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    (draft_dir / "evaluation.json").write_text(json.dumps(mask_data(evaluation), ensure_ascii=False, indent=2), encoding="utf-8")
+    (draft_dir / "node_execution_guide.md").write_text(edge_evaluation_guide_prompt(evaluation) + "\n", encoding="utf-8")
+    targets = workflow_definition_project_targets(sop, workflow_id)
+    change_request = {
+        "version": 1,
+        "draft_type": "save_evaluated_edge",
+        "draft_id": draft_id,
+        "workflow_id": validation["workflow_id"],
+        "edge_id": proposed["id"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "save_target": "agent-brain-plugins",
+        "targets": targets,
+        "change_summary": [
+            {
+                "field": f"edges.{proposed['id']}",
+                "before": "missing_or_unpublished",
+                "after": mask_data(proposed),
+            }
+        ],
+        "proposed": mask_data(proposed),
+        "evaluation_summary": {
+            "status": evaluation.get("status"),
+            "score": evaluation.get("score"),
+            "confidence": evaluation.get("confidence"),
+            "summary": evaluation.get("summary"),
+            "used_ai": edge_evaluation_used_ai(evaluation),
+        },
+        "notes": [
+            "This draft does not modify runtime sop.yaml.",
+            "Apply/publish must be handled by a repo-first change in agent-brain-plugins.",
+            "The Node Execution Guide must be carried into downstream Hermes skill execution in the runtime execution phase.",
+        ],
+    }
+    (draft_dir / "change_request.json").write_text(json.dumps(change_request, ensure_ascii=False, indent=2), encoding="utf-8")
+    validation = {**validation, "targets": targets, "change_count": 1}
+    (draft_dir / "validation.json").write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "draft_id": draft_id,
+        "draft_type": "save_evaluated_edge",
+        "draft_path": str(draft_dir),
+        "edge": proposed,
+        "change_request": change_request,
+        "validation": validation,
+    }
+
+
+def list_workflow_edge_drafts(sop):
+    drafts_dir = Path(sop["wiki_local_path"]) / "raw" / "workflow-drafts"
+    drafts = []
+    if drafts_dir.exists():
+        for draft_dir in sorted(drafts_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if draft_dir.is_dir():
+                drafts.append({
+                    "draft_id": draft_dir.name,
+                    "draft_type": (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "save_evaluated_edge"),
+                    "draft_path": str(draft_dir),
+                    "edge": read_yaml(draft_dir / "edge.yaml"),
+                    "change_request": read_json(draft_dir / "change_request.json") or {},
+                    "validation": read_json(draft_dir / "validation.json") or {},
+                })
+    return drafts
 
 
 def read_registry():
@@ -9944,6 +10169,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "validation": read_json(draft_dir / "validation.json") or {},
                                 })
                     return json_response(self, 200, {"sop_id": sop.get("id", ""), "drafts": drafts})
+                # GET /api/sop/{instance}/workflow-drafts/schema — workflow edge draft schema
+                if len(path) == 5 and path[3] == "workflow-drafts" and path[4] == "schema":
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "schema": workflow_edge_draft_schema(),
+                    })
+                # GET /api/sop/{instance}/workflow-drafts — list workflow edge drafts
+                if len(path) == 4 and path[3] == "workflow-drafts":
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "drafts": list_workflow_edge_drafts(sop),
+                    })
                 # GET /api/sop/{instance}/nodes/{node_id} — static node config
                 if len(path) == 5 and path[3] == "nodes":
                     endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
@@ -10270,6 +10507,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             draft = create_node_draft(sop, data)
+            status = 422 if (draft.get("validation") or {}).get("status") == "failed" else 201
+            return json_response(self, status, draft)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/edges/drafts
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "edges" and path[6] == "drafts"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            draft = create_workflow_edge_draft(sop, path[4], data)
             status = 422 if (draft.get("validation") or {}).get("status") == "failed" else 201
             return json_response(self, status, draft)
 

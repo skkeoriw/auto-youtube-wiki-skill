@@ -1643,6 +1643,98 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(response["config"]["model"]["value"], "deepseek-v4-flash")
         self.assertNotIn("secret-edge-key", json.dumps(response["config"]))
 
+    def test_workflow_edge_draft_route_requires_ai_approved_evaluation(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "inputs": {"source_url": {"kind": "scalar", "value_type": "url"}},
+            "outputs": {
+                "analysis_file": {"kind": "file", "value_type": "markdown"},
+                "transcript_file": {"kind": "file", "value_type": "text"},
+            },
+        }
+        before = "nodes: {}\n"
+        (self.wiki / "sop.yaml").write_text(before, encoding="utf-8")
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop):
+            thread.start()
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflow-drafts/schema",
+                timeout=3,
+            ) as response:
+                schema_response = json.loads(response.read())
+            self.assertEqual(schema_response["schema"]["schema_id"], "workflow-edge-draft-schema/v1")
+            rejected_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/drafts",
+                method="POST",
+                data=json.dumps({
+                    "edge": {"id": "youtube-fetch-to-youtube-deep-research", "from": "youtube-fetch", "to": "youtube-deep-research"},
+                    "edge_handoff_instruction": "把 source_url 作为 YouTube 深度研究目标视频地址。",
+                    "evaluation": {
+                        "status": "needs_instruction",
+                        "agent": {"used_ai": True},
+                        "node_execution_guide": {"format": "markdown", "prompt": ""},
+                    },
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as rejected_ctx:
+                urllib.request.urlopen(rejected_request, timeout=3)
+            self.assertEqual(rejected_ctx.exception.code, 422)
+            rejected = json.loads(rejected_ctx.exception.read())
+            self.assertEqual(rejected["validation"]["status"], "failed")
+            self.assertIn("not_approved", [error["code"] for error in rejected["validation"]["errors"]])
+            approved_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/drafts",
+                method="POST",
+                data=json.dumps({
+                    "edge": {
+                        "id": "youtube-fetch-to-youtube-deep-research",
+                        "from": "youtube-fetch",
+                        "to": "youtube-deep-research",
+                        "relayMode": "auto_by_target_inputs",
+                    },
+                    "edge_handoff_instruction": "把 source_url 作为 YouTube 深度研究目标视频地址，metadata 只作为可选上下文。",
+                    "evaluation": {
+                        "status": "ready",
+                        "score": 0.93,
+                        "confidence": 0.88,
+                        "summary": "source_url 可以稳定传给下游。",
+                        "decision": "can_run",
+                        "agent": {"provider": "openai-compatible", "model": "deepseek-v4-flash", "used_ai": True},
+                        "node_execution_guide": {
+                            "format": "markdown",
+                            "prompt": "Use skill sop-youtube-deep-research to execute this downstream node.",
+                        },
+                        "resolved_handoff": {"primary_artifacts": [{"from": "youtube-fetch.outputs.source_url"}]},
+                        "test_plan": ["执行下游 skill"],
+                    },
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(approved_request, timeout=3) as response:
+                self.assertEqual(response.status, 201)
+                draft = json.loads(response.read())
+            self.assertEqual(draft["draft_type"], "save_evaluated_edge")
+            self.assertEqual(draft["validation"]["status"], "passed")
+            self.assertFalse(draft["validation"]["production_dag_changed"])
+            self.assertEqual(draft["change_request"]["save_target"], "agent-brain-plugins")
+            self.assertTrue((Path(draft["draft_path"]) / "edge.yaml").exists())
+            self.assertTrue((Path(draft["draft_path"]) / "node_execution_guide.md").exists())
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflow-drafts",
+                timeout=3,
+            ) as response:
+                listed = json.loads(response.read())
+            self.assertEqual(listed["drafts"][0]["draft_id"], draft["draft_id"])
+        server.shutdown()
+        server.server_close()
+        self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
+
     def test_business_node_test_plan_resolves_generated_fixture(self):
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])
