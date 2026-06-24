@@ -2523,6 +2523,19 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn(f"raw/node-runs/{node_run_id}/result.json", paths)
         self.assertNotIn(f"raw/node-runs/{node_run_id}/runtime.env", paths)
 
+    def test_configure_instance_repo_remote_reads_env_file_token(self):
+        subprocess.run(["git", "init"], cwd=str(self.wiki), check=True, capture_output=True, text=True)
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/skkeoriw/wiki.git"], cwd=str(self.wiki), check=True)
+        env_file = self.wiki / ".agent-brain-plugins.env"
+        env_file.write_text("GITHUB_TOKEN=ghp_testtoken\n", encoding="utf-8")
+        with patch.dict(os.environ, {"YOUTUBE_WIKI_ENV_FILE": str(env_file)}, clear=False):
+            for key in ("GITHUB_TOKEN", "GH_TOKEN", "SKKEORIW_GITHUB_TOKEN"):
+                os.environ.pop(key, None)
+            ok, error = bridge.configure_instance_repo_remote(self.wiki, "skkeoriw/wiki")
+        self.assertTrue(ok, error)
+        remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=str(self.wiki), check=True, capture_output=True, text=True).stdout.strip()
+        self.assertIn("x-access-token:ghp_testtoken", remote)
+
     def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])

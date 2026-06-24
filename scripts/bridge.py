@@ -6480,7 +6480,13 @@ def configure_instance_repo_remote(wiki_path, repo):
     if owner == "divanoo65":
         candidate_keys.append("DIVANOO65_GITHUB_TOKEN")
     candidate_keys.extend(["GITHUB_TOKEN", "GH_TOKEN"])
-    token = next((os.environ.get(key) for key in candidate_keys if os.environ.get(key)), "")
+    env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
+    env_file_values = read_env_file_values(env_file)
+    token = next((
+        os.environ.get(key) or env_file_values.get(key)
+        for key in candidate_keys
+        if os.environ.get(key) or env_file_values.get(key)
+    ), "")
     if not token:
         return False, "GitHub token is not available"
     remote = f"https://x-access-token:{quote(token, safe='')}@github.com/{repo}.git"
