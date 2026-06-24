@@ -4101,6 +4101,7 @@ def hermes_smoke_check(message):
     context = node_run_config_context({}, None)
     route_item = node_run_config_lookup(context, "HERMES_SMOKE_ROUTE", RUNTIME_CAPABILITY_ENV.get("HERMES_SMOKE_ROUTE", []))
     route = str(route_item.get("value") or "sop-runtime-hermes-smoke").strip().strip("/") or "sop-runtime-hermes-smoke"
+    route_source = route_item.get("source") if not is_blank_value(route_item.get("value")) else "default"
     target_item = node_run_config_lookup(context, "HERMES_WEBHOOK_URL", [
         *RUNTIME_CAPABILITY_ENV.get("HERMES_WEBHOOK_URL", []),
         "WEBHOOK_PUBLIC_HOST",
@@ -4144,7 +4145,7 @@ def hermes_smoke_check(message):
                 "Hermes Smoke Route",
                 required=False,
                 value=route,
-                source=route_item.get("source") or "default",
+                source=route_source,
             ),
             "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
             "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file"],
