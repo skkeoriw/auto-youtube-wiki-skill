@@ -2403,6 +2403,95 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("Relay context:", agent["rendered_request"])
         self.assertIn("edge-youtube-deep-research-to-wiki-build", agent["rendered_request"])
 
+    def test_node_run_agent_request_includes_saved_edge_execution_guide(self):
+        sop = dict(self.sop)
+        sop["runtime_id"] = "runtime-test"
+        sop["instance_id"] = "test-instance"
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-fetch"] = {
+            "title": "YouTube Fetch",
+            "skill": "sop-youtube-fetch",
+            "webhook_route": "sop-youtube-fetch",
+            "outputs": {"source_url": {"kind": "scalar", "value_type": "url"}},
+        }
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "inputs": {
+                "source_url": {
+                    "kind": "scalar",
+                    "value_type": "url",
+                    "from": "youtube-fetch.outputs.source_url",
+                    "resolvers": [{"id": "direct-url", "kind": "direct"}],
+                }
+            },
+            "outputs": {"analysis_file": {"kind": "file", "value_type": "markdown"}},
+        }
+
+        source_run_id = "node-run-youtube-fetch-edge-guide"
+        output_dir = bridge.node_run_output_files_dir(sop, source_run_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "source-url.txt").write_text("https://www.youtube.com/watch?v=dQw4w9WgXcQ\n", encoding="utf-8")
+        bridge.write_node_run_io_manifest(
+            output_dir / "manifest.json",
+            kind="output",
+            node_run_id=source_run_id,
+            node_id="youtube-fetch",
+            source_mode="real-node",
+            items=[{
+                "path": "source-url.txt",
+                "output": "source_url",
+                "source_output": "source_url",
+                "value_type": "text",
+            }],
+        )
+        draft = bridge.create_workflow_edge_draft(sop, "test", {
+            "edge": {
+                "id": "youtube-fetch-to-youtube-deep-research",
+                "from": "youtube-fetch",
+                "to": "youtube-deep-research",
+            },
+            "edge_handoff_instruction": "Use only youtube-fetch.source_url as the downstream video URL.",
+            "evaluation": {
+                "status": "ready",
+                "score": 0.91,
+                "confidence": 0.87,
+                "summary": "The source_url output satisfies the downstream URL input.",
+                "agent": {"used_ai": True, "model": "deepseek-v4-flash"},
+                "node_execution_guide": {
+                    "format": "markdown",
+                    "prompt": "Use the materialized source_url input as the only YouTube video target. Ignore metadata unless explicitly requested.",
+                },
+            },
+        })
+        self.assertEqual(draft["validation"]["status"], "passed")
+
+        target_run_id = "node-run-youtube-deep-research-edge-guide"
+        plan = bridge.build_node_run_plan(sop, "test", "youtube-deep-research", {
+            "mode": "real-node",
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run_id,
+        })
+        self.assertEqual(plan["node_execution_guide"]["source"], "edge-draft")
+        self.assertEqual(plan["node_execution_guide"]["draft_id"], draft["draft_id"])
+        context = bridge.prepare_real_node_context(sop, target_run_id, "youtube-deep-research", plan)
+        agent = bridge.render_node_run_agent_request(
+            sop,
+            target_run_id,
+            "youtube-deep-research",
+            plan,
+            context,
+            ["bash", "/tmp/run_youtube_deep_research.sh", str(self.wiki), target_run_id, target_run_id],
+            "sop-youtube-deep-research",
+        )
+        self.assertIn("Approved Edge Handoff Guide:", agent["rendered_request"])
+        self.assertIn("Use the materialized source_url input as the only YouTube video target.", agent["rendered_request"])
+        self.assertEqual(agent["node_execution_guide"]["source"], "edge-draft")
+        manifest = bridge.read_json(bridge.node_run_manifest_path(sop, target_run_id, "input"))
+        self.assertEqual(manifest["node_execution_guide"]["draft_id"], draft["draft_id"])
+        self.assertEqual(context["node_run"]["node_execution_guide"]["edge_id"], "youtube-fetch-to-youtube-deep-research")
+
     def test_node_run_preflight_loads_runtime_env_file_like_stage_wrapper(self):
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])

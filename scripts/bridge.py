@@ -3386,6 +3386,93 @@ def list_workflow_edge_drafts(sop):
     return drafts
 
 
+def edge_node_execution_guide(edge):
+    if not isinstance(edge, dict):
+        return {}
+    relay = edge.get("relay") if isinstance(edge.get("relay"), dict) else {}
+    guide = relay.get("node_execution_guide") if isinstance(relay.get("node_execution_guide"), dict) else {}
+    prompt = str(guide.get("prompt") or "").strip()
+    if not prompt:
+        return {}
+    return {
+        "format": str(guide.get("format") or "markdown"),
+        "prompt": prompt,
+    }
+
+
+def workflow_edge_draft_prompt(draft):
+    edge = draft.get("edge") if isinstance(draft, dict) and isinstance(draft.get("edge"), dict) else {}
+    guide = edge_node_execution_guide(edge)
+    if guide.get("prompt"):
+        return guide
+    draft_path = str((draft or {}).get("draft_path") or "")
+    if draft_path:
+        guide_path = Path(draft_path) / "node_execution_guide.md"
+        try:
+            prompt = guide_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            prompt = ""
+        if prompt:
+            return {"format": "markdown", "prompt": prompt}
+    return {}
+
+
+def resolve_node_execution_guide(sop, target_node_id, relay_selection=None):
+    relay_selection = relay_selection if isinstance(relay_selection, dict) else {}
+    edge = relay_selection.get("edge_contract") if isinstance(relay_selection.get("edge_contract"), dict) else {}
+    source_node = str(relay_selection.get("source_node") or edge.get("from") or edge.get("source") or "").strip()
+    target_node = str(target_node_id or relay_selection.get("target_node_id") or edge.get("to") or edge.get("target") or "").strip()
+    if not source_node or not target_node:
+        return {}
+
+    formal_edge = workflow_edge_contract(sop, source_node, target_node)
+    guide = edge_node_execution_guide(formal_edge)
+    if guide.get("prompt"):
+        return {
+            **guide,
+            "source": "sop-edge",
+            "edge_id": formal_edge.get("id") or edge.get("id") or f"{source_node}-to-{target_node}",
+            "source_node": source_node,
+            "target_node": target_node,
+            "approved": True,
+        }
+
+    for draft in list_workflow_edge_drafts(sop):
+        draft_edge = draft.get("edge") if isinstance(draft.get("edge"), dict) else {}
+        validation = draft.get("validation") if isinstance(draft.get("validation"), dict) else {}
+        if validation.get("status") and validation.get("status") != "passed":
+            continue
+        if str(draft_edge.get("from") or draft_edge.get("source") or "") != source_node:
+            continue
+        if str(draft_edge.get("to") or draft_edge.get("target") or "") != target_node:
+            continue
+        guide = workflow_edge_draft_prompt(draft)
+        if not guide.get("prompt"):
+            continue
+        change_request = draft.get("change_request") if isinstance(draft.get("change_request"), dict) else {}
+        return {
+            **guide,
+            "source": "edge-draft",
+            "draft_id": draft.get("draft_id") or "",
+            "draft_path": draft.get("draft_path") or "",
+            "edge_id": draft_edge.get("id") or edge.get("id") or f"{source_node}-to-{target_node}",
+            "source_node": source_node,
+            "target_node": target_node,
+            "approved": True,
+            "evaluation_summary": change_request.get("evaluation_summary") if isinstance(change_request.get("evaluation_summary"), dict) else {},
+        }
+
+    return {
+        "source": "missing",
+        "edge_id": edge.get("id") or f"{source_node}-to-{target_node}",
+        "source_node": source_node,
+        "target_node": target_node,
+        "approved": False,
+        "prompt": "",
+        "format": "markdown",
+    }
+
+
 def read_registry():
     data = read_json(REGISTRY_PATH) or {}
     if not isinstance(data, dict):
@@ -4931,6 +5018,9 @@ def default_agent_executor_template():
         "Relay context:",
         "{{relay_context_brief}}",
         "",
+        "Approved Edge Handoff Guide:",
+        "{{node_execution_guide_prompt}}",
+        "",
         "Output contract:",
         "- output_directory: {{output_directory}}",
         "- output_manifest_path: {{output_manifest_path}}",
@@ -4964,6 +5054,11 @@ def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stag
     executor_path = node_run_agent_path(sop, node_run_id, "executor.json")
     output_manifest = node_run_manifest_path(sop, node_run_id, "output")
     input_manifest = node_run_manifest_path(sop, node_run_id, "input")
+    node_run_context = (context or {}).get("node_run") if isinstance((context or {}).get("node_run"), dict) else {}
+    guide = node_run_context.get("node_execution_guide") if isinstance(node_run_context.get("node_execution_guide"), dict) else {}
+    guide_prompt = str(guide.get("prompt") or "").strip()
+    if not guide_prompt:
+        guide_prompt = "No approved Edge Handoff Guide was resolved for this run."
     values = {
         "runtime_id": plan.get("runtime_id") or "",
         "instance_id": plan.get("instance_id") or "",
@@ -4977,7 +5072,8 @@ def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stag
         "output_directory": safe_relative_file(wiki, node_run_output_files_dir(sop, node_run_id)) or str(node_run_output_files_dir(sop, node_run_id)),
         "receipt_path": safe_relative_file(wiki, receipt_path) or str(receipt_path),
         "source_url": (context or {}).get("source_url") or "",
-        "relay_context_brief": (context or {}).get("node_run", {}).get("relay_context_brief") or (context or {}).get("node_run_relay_context_brief") or "No upstream relay context was provided for this run.",
+        "relay_context_brief": node_run_context.get("relay_context_brief") or (context or {}).get("node_run_relay_context_brief") or "No upstream relay context was provided for this run.",
+        "node_execution_guide_prompt": guide_prompt,
         "stage_command": node_run_command_preview(stage_command),
     }
     body = node_run_agent_template()
@@ -5004,6 +5100,7 @@ def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stag
         "receipt_path": safe_relative_file(wiki, receipt_path),
         "input_manifest_path": values["input_manifest_path"],
         "output_manifest_path": values["output_manifest_path"],
+        "node_execution_guide": mask_data(guide),
         "stage_command": stage_command,
         "stage_command_preview": values["stage_command"],
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -5900,6 +5997,7 @@ def build_node_test_plan(sop, node_id, body=None):
         relay_mode = relay_selection.get("relay_mode") or relay_mode
         selected_outputs = relay_selection.get("selected_outputs") or selected_outputs
         relay_mappings = relay_selection.get("relay_mappings") or relay_mappings
+    node_execution_guide = resolve_node_execution_guide(sop, node_id, relay_selection) if relay_selection else {}
     workflow_revision = workflow_revision_snapshot(sop)
     resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in inputs.items()]
     resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in optional_inputs.items()]
@@ -5936,6 +6034,7 @@ def build_node_test_plan(sop, node_id, body=None):
         "relay_mappings": relay_mappings,
         "relay_selection": mask_data(relay_selection),
         "edge_contract": (relay_selection or {}).get("edge_contract") or {},
+        "node_execution_guide": mask_data(node_execution_guide),
         "workflow_revision": mask_data(workflow_revision),
         "relay_instruction": relay_instruction,
         "relay_context_brief": relay_context_brief({"relay_selection": relay_selection, "node_id": node_id, "relay_instruction": relay_instruction}) if relay_selection or relay_instruction else "",
@@ -7903,6 +8002,7 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
             "relay_mappings": plan.get("relay_mappings") or [],
             "input_validation": input_validation,
             "edge_contract": (plan.get("relay_selection") or {}).get("edge_contract") or plan.get("edge_contract") or {},
+            "node_execution_guide": plan.get("node_execution_guide") or {},
             "workflow_revision": plan.get("workflow_revision") or {},
             "relay_context": relay_context,
             "relay_context_brief": brief,
@@ -7926,6 +8026,7 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
         "relay_selection": plan.get("relay_selection") or {},
         "input_validation": input_validation,
         "edge_contract": (plan.get("relay_selection") or {}).get("edge_contract") or plan.get("edge_contract") or {},
+        "node_execution_guide": plan.get("node_execution_guide") or {},
         "workflow_revision": plan.get("workflow_revision") or {},
         "relay_context": relay_context,
         "relay_context_brief": brief,
@@ -7971,6 +8072,7 @@ def apply_resolved_inputs_to_pipeline_context(sop, wiki, ctx, plan, node_id, nod
                 "input_directory": input_info.get("directory"),
                 "relay_selection": input_info.get("relay_selection") or {},
                 "edge_contract": input_info.get("edge_contract") or {},
+                "node_execution_guide": input_info.get("node_execution_guide") or {},
                 "workflow_revision": input_info.get("workflow_revision") or {},
                 "relay_context": input_info.get("relay_context") or {},
                 "relay_context_brief": input_info.get("relay_context_brief") or "",
@@ -8047,6 +8149,7 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
             "input_directory": input_info.get("directory"),
             "input_files": input_info.get("files") or [],
             "edge_contract": input_info.get("edge_contract") or plan.get("edge_contract") or {},
+            "node_execution_guide": input_info.get("node_execution_guide") or plan.get("node_execution_guide") or {},
             "workflow_revision": input_info.get("workflow_revision") or plan.get("workflow_revision") or {},
             "relay_context": input_info.get("relay_context") or {},
             "relay_context_brief": input_info.get("relay_context_brief") or "",
@@ -8952,6 +9055,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "source_node_run_id": plan.get("source_node_run_id") or "",
         "relay_selection": plan.get("relay_selection") or {},
         "edge_contract": plan.get("edge_contract") or (plan.get("relay_selection") or {}).get("edge_contract") or {},
+        "node_execution_guide": plan.get("node_execution_guide") or {},
         "workflow_revision": plan.get("workflow_revision") or {},
         "relay_context": {},
         "relay_context_brief": plan.get("relay_context_brief") or "",
@@ -8999,6 +9103,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
     input_resolution = result.get("input_resolution") if isinstance(result.get("input_resolution"), dict) else {}
     if input_resolution:
         result["edge_contract"] = input_resolution.get("edge_contract") or result.get("edge_contract") or {}
+        result["node_execution_guide"] = input_resolution.get("node_execution_guide") or result.get("node_execution_guide") or {}
         result["workflow_revision"] = input_resolution.get("workflow_revision") or result.get("workflow_revision") or {}
         result["relay_context"] = input_resolution.get("relay_context") or result.get("relay_context") or {}
         result["relay_context_brief"] = input_resolution.get("relay_context_brief") or result.get("relay_context_brief") or ""
@@ -9006,6 +9111,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
     real_context = (((real_execution or {}).get("detail") or {}).get("context") or {}).get("node_run") if isinstance(((real_execution or {}).get("detail") or {}).get("context"), dict) else {}
     if isinstance(real_context, dict):
         result["edge_contract"] = real_context.get("edge_contract") or result.get("edge_contract") or {}
+        result["node_execution_guide"] = real_context.get("node_execution_guide") or result.get("node_execution_guide") or {}
         result["workflow_revision"] = real_context.get("workflow_revision") or result.get("workflow_revision") or {}
         result["relay_context"] = real_context.get("relay_context") or result.get("relay_context") or {}
         result["relay_context_brief"] = real_context.get("relay_context_brief") or result.get("relay_context_brief") or ""
