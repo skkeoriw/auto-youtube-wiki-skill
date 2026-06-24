@@ -5209,15 +5209,7 @@ def edge_handoff_evaluator_env(sop, data):
         "WIKI_LLM_API_KEY",
         *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_API_KEY", []),
     ])
-    model = node_run_config_lookup(context, "EDGE_HANDOFF_LLM_MODEL", [
-        *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", []),
-        "HERMES_MODEL",
-        *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", []),
-        "WIKI_DEEPSEEK_MODEL",
-        *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", []),
-        "WIKI_LLM_MODEL",
-        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", []),
-    ])
+    model = edge_handoff_model_lookup(context)
     env = os.environ.copy()
     if not is_blank_value(base_url.get("value")):
         env["EDGE_HANDOFF_LLM_BASE_URL"] = str(base_url.get("value")).rstrip("/")
@@ -5252,6 +5244,20 @@ def edge_handoff_evaluator_env(sop, data):
         "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
         "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env"],
     }
+
+
+def edge_handoff_model_lookup(context):
+    groups = [
+        ["EDGE_HANDOFF_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", [])],
+        ["HERMES_MODEL", *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", [])],
+        ["WIKI_DEEPSEEK_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", [])],
+        ["WIKI_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", [])],
+    ]
+    for group in groups:
+        resolved = node_run_config_lookup(context, group[0], group[1:])
+        if not is_blank_value(resolved.get("value")):
+            return resolved
+    return {"key": "EDGE_HANDOFF_LLM_MODEL", "value": "deepseek-v4-flash", "source": "default"}
 
 
 def evaluate_edge_handoff(sop, workflow_id, data):
