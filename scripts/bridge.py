@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -5096,6 +5097,128 @@ def public_edge_contract(edge):
     }
 
 
+def edge_handoff_evaluator_script():
+    configured = os.environ.get("EDGE_HANDOFF_EVALUATOR_SCRIPT", "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        plugin_root() / "youtube-wiki/skills/sop-edge-handoff-evaluator/scripts/edge_handoff_evaluator.py",
+        Path.home() / "agent-brain-plugins/youtube-wiki/skills/sop-edge-handoff-evaluator/scripts/edge_handoff_evaluator.py",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate
+    return None
+
+
+def edge_handoff_node_payload(sop, node_id):
+    item = node_registry_item(sop, node_id) or {}
+    cfg = (sop.get("nodes") or {}).get(node_id) if isinstance(sop.get("nodes"), dict) else {}
+    cfg = cfg if isinstance(cfg, dict) else {}
+    skill = item.get("skill") if isinstance(item.get("skill"), dict) else {}
+    executor = item.get("executor") if isinstance(item.get("executor"), dict) else cfg.get("executor") if isinstance(cfg.get("executor"), dict) else {}
+    return {
+        "node_id": node_id,
+        "title": item.get("title") or cfg.get("title") or node_id,
+        "skill_id": skill.get("id") or executor.get("skill") or cfg.get("skill") or item.get("skill_id") or node_id,
+        "skill_summary": skill.get("summary") or item.get("description") or cfg.get("description") or "",
+        "skill_readme": skill.get("summary") or item.get("skill_readme") or "",
+        "inputs": item.get("inputs") or normalize_contract(cfg.get("inputs") or {}, "input"),
+        "optional_inputs": item.get("optional_inputs") or normalize_contract(cfg.get("optional_inputs") or {}, "input"),
+        "outputs": item.get("outputs") or normalize_contract(cfg.get("outputs") or {}, "output"),
+        "executor": executor,
+        "capabilities": item.get("capabilities") or cfg.get("capabilities") or {},
+        "infra": item.get("infra") or cfg.get("infra") or {},
+    }
+
+
+def edge_handoff_request_payload(sop, workflow_id, data):
+    data = data if isinstance(data, dict) else {}
+    edge = data.get("edge") if isinstance(data.get("edge"), dict) else {}
+    upstream_data = data.get("upstream") if isinstance(data.get("upstream"), dict) else {}
+    downstream_data = data.get("downstream") if isinstance(data.get("downstream"), dict) else {}
+    upstream_node_id = str(
+        data.get("upstream_node_id")
+        or edge.get("from")
+        or edge.get("source")
+        or upstream_data.get("node_id")
+    ).strip()
+    downstream_node_id = str(
+        data.get("downstream_node_id")
+        or edge.get("to")
+        or edge.get("target")
+        or downstream_data.get("node_id")
+    ).strip()
+    upstream = upstream_data
+    downstream = downstream_data
+    if upstream_node_id and not upstream:
+        upstream = edge_handoff_node_payload(sop, upstream_node_id)
+    if downstream_node_id and not downstream:
+        downstream = edge_handoff_node_payload(sop, downstream_node_id)
+    runtime_id = sop.get("runtime_id") or os.environ.get("SOP_RUNTIME_ID") or ""
+    return {
+        "runtime_id": data.get("runtime_id") or runtime_id,
+        "instance_id": data.get("instance_id") or sop.get("id") or sop.get("instance_id") or "",
+        "workflow_id": data.get("workflow_id") or workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or "",
+        "edge_id": data.get("edge_id") or edge.get("id") or f"edge-{upstream_node_id}-to-{downstream_node_id}",
+        "phase": data.get("phase") or "design",
+        "workflow_goal": data.get("workflow_goal") or data.get("goal") or "",
+        "edge_handoff_instruction": data.get("edge_handoff_instruction") or data.get("instruction") or edge.get("instruction") or "",
+        "edge": edge,
+        "upstream": upstream,
+        "downstream": downstream,
+    }
+
+
+def evaluate_edge_handoff(sop, workflow_id, data):
+    request_payload = edge_handoff_request_payload(sop, workflow_id, data)
+    if not (request_payload.get("upstream") or {}).get("node_id") or not (request_payload.get("downstream") or {}).get("node_id"):
+        return 422, {
+            "status": "blocked",
+            "detail": "upstream_node_id and downstream_node_id are required",
+            "request": request_payload,
+        }
+    script = edge_handoff_evaluator_script()
+    if not script:
+        return 503, {
+            "status": "blocked",
+            "detail": "sop-edge-handoff-evaluator script is not installed on this Runtime",
+            "request": request_payload,
+        }
+    allow_deterministic = bool(data.get("allow_deterministic") or data.get("allow_fallback"))
+    with tempfile.TemporaryDirectory(prefix="edge-handoff-") as temp_dir:
+        request_path = Path(temp_dir) / "request.json"
+        output_path = Path(temp_dir) / "evaluation.json"
+        request_path.write_text(json.dumps(request_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        command = ["python3", str(script), "--request-json", str(request_path), "--output-json", str(output_path), "--require-ai"]
+        if allow_deterministic:
+            command.append("--allow-deterministic")
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "180") or "180"))
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if output_path.is_file():
+            evaluation = read_json(output_path) or {}
+        else:
+            try:
+                evaluation = json.loads(stdout)
+            except Exception:
+                evaluation = {
+                    "status": "blocked",
+                    "summary": "Edge Handoff evaluator did not return JSON.",
+                    "blocking_reasons": [{"code": "invalid_evaluator_output", "message": stderr or stdout[-1000:]}],
+                }
+        http_status = 200 if completed.returncode == 0 else 500
+        return http_status, {
+            "ok": completed.returncode == 0,
+            "sop_id": sop.get("id", ""),
+            "workflow_id": request_payload.get("workflow_id", ""),
+            "edge_id": request_payload.get("edge_id", ""),
+            "mode": "edge-handoff-agent-evaluation",
+            "request": request_payload,
+            "evaluation": evaluation,
+            "stderr": stderr[-4000:],
+        }
+
+
 def relay_context_brief(plan, input_validation=None):
     selection = plan.get("relay_selection") if isinstance(plan.get("relay_selection"), dict) else {}
     edge = selection.get("edge_contract") if isinstance(selection.get("edge_contract"), dict) else plan.get("edge_contract") if isinstance(plan.get("edge_contract"), dict) else {}
@@ -9936,6 +10059,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError as exc:
                 return json_response(self, 400, {"detail": str(exc)})
             return json_response(self, 200, result)
+
+        # POST /api/sop/{instance}/edge-handoff/evaluate  → Runtime Edge Handoff Agent evaluation.
+        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "edge-handoff" and path[4] == "evaluate":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            workflow_id = str(data.get("workflow_id") or workflow_binding(sop).get("workflow_id") or sop.get("id") or "")
+            http_code, result = evaluate_edge_handoff(sop, workflow_id, data)
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/edges/evaluate
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "edges" and path[6] == "evaluate"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = evaluate_edge_handoff(sop, path[4], data)
+            return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/runs  → trigger
         if len(path) == 4 and path[:2] == ["api", "sop"] and path[3] == "runs":

@@ -1574,6 +1574,62 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
+    def test_edge_handoff_evaluate_route_builds_node_context(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "outputs": {
+                "analysis_file": {"kind": "file", "value_type": "markdown"},
+                "transcript_file": {"kind": "file", "value_type": "text"},
+            },
+        }
+        sop["nodes"]["tg-notify"] = {
+            "title": "Telegram Notify",
+            "skill": "sop-tg-notify",
+            "webhook_route": "sop-tg-notify",
+            "inputs": {
+                "message": {"from": "edge.message", "kind": "scalar", "value_type": "text"},
+            },
+            "outputs": {"telegram_message": {"kind": "file"}},
+        }
+        fake_script = self.wiki / "fake-edge-evaluator.py"
+        fake_script.write_text(
+            "import json, sys\n"
+            "args=sys.argv\n"
+            "req=json.load(open(args[args.index('--request-json')+1], encoding='utf-8'))\n"
+            "out=args[args.index('--output-json')+1]\n"
+            "evaluation={'status':'needs_instruction','summary':'fake ai eval','node_execution_guide':{'format':'markdown','prompt':''},'agent':{'used_ai':True}}\n"
+            "json.dump(evaluation, open(out,'w',encoding='utf-8'))\n"
+            "print(json.dumps(evaluation))\n",
+            encoding="utf-8",
+        )
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop), patch.object(bridge, "edge_handoff_evaluator_script", return_value=fake_script):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/evaluate",
+                method="POST",
+                data=json.dumps({
+                    "upstream_node_id": "youtube-deep-research",
+                    "downstream_node_id": "tg-notify",
+                    "edge_handoff_instruction": "",
+                    "allow_deterministic": True,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            response = json.loads(urllib.request.urlopen(request, timeout=5).read().decode("utf-8"))
+        server.shutdown()
+        server.server_close()
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["mode"], "edge-handoff-agent-evaluation")
+        self.assertEqual(response["evaluation"]["status"], "needs_instruction")
+        self.assertEqual(response["request"]["upstream"]["skill_id"], "sop-youtube-deep-research")
+        self.assertEqual(response["request"]["downstream"]["skill_id"], "sop-tg-notify")
+
     def test_business_node_test_plan_resolves_generated_fixture(self):
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])
