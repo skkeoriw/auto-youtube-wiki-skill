@@ -2015,6 +2015,45 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(edge["intent"]["title"], "Pass URL")
         self.assertTrue(dag["workflow_revision"]["hash"])
 
+    def test_instance_loaded_sop_preserves_first_class_edges(self):
+        sop_file = self.wiki / "sop.yaml"
+        sop_file.write_text(json.dumps({
+            "id": "youtube-research-wiki",
+            "nodes": {
+                "youtube-fetch": {"outputs": {"source_url": "context.source_url"}},
+                "youtube-deep-research": {
+                    "needs": ["youtube-fetch"],
+                    "inputs": {"source_url": {"from": "youtube-fetch.outputs.source_url"}},
+                    "outputs": {"analysis_file": "raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md"},
+                },
+            },
+            "edges": [
+                {
+                    "id": "edge-fetch-to-deep",
+                    "from": "youtube-fetch",
+                    "to": "youtube-deep-research",
+                    "relay": {
+                        "intent": {"title": "Pass URL"},
+                        "bindings": [
+                            {
+                                "target_input": "source_url",
+                                "source": {"node": "youtube-fetch", "output": "source_url", "extractor": {"id": "direct-url"}},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }), encoding="utf-8")
+        sop = bridge.sop_from_instance(
+            {"runtime_id": "runtime-test"},
+            {"instance_id": "instance-test", "local_path": str(self.wiki), "repo": "owner/wiki"},
+        )
+        dag = bridge.sop_dag(sop)
+
+        self.assertEqual(sop["edges"][0]["id"], "edge-fetch-to-deep")
+        self.assertEqual(dag["workflow_revision"]["edge_count"], 1)
+        self.assertIn("edge-fetch-to-deep", [edge["id"] for edge in dag["edges"]])
+
     def test_node_run_agent_request_renders_hermes_skill_contract(self):
         sop = dict(self.sop)
         sop["runtime_id"] = "runtime-test"

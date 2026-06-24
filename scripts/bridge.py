@@ -3241,6 +3241,7 @@ def sop_from_instance(runtime, instance):
         "sop_file": str(sop_file),
         "has_sop_definition": has_sop_definition,
         "nodes": nodes,
+        "edges": sop.get("edges") if isinstance(sop.get("edges"), list) else [],
         "enabled": bool(instance.get("enabled", True)),
         "runtime_id": runtime.get("runtime_id", ""),
         "channel_name": runtime.get("channel_name", ""),
