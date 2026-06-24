@@ -2156,16 +2156,13 @@ def node_static_config(sop, node_id):
     )).expanduser()
     skills_dir = plugin_dir / "skills"
 
-    # Resolve skill script path
-    skill_name = config.get("skill") or config.get("webhook_route") or node_id
-    skill_dir = skills_dir / f"sop-{node_id}"
-    if not skill_dir.exists():
-        skill_dir = skills_dir / skill_name
-    script_candidates = [
-        skill_dir / "scripts" / f"run_{node_id.replace('-', '_')}.sh",
-        skill_dir / "scripts" / f"run_{node_id}.sh",
-    ]
-    skill_script = next((str(p.relative_to(plugin_dir.parent)) for p in script_candidates if p.exists()), None)
+    configured_executor = config.get("executor") if isinstance(config.get("executor"), dict) else {}
+    skill_name = configured_executor.get("skill") or config.get("skill") or config.get("webhook_route") or f"sop-{node_id}"
+    skill_dirs = []
+    for candidate in (skills_dir / str(skill_name), skills_dir / f"sop-{node_id}"):
+        if candidate not in skill_dirs:
+            skill_dirs.append(candidate)
+    skill_dir = next((path for path in skill_dirs if path.exists()), skill_dirs[0])
 
     # Read SKILL.md summary (first 800 chars)
     skill_readme = None
@@ -2179,7 +2176,22 @@ def node_static_config(sop, node_id):
             break
     manifest = read_yaml(skill_dir / "node.yaml") if (skill_dir / "node.yaml").exists() else {}
     manifest_executor = manifest.get("executor") if isinstance(manifest.get("executor"), dict) else {}
-    configured_executor = config.get("executor") if isinstance(config.get("executor"), dict) else {}
+    entry = str(configured_executor.get("entry") or manifest_executor.get("entry") or "").strip()
+    script_candidates = []
+    if entry:
+        entry_path = Path(entry)
+        if entry_path.is_absolute():
+            script_candidates.append(entry_path)
+        else:
+            script_candidates.extend([directory / entry for directory in skill_dirs])
+    for directory in skill_dirs:
+        script_candidates.extend([
+            directory / "scripts" / f"run_{node_id.replace('-', '_')}.sh",
+            directory / "scripts" / f"run_{node_id}.sh",
+            directory / "scripts" / f"run_{node_id.replace('-', '_')}.py",
+            directory / "scripts" / f"run_{node_id}.py",
+        ])
+    skill_script = next((str(p.relative_to(plugin_dir.parent)) for p in script_candidates if p.exists()), None)
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
     manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
     manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
@@ -2195,7 +2207,7 @@ def node_static_config(sop, node_id):
             **manifest_executor,
             **configured_executor,
             "type": configured_executor.get("type") or manifest_executor.get("type") or "skill",
-            "skill": config.get("skill") or manifest_executor.get("skill", ""),
+            "skill": configured_executor.get("skill") or config.get("skill") or manifest_executor.get("skill", ""),
             "webhook_route": config.get("webhook_route", ""),
         },
         "inputs": merge_contracts(manifest_inputs, config.get("inputs", {}), "input"),
@@ -4641,6 +4653,29 @@ def node_run_skill_name(sop, node_id, plan=None):
     return route or f"sop-{node_id}"
 
 
+def node_run_executor_kind(sop, node_id, plan=None):
+    override = str(os.environ.get("NODE_RUN_AGENT_EXECUTOR") or "").strip().lower()
+    if override in {"hermes", "legacy-shell"}:
+        return override
+    plan = plan if isinstance(plan, dict) else {}
+    node_cfg = (sop.get("nodes") or {}).get(node_id) if isinstance(sop.get("nodes"), dict) else {}
+    static = node_static_config(sop, node_id) or {}
+    executor = {}
+    for source in (
+        node_cfg.get("executor") if isinstance(node_cfg, dict) and isinstance(node_cfg.get("executor"), dict) else {},
+        static.get("executor") if isinstance(static.get("executor"), dict) else {},
+        plan.get("executor") if isinstance(plan.get("executor"), dict) else {},
+    ):
+        executor.update(source or {})
+    executor_type = str(executor.get("type") or "").strip().lower()
+    agent = str(executor.get("agent") or "").strip().lower()
+    if executor_type in {"direct-skill", "legacy-shell", "shell"}:
+        return "legacy-shell"
+    if executor_type in {"agent-skill", "skill"} or agent == "hermes":
+        return "hermes"
+    return "hermes"
+
+
 def node_run_command_preview(command):
     if not command:
         return ""
@@ -4723,9 +4758,10 @@ def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stag
     rendered = f"{guard}\n\n{body.rstrip()}\n"
     request_path.parent.mkdir(parents=True, exist_ok=True)
     request_path.write_text(rendered, encoding="utf-8")
+    executor_kind = node_run_executor_kind(sop, node_id, plan)
     executor = {
         "version": 1,
-        "executor": "hermes",
+        "executor": executor_kind,
         "requested_skill": skill_name,
         "node_id": node_id,
         "node_run_id": node_run_id,
@@ -5064,6 +5100,7 @@ def relay_context_brief(plan, input_validation=None):
     selection = plan.get("relay_selection") if isinstance(plan.get("relay_selection"), dict) else {}
     edge = selection.get("edge_contract") if isinstance(selection.get("edge_contract"), dict) else plan.get("edge_contract") if isinstance(plan.get("edge_contract"), dict) else {}
     intent = edge.get("intent") if isinstance(edge.get("intent"), dict) else {}
+    relay_instruction = str(plan.get("relay_instruction") or "").strip()
     matched = selection.get("matched_items") if isinstance(selection.get("matched_items"), list) else []
     errors = (input_validation or {}).get("errors") if isinstance(input_validation, dict) else []
     lines = []
@@ -5073,6 +5110,8 @@ def relay_context_brief(plan, input_validation=None):
         lines.append(f"Intent: {intent.get('title')}")
     if intent.get("brief"):
         lines.append(f"Instruction: {intent.get('brief')}")
+    if relay_instruction:
+        lines.append(f"Run instruction: {relay_instruction}")
     if matched:
         lines.append("Bindings:")
         for item in matched:
@@ -5369,20 +5408,31 @@ def dedupe_node_input_items(items):
 
 
 def node_test_side_effects(node_id, config, static):
-    infra = static.get("infra") if isinstance(static.get("infra"), dict) else {}
-    skill = str((static.get("executor") or {}).get("skill") or config.get("skill") or "")
-    external = node_id in {"notebooklm-research", "youtube-deep-research", "wiki-build", "tg-notify"}
-    llm = node_id == "wiki-build"
-    telegram = node_id == "tg-notify" or bool(infra.get("tg_notify"))
+    executor = static.get("executor") if isinstance(static.get("executor"), dict) else {}
+    capabilities = static.get("capabilities") if isinstance(static.get("capabilities"), dict) else {}
+    skill = str(executor.get("skill") or config.get("skill") or "")
+
+    def cap_enabled(name):
+        value = capabilities.get(name)
+        if isinstance(value, dict):
+            return bool(value.get("enabled", True))
+        return bool(value)
+
+    executor_type = str(executor.get("type") or "").lower()
+    external = executor_type in {"agent-skill", "http", "public-api"} or any(
+        cap_enabled(name) for name in ("llm", "http", "worker", "notebooklm", "ssh")
+    )
+    llm = cap_enabled("llm")
+    telegram = cap_enabled("telegram")
     return {
         "writes_workspace": bool(static.get("outputs")),
-        "git_write": True,
+        "git_write": cap_enabled("git"),
         "telegram": telegram,
         "external_api": external,
         "llm": llm,
         "skill": skill,
         "default_mode": "preflight",
-        "real_execution_enabled": node_real_execution_supported(node_id),
+        "real_execution_enabled": node_real_execution_supported(node_id, {"nodes": {node_id: static}}),
     }
 
 
@@ -5400,6 +5450,7 @@ def build_node_test_plan(sop, node_id, body=None):
     relay_mode = normalize_node_run_relay_mode(body.get("relay_mode") or body.get("relayMode"), source_mode)
     selected_outputs = normalize_selected_outputs(body.get("selected_outputs") or body.get("selectedOutputs") or [])
     relay_mappings = normalize_relay_mappings(body.get("relay_mappings") or body.get("relayMappings") or [])
+    relay_instruction = str(body.get("relay_instruction") or body.get("relayInstruction") or "").strip()
     manual_inputs = body.get("manual_inputs") if isinstance(body.get("manual_inputs"), dict) else {}
     inputs = normalize_contract(static.get("inputs", {}), "input")
     optional_inputs = normalize_contract(static.get("optional_inputs", {}), "input")
@@ -5445,7 +5496,8 @@ def build_node_test_plan(sop, node_id, body=None):
         "relay_selection": mask_data(relay_selection),
         "edge_contract": (relay_selection or {}).get("edge_contract") or {},
         "workflow_revision": mask_data(workflow_revision),
-        "relay_context_brief": relay_context_brief({"relay_selection": relay_selection, "node_id": node_id}) if relay_selection else "",
+        "relay_instruction": relay_instruction,
+        "relay_context_brief": relay_context_brief({"relay_selection": relay_selection, "node_id": node_id, "relay_instruction": relay_instruction}) if relay_selection or relay_instruction else "",
         "manual_inputs": manual_inputs,
         "required_inputs": resolved_inputs,
         "optional_inputs": resolved_optional,
@@ -5463,10 +5515,10 @@ def build_node_test_plan(sop, node_id, body=None):
                 "enabled": True,
             },
             "real_execution": {
-                "enabled": node_real_execution_supported(node_id),
+                "enabled": node_real_execution_supported(node_id, sop),
                 "reason": (
                     "Standard stage wrapper is available for real Node Run execution."
-                    if node_real_execution_supported(node_id)
+                    if node_real_execution_supported(node_id, sop)
                     else "No standard stage wrapper is available for this node."
                 ),
             },
@@ -6626,7 +6678,7 @@ def build_node_run_steps(sop, plan):
     telegram = configs.get("telegram") or {}
     git = configs.get("github") or configs.get("git") or {}
     mode = plan.get("mode") or "preflight"
-    real_supported = node_real_execution_supported(plan.get("node_id"))
+    real_supported = node_real_execution_supported(plan.get("node_id"), sop)
     config_status = "done"
     config_notes = []
     if worker.get("status") == "failed":
@@ -6799,21 +6851,45 @@ def node_run_status_from_steps(steps):
     return "done"
 
 
-def real_node_stage_script(node_id):
+def real_node_stage_script(node_id, sop=None):
     safe_node = str(node_id or "").strip()
     if not safe_node or not re.match(r"^[A-Za-z0-9_-]+$", safe_node):
         return None
     plugin_dir = plugin_root() / "youtube-wiki"
-    skill_dir = plugin_dir / "skills" / f"sop-{safe_node}"
-    candidates = [
-        skill_dir / "scripts" / f"run_{safe_node.replace('-', '_')}.sh",
-        skill_dir / "scripts" / f"run_{safe_node}.sh",
-    ]
+    static = node_static_config(sop, safe_node) if isinstance(sop, dict) else {}
+    executor = (static or {}).get("executor") if isinstance((static or {}).get("executor"), dict) else {}
+    skill_name = str(executor.get("skill") or (static or {}).get("skill") or f"sop-{safe_node}").strip()
+    skill_dirs = []
+    for directory in (plugin_dir / "skills" / skill_name, plugin_dir / "skills" / f"sop-{safe_node}"):
+        if directory not in skill_dirs:
+            skill_dirs.append(directory)
+    entry = str(executor.get("entry") or "").strip()
+    candidates = []
+    if entry:
+        entry_path = Path(entry)
+        if entry_path.is_absolute():
+            candidates.append(entry_path)
+        else:
+            candidates.extend([directory / entry for directory in skill_dirs])
+    for directory in skill_dirs:
+        candidates.extend([
+            directory / "scripts" / f"run_{safe_node.replace('-', '_')}.sh",
+            directory / "scripts" / f"run_{safe_node}.sh",
+            directory / "scripts" / f"run_{safe_node.replace('-', '_')}.py",
+            directory / "scripts" / f"run_{safe_node}.py",
+        ])
     return next((path for path in candidates if path.exists()), None)
 
 
-def node_real_execution_supported(node_id):
-    return real_node_stage_script(node_id) is not None
+def node_real_execution_supported(node_id, sop=None):
+    return real_node_stage_script(node_id, sop) is not None
+
+
+def node_stage_command(script, wiki, run_id, pipeline_id):
+    if not script:
+        return []
+    executable = "python3" if str(script).endswith(".py") else "bash"
+    return [executable, str(script), str(wiki), run_id, pipeline_id]
 
 
 def node_run_step_by_id(steps, step_id):
@@ -8104,7 +8180,7 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
 
 
 def execute_real_node_run(sop, node_run_id, node_id, plan):
-    if not node_real_execution_supported(node_id):
+    if not node_real_execution_supported(node_id, sop):
         return {
             "status": "blocked",
             "summary": "Real node execution is not available for this node.",
@@ -8115,7 +8191,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         }
 
     wiki = Path(sop["wiki_local_path"]).expanduser()
-    script = real_node_stage_script(node_id)
+    script = real_node_stage_script(node_id, sop)
     if not script or not script.exists():
         return {
             "status": "failed",
@@ -8128,7 +8204,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
 
     started = datetime.now(timezone.utc)
     log_path = node_run_workspace(sop, node_run_id) / "executor.log"
-    stage_command = ["bash", str(script), str(wiki), node_run_id, node_run_id]
+    stage_command = node_stage_command(script, wiki, node_run_id, node_run_id)
     timeout = real_node_execution_timeout(plan)
     context = {}
     agent_request = {}
@@ -8137,9 +8213,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
     stderr = ""
     returncode = 1
     timed_out = False
-    executor_kind = str(os.environ.get("NODE_RUN_AGENT_EXECUTOR") or "hermes").strip().lower()
-    if executor_kind not in {"hermes", "legacy-shell"}:
-        executor_kind = "hermes"
+    executor_kind = node_run_executor_kind(sop, node_id, plan)
     command_for_detail = []
     input_resolution_error = {}
     try:
@@ -9182,12 +9256,9 @@ def retry_node(sop, pipeline_id, node_id):
     node_data = read_json(node_file) or {}
     if node_data.get("status") == "running":
         return 409, {"status": "error", "message": "节点正在运行中，无法重试"}
-
-    plugin_dir = Path(os.environ.get(
-        "YOUTUBE_WIKI_PLUGIN_DIR",
-        str(Path.home() / "agent-brain-plugins" / "youtube-wiki"),
-    )).expanduser()
-    skills_dir = plugin_dir / "skills"
+    static = node_static_config(sop, node_id) or {}
+    if static.get("retryable") is False:
+        return 409, {"status": "error", "message": "该节点定义为不可重试", "node_id": node_id}
 
     run_id = f"retry-{int(time.time())}"
     node_data["status"] = "running"
@@ -9210,23 +9281,16 @@ def retry_node(sop, pipeline_id, node_id):
 
     _append_run_event(run_dir, "node_retry", node_id=node_id, run_id=run_id)
 
-    # Stage script lookup — mirrors stage_runner.py forward_next
-    script_map = {
-        "notebooklm-research": skills_dir / "sop-notebooklm-research" / "scripts" / "run_notebooklm_research.sh",
-        "youtube-deep-research": skills_dir / "sop-youtube-deep-research" / "scripts" / "run_youtube_deep_research.sh",
-        "wiki-build": skills_dir / "sop-wiki-build" / "scripts" / "run_wiki_build.sh",
-    }
-
     env = {**os.environ}
     log_path = Path("/tmp") / f"retry-{node_id}-{run_id}.log"
     launched = False
 
-    script = script_map.get(node_id)
+    script = real_node_stage_script(node_id, sop)
     if script and script.exists():
         try:
             with open(log_path, "ab") as log:
                 subprocess.Popen(
-                    ["bash", str(script), str(wiki), run_id],
+                    node_stage_command(script, wiki, run_id, pipeline_id),
                     env=env,
                     stdout=log,
                     stderr=subprocess.STDOUT,

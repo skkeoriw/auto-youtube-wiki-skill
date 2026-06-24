@@ -1,12 +1,14 @@
 """Tests for cancel_run, cancel_node, retry_node in bridge.py."""
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from bridge import cancel_run, cancel_node, retry_node
+from bridge import cancel_run, cancel_node, relay_context_brief, retry_node
 
 
 def _make_wiki(tmp_path, pipeline_id, node_id="notebooklm-research", node_status="failed"):
@@ -147,6 +149,18 @@ class RetryNodeTest(unittest.TestCase):
             self.assertEqual(status, 409)
             self.assertEqual(result["status"], "error")
 
+    def test_rejects_non_retryable_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki, sop = _make_wiki(Path(tmp), "pipeline-030b", node_status="failed")
+            sop["nodes"]["notebooklm-research"]["retryable"] = False
+            status, result = retry_node(sop, "pipeline-030b", "notebooklm-research")
+            self.assertEqual(status, 409)
+            self.assertEqual(result["status"], "error")
+            node = json.loads(
+                (wiki / "raw/pipeline-runs/pipeline-030b/nodes/notebooklm-research.json").read_text()
+            )
+            self.assertEqual(node["status"], "failed")
+
     def test_returns_404_for_nonexistent_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:
             wiki = Path(tmp) / "wiki"
@@ -173,6 +187,55 @@ class RetryNodeTest(unittest.TestCase):
             if events_file.exists():
                 events = [json.loads(line) for line in events_file.read_text().splitlines()]
                 self.assertTrue(any(e["event"] == "node_retry" for e in events))
+
+    def test_retry_uses_custom_node_executor_entry_without_hardcoded_script_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wiki, sop = _make_wiki(root, "pipeline-033", node_id="custom-summary", node_status="failed")
+            plugin_root = root / "agent-brain-plugins"
+            script = plugin_root / "youtube-wiki" / "skills" / "sop-custom-summary" / "scripts" / "run_custom_summary.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            sop["nodes"]["custom-summary"] = {
+                "executor": {
+                    "type": "agent-skill",
+                    "skill": "sop-custom-summary",
+                    "entry": "scripts/run_custom_summary.sh",
+                },
+            }
+            old_path = os.environ.get("AGENT_BRAIN_PLUGINS_PATH")
+            os.environ["AGENT_BRAIN_PLUGINS_PATH"] = str(plugin_root)
+            try:
+                with mock.patch("bridge.subprocess.Popen") as popen:
+                    status, result = retry_node(sop, "pipeline-033", "custom-summary")
+            finally:
+                if old_path is None:
+                    os.environ.pop("AGENT_BRAIN_PLUGINS_PATH", None)
+                else:
+                    os.environ["AGENT_BRAIN_PLUGINS_PATH"] = old_path
+            self.assertEqual(status, 200)
+            self.assertEqual(result["status"], "retrying")
+            command = popen.call_args.args[0]
+            self.assertEqual(command[:2], ["bash", str(script)])
+            self.assertEqual(command[2], str(wiki))
+            self.assertEqual(command[4], "pipeline-033")
+
+
+class RelayContextTest(unittest.TestCase):
+    def test_relay_instruction_is_included_in_context_brief(self):
+        brief = relay_context_brief({
+            "relay_instruction": "Use only analysis_file as wiki source.",
+            "relay_selection": {
+                "edge_contract": {"intent": {"title": "Research to Wiki"}},
+                "matched_items": [{
+                    "source_output": "analysis_file",
+                    "target_input": "reports",
+                    "source_path": "raw/example/analysis.md",
+                }],
+            },
+        })
+        self.assertIn("Run instruction: Use only analysis_file as wiki source.", brief)
+        self.assertIn("analysis_file -> reports", brief)
 
 
 if __name__ == "__main__":
