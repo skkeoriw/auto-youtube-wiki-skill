@@ -5182,7 +5182,7 @@ def persist_node_run_audit_evidence_to_git(sop, node_run_id):
     if not remote_ok:
         return {"status": "failed", "paths": paths, "error": remote_error}
     subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=str(wiki), capture_output=True, text=True, timeout=60)
-    add = subprocess.run(["git", "add", "--", *paths], cwd=str(wiki), capture_output=True, text=True)
+    add = subprocess.run(["git", "add", "-f", "--", *paths], cwd=str(wiki), capture_output=True, text=True)
     if add.returncode != 0:
         return {"status": "failed", "paths": paths, "error": add.stderr[:300] or "git add failed"}
     diff = subprocess.run(["git", "diff", "--cached", "--quiet", "--", *paths], cwd=str(wiki), capture_output=True)
