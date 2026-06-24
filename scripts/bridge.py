@@ -5279,7 +5279,7 @@ def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manua
         "provenance": "",
         "reason": "",
     }
-    if source_mode == "manual" and input_name in manual_inputs and str(manual_inputs[input_name]).strip():
+    if input_name in manual_inputs and str(manual_inputs[input_name]).strip():
         item.update({"resolved": True, "value": manual_inputs[input_name], "provenance": "manual"})
         return item
 
@@ -5348,6 +5348,26 @@ def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manua
     return item
 
 
+def dedupe_node_input_items(items):
+    rows = []
+    seen = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("name") or item.get("target_input") or ""),
+            str(item.get("source_node_run_id") or ""),
+            str(item.get("source_node") or ""),
+            str(item.get("source_output") or ""),
+            str(item.get("provenance") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(item)
+    return rows
+
+
 def node_test_side_effects(node_id, config, static):
     infra = static.get("infra") if isinstance(static.get("infra"), dict) else {}
     skill = str((static.get("executor") or {}).get("skill") or config.get("skill") or "")
@@ -5391,14 +5411,14 @@ def build_node_test_plan(sop, node_id, body=None):
     workflow_revision = workflow_revision_snapshot(sop)
     resolved_inputs = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in inputs.items()]
     resolved_optional = [resolve_node_input(sop, name, spec, source_mode, base_run_id, manual_inputs, source_node_run_id, relay_mode, selected_outputs) for name, spec in optional_inputs.items()]
-    pending_materialization = [
+    pending_materialization = dedupe_node_input_items([
         item for item in resolved_inputs + resolved_optional
         if item.get("resolution_state") == "pending_materialization"
-    ]
-    missing = [
+    ])
+    missing = dedupe_node_input_items([
         item for item in resolved_inputs
         if item.get("required") and not item.get("resolved") and item.get("resolution_state") != "pending_materialization"
-    ]
+    ])
     upstream = []
     for spec in list(inputs.values()) + list(optional_inputs.values()):
         source = str((spec or {}).get("from") if isinstance(spec, dict) else spec or "")
@@ -5429,7 +5449,7 @@ def build_node_test_plan(sop, node_id, body=None):
         "manual_inputs": manual_inputs,
         "required_inputs": resolved_inputs,
         "optional_inputs": resolved_optional,
-        "resolved_inputs": [item for item in resolved_inputs if item.get("resolved")],
+        "resolved_inputs": dedupe_node_input_items([item for item in resolved_inputs if item.get("resolved")]),
         "pending_materialization_inputs": pending_materialization,
         "missing_inputs": missing,
         "upstream_nodes": upstream,
@@ -7295,7 +7315,15 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
     items = []
     source_mode = plan.get("input_source") or "generated-fixture"
     source_node_run_id = sanitize_node_run_id(plan.get("source_node_run_id") or "")
+    manual_resolved_items = [
+        item for item in list(plan.get("resolved_inputs") or []) + list(plan.get("optional_inputs") or [])
+        if item.get("resolved") and item.get("provenance") == "manual"
+    ]
+    manual_targets = {str(item.get("name") or item.get("target_input") or "").strip() for item in manual_resolved_items}
     if source_mode == "existing-node-run":
+        for resolved in manual_resolved_items:
+            rows = materialize_resolved_input_value(wiki, target_dir, len(items) + 1, resolved, str(source_url or ""))
+            items.extend(rows)
         relay_mode = plan.get("relay_mode") or "auto_by_target_inputs"
         selected_outputs = plan.get("selected_outputs") or []
         relay_mappings = plan.get("relay_mappings") or []
@@ -7303,6 +7331,9 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
         if not relay_selection.get("matched_items"):
             relay_selection = node_run_relay_selection_plan(sop, node_id, source_node_run_id, relay_mode, selected_outputs, relay_mappings)
         for source_item in relay_selection.get("matched_items") or []:
+            target_input = str(source_item.get("target_input") or source_item.get("input_name") or source_item.get("source_output") or "").strip()
+            if target_input in manual_targets:
+                continue
             source_rel = str(source_item.get("source_path") or "")
             row = copy_node_run_input_file(wiki, source_rel, target_dir, len(items) + 1, {
                 **source_item,
@@ -7331,7 +7362,11 @@ def materialize_node_run_inputs(sop, node_run_id, node_id, plan, ctx):
         if rel:
             item["materialized_path"] = rel
     input_validation = validate_materialized_node_inputs(sop, node_id, items, source_mode)
-    relay_context = relay_context_payload(plan, items, input_validation) if source_mode == "existing-node-run" else {}
+    relay_items = [
+        item for item in items
+        if item.get("source") == "node-run" or item.get("source_node_run_id") or item.get("source_output")
+    ]
+    relay_context = relay_context_payload(plan, relay_items, input_validation) if source_mode == "existing-node-run" else {}
     resolution_trace = relay_context.get("items") or []
     brief = relay_context.get("brief") or relay_context_brief(plan, input_validation)
 

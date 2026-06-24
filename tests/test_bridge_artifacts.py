@@ -1961,6 +1961,105 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(manifest["resolution_trace"][0]["target_input"], "source_url")
         self.assertEqual(manifest["resolution_trace"][0]["status"], "resolved")
 
+    def test_existing_node_run_can_overlay_manual_inputs_for_other_required_inputs(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "outputs": {
+                "analysis_file": {
+                    "path": "raw/youtube-deep-research/{pipeline_id}/outputs/analysis.md",
+                    "kind": "file",
+                    "value_type": "markdown",
+                }
+            },
+        }
+        sop["nodes"]["wiki-build"] = {
+            **sop["nodes"]["wiki-build"],
+            "inputs": {
+                "reports": {
+                    "from": "notebooklm-research.outputs.reports",
+                    "kind": "files",
+                    "type": "files",
+                    "value_type": "markdown",
+                }
+            },
+            "optional_inputs": {
+                "deep_research": {
+                    "from": "youtube-deep-research.outputs.analysis_file",
+                    "required": False,
+                    "kind": "files",
+                    "type": "files",
+                    "value_type": "markdown",
+                }
+            },
+        }
+        sop["edges"] = [
+            {
+                "id": "edge-deep-to-wiki",
+                "from": "youtube-deep-research",
+                "to": "wiki-build",
+                "relay": {
+                    "intent": {"title": "Use deep research as supplemental wiki source"},
+                    "bindings": [
+                        {
+                            "target_input": "deep_research",
+                            "required": False,
+                            "source": {
+                                "node": "youtube-deep-research",
+                                "output": "analysis_file",
+                                "extractor": {"id": "direct-file", "kind": "direct"},
+                            },
+                        }
+                    ],
+                },
+            }
+        ]
+        source_run = "node-run-youtube-deep-source"
+        source_dir = bridge.node_run_output_files_dir(sop, source_run)
+        source_dir.mkdir(parents=True)
+        (source_dir / "analysis.md").write_text("# Deep research\nusable context", encoding="utf-8")
+        bridge.write_json(source_dir / "manifest.json", {
+            "version": 1,
+            "kind": "output",
+            "node_run_id": source_run,
+            "node_id": "youtube-deep-research",
+            "items": [
+                {
+                    "path": "analysis.md",
+                    "source_node": "youtube-deep-research",
+                    "source_run_id": source_run,
+                    "source_path": f"raw/node-runs/{source_run}/outputs/files/analysis.md",
+                    "output": "analysis_file",
+                    "value_type": "markdown",
+                }
+            ],
+        })
+
+        target_run = "node-run-wiki-build-hybrid-inputs"
+        plan = bridge.build_node_run_plan(sop, "test", "wiki-build", {
+            "mode": "dry-run",
+            "input_source": "existing-node-run",
+            "source_node_run_id": source_run,
+            "manual_inputs": {
+                "reports": "# Manual report\nprimary notebook context",
+            },
+        })
+        self.assertEqual(plan["missing_inputs"], [])
+        self.assertEqual([item["name"] for item in plan["resolved_inputs"]], ["reports"])
+        self.assertEqual([item["name"] for item in plan["pending_materialization_inputs"]], ["deep_research"])
+
+        info = bridge.materialize_node_run_inputs(sop, target_run, "wiki-build", plan, {})
+        manifest = json.loads((self.wiki / "raw/node-runs" / target_run / "inputs/sources/manifest.json").read_text(encoding="utf-8"))
+        targets = [item.get("target_input") for item in manifest["items"]]
+
+        self.assertEqual(info["input_validation"]["status"], "passed")
+        self.assertIn("reports", targets)
+        self.assertIn("deep_research", targets)
+        self.assertEqual(manifest["relay_context"]["edge_id"], "edge-deep-to-wiki")
+        self.assertEqual(manifest["resolution_trace"][0]["target_input"], "deep_research")
+
     def test_edge_contract_failure_is_reported_as_resolution_trace(self):
         self._add_deep_research_contract()
         self.sop["edges"] = [
