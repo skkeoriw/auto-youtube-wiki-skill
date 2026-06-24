@@ -65,6 +65,31 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
+normalize_managed_hermes_host() {
+  local zone="${AUTO_DOMAIN_ZONE_NAME:-chxyka.ccwu.cc}"
+  local host="${WEBHOOK_PUBLIC_HOST:-}"
+  local public_name="${HERMES_PUBLIC_NAME:-}"
+
+  host="${host#http://}"
+  host="${host#https://}"
+  host="${host%%/*}"
+
+  if [[ -z "$public_name" ]]; then
+    if [[ -n "${YOUTUBE_WIKI_PUBLIC_NAME:-}" ]]; then
+      public_name="hermes-${YOUTUBE_WIKI_PUBLIC_NAME}"
+    elif [[ -n "${YOUTUBE_WIKI_RUNTIME_ID:-}" ]]; then
+      public_name="hermes-${YOUTUBE_WIKI_RUNTIME_ID}"
+    fi
+  fi
+
+  if [[ -n "$host" && -n "$public_name" && -z "${HERMES_WEBHOOK_URL:-}" && "$host" != *".${zone}" ]]; then
+    export HERMES_PUBLIC_NAME="$public_name"
+    export WEBHOOK_PUBLIC_HOST="${public_name}.${zone}"
+  fi
+}
+
+normalize_managed_hermes_host
+
 export BRIDGE_PORT BRIDGE_SCRIPT BRIDGE_PY_FILE
 BRIDGE_PORT="$PORT"
 BRIDGE_SCRIPT="$LOCAL_SCRIPT"

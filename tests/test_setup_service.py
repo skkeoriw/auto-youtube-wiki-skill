@@ -167,6 +167,7 @@ class SetupServiceManagedSourceTest(unittest.TestCase):
         self.assertIn("build_hermes_metadata", text)
         self.assertIn("start_managed_channel", text)
         self.assertIn("sop-runtime-hermes", text)
+        self.assertIn("ignoring unmanaged WEBHOOK_PUBLIC_HOST", text)
         self.assertIn('setsid node "$AUTO_DOMAIN_AGENT_JS"', text)
         self.assertIn("local auto-domain-cli runner ignored", text)
         self.assertIn("using managed latest source instead", text)

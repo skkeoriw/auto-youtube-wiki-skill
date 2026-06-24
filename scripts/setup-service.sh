@@ -82,6 +82,7 @@ PY
 }
 
 WEBHOOK_PUBLIC_HOST="$(host_from_url "${WEBHOOK_PUBLIC_HOST:-}")"
+REQUESTED_HERMES_WEBHOOK_URL="${HERMES_WEBHOOK_URL:-}"
 if [ -z "$WEBHOOK_PUBLIC_HOST" ] && [ -n "${HERMES_WEBHOOK_URL:-}" ]; then
   WEBHOOK_PUBLIC_HOST="$(host_from_url "$HERMES_WEBHOOK_URL")"
 fi
@@ -89,6 +90,9 @@ if [ -z "$HERMES_PUBLIC_NAME" ] && [ -n "$WEBHOOK_PUBLIC_HOST" ]; then
   suffix=".${AUTO_DOMAIN_ZONE_NAME}"
   if [ "${WEBHOOK_PUBLIC_HOST%"$suffix"}" != "$WEBHOOK_PUBLIC_HOST" ]; then
     HERMES_PUBLIC_NAME="${WEBHOOK_PUBLIC_HOST%"$suffix"}"
+  elif [ -z "$REQUESTED_HERMES_WEBHOOK_URL" ]; then
+    echo "[setup-service] ignoring unmanaged WEBHOOK_PUBLIC_HOST for managed Hermes tunnel: $WEBHOOK_PUBLIC_HOST" >&2
+    WEBHOOK_PUBLIC_HOST=""
   fi
 fi
 if [ -z "$HERMES_PUBLIC_NAME" ]; then

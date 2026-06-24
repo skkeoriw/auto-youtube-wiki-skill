@@ -1069,8 +1069,8 @@ def capability_config_resolution(sop, node_id="", run_overrides=None, workflow_i
         ("instance-settings", instance_values),
         ("runtime-settings", runtime_values),
         ("global-settings", global_values),
-        ("runtime-env-file", env_file_values),
         ("bridge-env", bridge_env_values),
+        ("runtime-env-file", env_file_values),
     ]
     registry = setting_registry_preview(sop, node_id=node_id, query={**(query or {}), "workflow_id": workflow_id, "node_id": node_id})
     fields = [dict(item) for item in registry.get("items") or []]
@@ -1146,7 +1146,7 @@ def capability_config_resolution(sop, node_id="", run_overrides=None, workflow_i
         "backend": settings.get("backend", runtime_settings_backend()),
         "updated_at": settings.get("updated_at", ""),
         "env_file": str(Path(env_file).expanduser()),
-        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env", "definition-default"],
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file", "definition-default"],
         "registry_total": registry.get("registry_total", len(fields)),
         "registry_filters": registry.get("filters") or {},
         "items": items,
@@ -4147,7 +4147,7 @@ def hermes_smoke_check(message):
                 source=route_item.get("source") or "default",
             ),
             "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
-            "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env"],
+            "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file"],
         },
         "payload": payload,
     }
@@ -5875,7 +5875,7 @@ def edge_handoff_evaluator_env(sop, data):
             source=model.get("source") or "missing:EDGE_HANDOFF_LLM_MODEL",
         ),
         "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
-        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env"],
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file"],
     }
 
 
@@ -6626,8 +6626,8 @@ def node_run_config_lookup(context, key, aliases=None):
         ("instance-settings", context.get("instance_settings_values") or {}),
         ("runtime-settings", context.get("runtime_settings_values") or {}),
         ("global-settings", context.get("global_settings_values") or {}),
-        ("runtime-env-file", context.get("runtime_env_file_values") or {}),
         ("bridge-env", context.get("bridge_env") or {}),
+        ("runtime-env-file", context.get("runtime_env_file_values") or {}),
     ]
     for source_name, values in sources:
         for candidate in candidates:
@@ -6862,7 +6862,7 @@ def node_run_config_source_summary(context):
         "instance_settings_keys": sorted((context.get("instance_settings_values") or {}).keys()),
         "runtime_settings_keys": sorted((context.get("runtime_settings_values") or {}).keys()),
         "global_settings_keys": sorted((context.get("global_settings_values") or {}).keys()),
-        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "runtime-env-file", "bridge-env", "defaults"],
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file", "defaults"],
     }
 
 

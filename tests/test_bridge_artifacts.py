@@ -1017,6 +1017,21 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertNotIn("env-secret-token", json.dumps(result, ensure_ascii=False))
         self.assertIn("x-hub-signature-256", {key.lower(): value for key, value in captured["request"].headers.items()})
 
+    def test_node_run_config_lookup_prefers_bridge_env_over_env_file_defaults(self):
+        context = {
+            "overrides": {},
+            "instance_settings_values": {},
+            "runtime_settings_values": {},
+            "global_settings_values": {},
+            "runtime_env_file_values": {"WEBHOOK_PUBLIC_HOST": "stale-hermes.example"},
+            "bridge_env": {"WEBHOOK_PUBLIC_HOST": "hermes-runtime-test.chxyka.ccwu.cc"},
+        }
+
+        resolved = bridge.node_run_config_lookup(context, "WEBHOOK_PUBLIC_HOST")
+
+        self.assertEqual(resolved["value"], "hermes-runtime-test.chxyka.ccwu.cc")
+        self.assertEqual(resolved["source"], "bridge-env:WEBHOOK_PUBLIC_HOST")
+
     def test_hermes_agent_check_runs_local_cli_with_prompt(self):
         captured = {}
 
