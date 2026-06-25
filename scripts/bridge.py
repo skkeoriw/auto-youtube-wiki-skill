@@ -3768,8 +3768,11 @@ def list_workflow_edge_drafts(sop):
                     "draft_type": (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "save_evaluated_edge"),
                     "draft_path": str(draft_dir),
                     "edge": read_yaml(draft_dir / "edge.yaml"),
+                    "evaluation": read_json(draft_dir / "evaluation.json") or {},
                     "change_request": read_json(draft_dir / "change_request.json") or {},
                     "validation": read_json(draft_dir / "validation.json") or {},
+                    "runtime_sop_result": read_json(draft_dir / "runtime_sop_result.json") or {},
+                    "apply_result": read_json(draft_dir / "apply_result.json") or {},
                 })
     return drafts
 
