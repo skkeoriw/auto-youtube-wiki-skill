@@ -7478,22 +7478,36 @@ def run_workflow_edge_handoff_probe(sop, data, request_payload, relay_package, e
         ],
         "temperature": 0,
         "max_tokens": int(evaluator_env.get("EDGE_HANDOFF_LLM_MAX_TOKENS", "2048") or "2048"),
+        "response_format": {"type": "json_object"},
         "stream": False,
     }
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     started = time.time()
-    try:
+    def post_probe(payload):
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": evaluator_env.get("EDGE_HANDOFF_LLM_USER_AGENT") or evaluator_env.get("WIKI_LLM_USER_AGENT") or "curl/8.0.1",
+            },
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=int(evaluator_env.get("EDGE_HANDOFF_LLM_TIMEOUT", "22") or "22")) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
+            return response.read().decode("utf-8", errors="replace")
+    try:
+        try:
+            response_text = post_probe(body)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            if exc.code in {400, 422} and "response_format" in detail:
+                retry_body = dict(body)
+                retry_body.pop("response_format", None)
+                response_text = post_probe(retry_body)
+            else:
+                raise urllib.error.HTTPError(exc.url, exc.code, detail or exc.reason, exc.headers, None) from exc
     except Exception as exc:
         probe = deterministic_handoff_probe(request_payload, relay_package, evaluation, reason=str(exc))
         probe["status"] = "blocked"
