@@ -5502,6 +5502,7 @@ def sop_dag(sop):
             continue
         visible_node_ids.add(node_id)
         static = node_static_config(sop, node_id) or {}
+        registry_item = node_registry_item(sop, node_id) or {}
         manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
         manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
         nodes.append({
@@ -5528,9 +5529,9 @@ def sop_dag(sop):
             "webhook_route": node.get("webhook_route", node.get("route", "")),
             "needs": node.get("needs") or [],
             "executor": static.get("executor") or {},
-            "inputs": node.get("inputs", {}),
-            "outputs": node.get("outputs", {}),
-            "optional_inputs": node.get("optional_inputs", {}),
+            "inputs": registry_item.get("inputs") or node.get("inputs", {}),
+            "outputs": registry_item.get("outputs") or node.get("outputs", {}),
+            "optional_inputs": registry_item.get("optional_inputs") or node.get("optional_inputs", {}),
             "capabilities": {
                 "git": manifest_caps.get("git", {"enabled": True, "required": False}),
                 "telegram": manifest_caps.get("telegram", {
@@ -7095,6 +7096,60 @@ def workflow_edge_generated_fixture(upstream):
     }
 
 
+def workflow_edge_instruction_text(data, edge):
+    edge = edge if isinstance(edge, dict) else {}
+    return str(
+        data.get("edge_handoff_instruction")
+        or data.get("instruction")
+        or edge.get("instruction")
+        or ""
+    ).strip()
+
+
+def workflow_edge_spec_has_resolver(spec, resolver_id):
+    for resolver in node_input_resolvers(spec if isinstance(spec, dict) else {}):
+        current = str(resolver.get("id") or resolver.get("name") or resolver.get("kind") or resolver.get("type") or "").strip()
+        if current == resolver_id:
+            return True
+    return False
+
+
+def workflow_edge_output_is_json(outputs, output_name):
+    spec = outputs.get(output_name) if isinstance(outputs, dict) else {}
+    spec = spec if isinstance(spec, dict) else {}
+    text = " ".join(str(spec.get(key) or "") for key in ("kind", "type", "value_type", "content_type", "path")).lower()
+    return "json" in text or "metadata" in output_name.lower()
+
+
+def workflow_edge_message_mapping_from_instruction(instruction, outputs, target_spec):
+    if not instruction or not isinstance(outputs, dict):
+        return None
+    lower = instruction.lower()
+    wants_title = "title" in lower or "标题" in instruction
+    wants_description = "description" in lower or "描述" in instruction or "简介" in instruction
+    wants_url = "source_url" in lower or "url" in lower or "链接" in instruction
+    metadata_outputs = [name for name in outputs if workflow_edge_output_is_json(outputs, name)]
+    if wants_title and metadata_outputs and workflow_edge_spec_has_resolver(target_spec, "metadata-title"):
+        return {
+            "source_output": metadata_outputs[0],
+            "target_input": "message",
+            "resolver": "metadata-title",
+        }
+    if wants_description and metadata_outputs and workflow_edge_spec_has_resolver(target_spec, "metadata-description"):
+        return {
+            "source_output": metadata_outputs[0],
+            "target_input": "message",
+            "resolver": "metadata-description",
+        }
+    if wants_url and "source_url" in outputs:
+        return {
+            "source_output": "source_url",
+            "target_input": "message",
+            "resolver": "direct-text" if workflow_edge_spec_has_resolver(target_spec, "direct-text") else "direct",
+        }
+    return None
+
+
 def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
     data = data if isinstance(data, dict) else {}
     edge = data.get("edge") if isinstance(data.get("edge"), dict) else {}
@@ -7126,6 +7181,7 @@ def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
     sop_edge_mappings = edge_contract_relay_mappings(sop, sop_edge)
     if sop_edge_mappings:
         return sop_edge_mappings
+    instruction = workflow_edge_instruction_text(data, edge)
     outputs = upstream.get("outputs") if isinstance(upstream.get("outputs"), dict) else {}
     required = downstream.get("inputs") if isinstance(downstream.get("inputs"), dict) else {}
     optional = downstream.get("optional_inputs") if isinstance(downstream.get("optional_inputs"), dict) else {}
@@ -7147,6 +7203,12 @@ def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
                 "target_input": input_name,
                 "resolver": "direct",
             })
+            continue
+        if input_name in {"message", "message_payload", "payload", "content", "text", "summary"}:
+            message_mapping = workflow_edge_message_mapping_from_instruction(instruction, outputs, spec)
+            if message_mapping:
+                message_mapping["target_input"] = input_name
+                mappings.append(message_mapping)
     return mappings
 
 
