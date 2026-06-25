@@ -4512,6 +4512,68 @@ def normalize_hermes_webhook_url(raw, route):
     return f"{raw}/webhooks/{route}"
 
 
+def derived_hermes_webhook_from_runtime(route):
+    """Derive the managed Hermes channel from the current runtime channel.
+
+    create-runtime registers two sibling auto-domain channels:
+    runtime-<ip>.<domain> and hermes-runtime-<ip>.<domain>. Older env files can
+    still contain a stale WEBHOOK_PUBLIC_HOST, so the runtime-local smoke check
+    should prefer the current channel-derived Hermes host when the runtime
+    channel follows the managed runtime-ip naming convention.
+    """
+    info = runtime_info()
+    parsed = urlparse(str(info.get("channel_url") or ""))
+    host = parsed.netloc or parsed.path
+    host = host.split("/")[0].strip()
+    if not host:
+        return "", ""
+    first_label = host.split(".", 1)[0]
+    if not re.fullmatch(r"runtime-\d+-\d+-\d+-\d+", first_label):
+        return "", ""
+    return normalize_hermes_webhook_url(f"hermes-{host}", route), "runtime-channel:derived-hermes-host"
+
+
+def hermes_smoke_target_candidates(context, route):
+    explicit = node_run_config_lookup(context, "HERMES_WEBHOOK_URL", RUNTIME_CAPABILITY_ENV.get("HERMES_WEBHOOK_URL", []))
+    public = node_run_config_lookup(context, "WEBHOOK_PUBLIC_HOST", [
+        *RUNTIME_CAPABILITY_ENV.get("WEBHOOK_PUBLIC_HOST", []),
+        "HERMES_PUBLIC_HOST",
+    ])
+    derived_url, derived_source = derived_hermes_webhook_from_runtime(route)
+    candidates = []
+    if not is_blank_value(explicit.get("value")):
+        candidates.append({
+            "key": explicit.get("key") or "HERMES_WEBHOOK_URL",
+            "value": explicit.get("value"),
+            "source": explicit.get("source") or "unknown:HERMES_WEBHOOK_URL",
+            "url": normalize_hermes_webhook_url(explicit.get("value"), route),
+        })
+    if derived_url:
+        candidates.append({
+            "key": "HERMES_WEBHOOK_URL",
+            "value": derived_url,
+            "source": derived_source,
+            "url": derived_url,
+        })
+    if not is_blank_value(public.get("value")):
+        candidates.append({
+            "key": public.get("key") or "WEBHOOK_PUBLIC_HOST",
+            "value": public.get("value"),
+            "source": public.get("source") or "unknown:WEBHOOK_PUBLIC_HOST",
+            "url": normalize_hermes_webhook_url(public.get("value"), route),
+        })
+
+    unique = []
+    seen = set()
+    for item in candidates:
+        url = str(item.get("url") or "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        unique.append(item)
+    return unique
+
+
 def hermes_webhook_url():
     route = hermes_smoke_route()
     raw = (
@@ -4692,14 +4754,10 @@ def hermes_smoke_check(message):
     route_item = node_run_config_lookup(context, "HERMES_SMOKE_ROUTE", RUNTIME_CAPABILITY_ENV.get("HERMES_SMOKE_ROUTE", []))
     route = str(route_item.get("value") or "sop-runtime-hermes-smoke").strip().strip("/") or "sop-runtime-hermes-smoke"
     route_source = route_item.get("source") if not is_blank_value(route_item.get("value")) else "default"
-    target_item = node_run_config_lookup(context, "HERMES_WEBHOOK_URL", [
-        *RUNTIME_CAPABILITY_ENV.get("HERMES_WEBHOOK_URL", []),
-        "WEBHOOK_PUBLIC_HOST",
-        *RUNTIME_CAPABILITY_ENV.get("WEBHOOK_PUBLIC_HOST", []),
-        "HERMES_PUBLIC_HOST",
-    ])
+    target_candidates = hermes_smoke_target_candidates(context, route)
+    target_item = target_candidates[0] if target_candidates else {"key": "HERMES_WEBHOOK_URL", "value": "", "source": "missing:HERMES_WEBHOOK_URL", "url": ""}
     token_item = node_run_config_lookup(context, "HERMES_WEBHOOK_TOKEN", RUNTIME_CAPABILITY_ENV.get("HERMES_WEBHOOK_TOKEN", []))
-    target = normalize_hermes_webhook_url(target_item.get("value"), route)
+    target = str(target_item.get("url") or "")
     token = str(token_item.get("value") or "")
     info = runtime_info()
     payload = {
@@ -4715,6 +4773,14 @@ def hermes_smoke_check(message):
         "route": route,
         "curl": hermes_manual_curl(target or "https://<WEBHOOK_PUBLIC_HOST>/webhooks/sop-runtime-hermes-smoke", payload),
         "token_present": bool(token),
+        "target_candidates": [
+            {
+                "target_url": item.get("url"),
+                "source": item.get("source"),
+                "key": item.get("key"),
+            }
+            for item in target_candidates
+        ],
         "config": {
             "target": env_config_item(
                 target_item.get("key") or "HERMES_WEBHOOK_URL",
@@ -4764,11 +4830,34 @@ def hermes_smoke_check(message):
         "X-Hub-Signature-256": f"sha256={signature}",
     }
     started = time.monotonic()
-    http_status, content_type, response_body, error, attempts = hermes_post_with_retry(target, data, headers, attempts=3)
+    candidate_results = []
+    http_status = 0
+    content_type = ""
+    response_body = ""
+    error = ""
+    attempts = 0
+    for candidate in target_candidates:
+        target = str(candidate.get("url") or "")
+        if not target:
+            continue
+        http_status, content_type, response_body, error, attempts = hermes_post_with_retry(target, data, headers, attempts=1)
+        candidate_results.append({
+            "target_url": target,
+            "source": candidate.get("source"),
+            "http_status": http_status,
+            "ok": http_status in {200, 201, 202, 204},
+            "error": error,
+        })
+        if http_status in {200, 201, 202, 204}:
+            target_item = candidate
+            break
     latency_ms = round((time.monotonic() - started) * 1000)
     ok = http_status in {200, 201, 202, 204}
     return (200 if ok else 502), {
         **base,
+        "target_url": str(target_item.get("url") or target),
+        "curl": hermes_manual_curl(str(target_item.get("url") or target) or "https://<WEBHOOK_PUBLIC_HOST>/webhooks/sop-runtime-hermes-smoke", payload),
+        "candidate_results": candidate_results,
         "ok": ok,
         "attempts": attempts,
         "http_status": http_status,

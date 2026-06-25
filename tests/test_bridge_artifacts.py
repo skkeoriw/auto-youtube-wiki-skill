@@ -1018,6 +1018,50 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertNotIn("env-secret-token", json.dumps(result, ensure_ascii=False))
         self.assertIn("x-hub-signature-256", {key.lower(): value for key, value in captured["request"].headers.items()})
 
+    def test_hermes_smoke_check_prefers_managed_runtime_channel_over_stale_public_host(self):
+        captured = {}
+
+        class FakeResponse:
+            status = 202
+            headers = {"content-type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"status":"accepted"}'
+
+        def fake_urlopen(request, timeout=0):
+            captured["url"] = request.full_url
+            return FakeResponse()
+
+        with (
+            patch.dict(os.environ, {
+                "HERMES_WEBHOOK_URL": "",
+                "WEBHOOK_PUBLIC_HOST": "stale-hermes.example",
+                "HERMES_WEBHOOK_TOKEN": "secret-token",
+            }, clear=False),
+            patch.object(bridge, "read_env_file_values", return_value={}),
+            patch.object(bridge, "read_runtime_management_config", return_value={"values": {}, "backend": "file"}),
+            patch.object(bridge, "runtime_info", return_value={
+                "runtime_id": "youtube-wiki",
+                "channel_url": "https://runtime-152-32-214-95.chxyka.ccwu.cc",
+                "spi_base_url": "https://runtime-152-32-214-95.chxyka.ccwu.cc/api/sop",
+            }),
+            patch.object(bridge.urllib.request, "urlopen", side_effect=fake_urlopen),
+        ):
+            status, result = bridge.hermes_smoke_check("你好 你是谁")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["url"], "https://hermes-runtime-152-32-214-95.chxyka.ccwu.cc/webhooks/sop-runtime-hermes-smoke")
+        self.assertEqual(result["target_url"], captured["url"])
+        self.assertEqual(result["config"]["target"]["source"], "runtime-channel:derived-hermes-host")
+        self.assertTrue(any(item["target_url"] == captured["url"] for item in result["target_candidates"]))
+
     def test_node_run_config_lookup_prefers_bridge_env_over_env_file_defaults(self):
         context = {
             "overrides": {},
