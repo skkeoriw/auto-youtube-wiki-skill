@@ -5851,7 +5851,7 @@ def edge_handoff_evaluator_env(sop, data):
         env["EDGE_HANDOFF_LLM_API_KEY"] = str(api_key.get("value"))
     if not is_blank_value(model.get("value")):
         env["EDGE_HANDOFF_LLM_MODEL"] = str(model.get("value"))
-    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "18")
+    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "22")
     env.setdefault("EDGE_HANDOFF_LLM_MAX_TOKENS", "4096")
     return env, {
         "base_url": env_config_item(
@@ -5918,7 +5918,7 @@ def evaluate_edge_handoff(sop, workflow_id, data):
         command = ["python3", str(script), "--request-json", str(request_path), "--output-json", str(output_path), "--require-ai"]
         if allow_deterministic:
             command.append("--allow-deterministic")
-        evaluator_timeout = int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "22") or "22")
+        evaluator_timeout = int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "24") or "24")
         try:
             completed = subprocess.run(command, text=True, capture_output=True, timeout=evaluator_timeout, env=evaluator_env)
         except subprocess.TimeoutExpired as exc:
