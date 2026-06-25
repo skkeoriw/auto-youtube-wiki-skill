@@ -2406,6 +2406,156 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
+    def _ready_edge_evaluation(self, prompt="Use resolved edge inputs."):
+        return {
+            "status": "ready",
+            "score": 0.92,
+            "confidence": 0.88,
+            "summary": "Edge can be executed.",
+            "decision": "can_run",
+            "agent": {"provider": "openai-compatible", "model": "deepseek-v4-flash", "used_ai": True},
+            "node_execution_guide": {"format": "markdown", "prompt": prompt},
+            "resolved_handoff": {"primary_artifacts": [{"from": "upstream.outputs.output"}]},
+            "test_plan": ["materialize edge inputs", "execute downstream skill"],
+        }
+
+    def _workflow_draft_sop(self):
+        runtime_sop_path = self.wiki / "sop.yaml"
+        runtime_sop_path.write_text(json.dumps({
+            "id": "youtube-research-wiki",
+            "repo": "skkeoriw/wiki-test",
+            "nodes": {
+                "youtube-fetch": {
+                    "title": "YouTube Fetch",
+                    "skill": "sop-youtube-fetch",
+                    "outputs": {
+                        "source_url": {"kind": "scalar", "value_type": "url"},
+                        "metadata_file": {"kind": "file", "value_type": "json"},
+                    },
+                },
+                "youtube-deep-research": {
+                    "title": "YouTube Deep Research",
+                    "skill": "sop-youtube-deep-research",
+                    "inputs": {"source_url": {"kind": "scalar", "value_type": "url", "required": True}},
+                    "outputs": {"analysis_file": {"kind": "file", "value_type": "markdown"}},
+                },
+                "wiki-build": {
+                    "title": "Wiki Build",
+                    "skill": "sop-wiki-build",
+                    "inputs": {"reports": {"kind": "file", "required": True}},
+                    "outputs": {"index": {"kind": "file", "value_type": "markdown"}},
+                },
+            },
+            "edges": [],
+        }), encoding="utf-8")
+        sop = dict(self.sop)
+        sop["id"] = "test-instance"
+        sop["instance_id"] = "test-instance"
+        sop["repo"] = "skkeoriw/wiki-test"
+        sop["sop_file"] = str(runtime_sop_path)
+        sop["raw_id"] = "youtube-research-wiki"
+        sop["sop_type"] = "youtube-research-wiki"
+        sop["nodes"] = bridge.read_yaml(runtime_sop_path)["nodes"]
+        sop["edges"] = []
+        return sop, runtime_sop_path
+
+    def test_workflow_draft_runtime_sop_snapshot_applies_multiple_edges(self):
+        sop, runtime_sop_path = self._workflow_draft_sop()
+        payload = {
+            "draft": {
+                "name": "youtube-wiki-three-node",
+                "goal": "Fetch, research, then build wiki pages.",
+                "nodes": [
+                    {"nodeId": "youtube-fetch"},
+                    {"nodeId": "youtube-deep-research"},
+                    {"nodeId": "wiki-build"},
+                ],
+                "edges": [
+                    {
+                        "id": "youtube-fetch-to-youtube-deep-research",
+                        "from": "youtube-fetch",
+                        "to": "youtube-deep-research",
+                        "instruction": "Pass source_url to the deep research node.",
+                        "relayMode": "auto_by_target_inputs",
+                    },
+                    {
+                        "id": "youtube-deep-research-to-wiki-build",
+                        "from": "youtube-deep-research",
+                        "to": "wiki-build",
+                        "instruction": "Pass analysis_file to wiki-build as the research report.",
+                        "relayMode": "selected_outputs",
+                        "relayMappings": [{"sourceOutput": "analysis_file", "targetInput": "reports", "resolver": "direct"}],
+                    },
+                ],
+            },
+            "evaluations": {
+                "youtube-fetch-to-youtube-deep-research": self._ready_edge_evaluation("Use source_url."),
+                "youtube-deep-research-to-wiki-build": self._ready_edge_evaluation("Use analysis_file as report input."),
+            },
+        }
+
+        draft = bridge.create_workflow_draft(sop, "youtube-research-wiki", payload)
+        self.assertEqual(draft["status"], "draft_saved")
+        self.assertEqual(draft["validation"]["status"], "passed")
+        self.assertEqual(draft["ready_edge_count"], 2)
+
+        runtime = bridge.generate_workflow_draft_runtime_sop(sop, "youtube-research-wiki", {"draft_id": draft["draft_id"]})
+        self.assertEqual(runtime["status"], "runtime_sop_ready")
+        self.assertEqual(runtime["edge_count"], 2)
+        self.assertTrue(Path(runtime["runtime_sop_path"]).exists())
+        self.assertEqual(bridge.read_yaml(runtime_sop_path)["edges"], [])
+        snapshot = bridge.read_yaml(Path(runtime["runtime_sop_path"]))
+        self.assertEqual([edge["id"] for edge in snapshot["edges"]], [
+            "youtube-fetch-to-youtube-deep-research",
+            "youtube-deep-research-to-wiki-build",
+        ])
+        self.assertEqual(snapshot["edges"][1]["relay"]["mappings"][0]["target_input"], "reports")
+
+    def test_workflow_draft_run_passes_runtime_sop_snapshot_to_trigger(self):
+        sop, _runtime_sop_path = self._workflow_draft_sop()
+        payload = {
+            "draft": {
+                "name": "youtube-wiki-run-draft",
+                "nodes": [{"nodeId": "youtube-fetch"}, {"nodeId": "youtube-deep-research"}],
+                "edges": [{
+                    "id": "youtube-fetch-to-youtube-deep-research",
+                    "from": "youtube-fetch",
+                    "to": "youtube-deep-research",
+                    "instruction": "Pass source_url.",
+                    "relayMode": "auto_by_target_inputs",
+                }],
+            },
+            "evaluations": {
+                "youtube-fetch-to-youtube-deep-research": self._ready_edge_evaluation("Use source_url."),
+            },
+        }
+        draft = bridge.create_workflow_draft(sop, "youtube-research-wiki", payload)
+        runtime = bridge.generate_workflow_draft_runtime_sop(sop, "youtube-research-wiki", {"draft_id": draft["draft_id"]})
+        captured = {}
+
+        def fake_run(command, env=None, capture_output=False, text=False, timeout=None):
+            captured["command"] = command
+            captured["env"] = env or {}
+            captured["timeout"] = timeout
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps({
+                "status": "triggered",
+                "pipeline_id": "draft-pipeline-1",
+            }), stderr="")
+
+        with patch.object(bridge.subprocess, "run", side_effect=fake_run):
+            code, result = bridge.trigger_workflow_draft_run(sop, "youtube-research-wiki", {
+                "draft_id": draft["draft_id"],
+                "runtime_sop_path": runtime["runtime_sop_path"],
+                "repo": "skkeoriw/wiki-test",
+                "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            })
+
+        self.assertEqual(code, 200)
+        self.assertEqual(result["pipeline_id"], "draft-pipeline-1")
+        self.assertEqual(result["workflow_draft_id"], draft["draft_id"])
+        self.assertEqual(captured["env"]["YOUTUBE_WIKI_RUNTIME_SOP_FILE"], runtime["runtime_sop_path"])
+        self.assertIn("--intent", captured["command"])
+
     def test_business_node_test_plan_resolves_generated_fixture(self):
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])

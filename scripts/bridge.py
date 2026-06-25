@@ -3707,6 +3707,294 @@ def generate_workflow_edge_runtime_sop(sop, workflow_id, data):
     return result
 
 
+def resolve_workflow_draft_dir(sop, draft_id="", draft_path=""):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    candidates = []
+    if draft_path:
+        candidates.append(str(draft_path))
+    if draft_id:
+        candidates.append(str(wiki / "raw" / "workflow-drafts" / str(draft_id)))
+    for raw_path in candidates:
+        path = Path(str(raw_path)).expanduser()
+        if not path.is_absolute():
+            path = (wiki / path).resolve()
+        else:
+            path = path.resolve()
+        try:
+            path.relative_to(wiki)
+        except ValueError:
+            continue
+        if path.exists() and path.is_dir():
+            return path
+    return None
+
+
+def workflow_draft_edge_specs(sop, workflow_id, data):
+    data = data if isinstance(data, dict) else {}
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else data
+    evaluations = data.get("evaluations") if isinstance(data.get("evaluations"), dict) else {}
+    edges = draft.get("edges") if isinstance(draft.get("edges"), list) else []
+    specs = []
+    for raw_edge in edges:
+        if not isinstance(raw_edge, dict):
+            continue
+        edge_id = str(raw_edge.get("id") or "").strip()
+        evaluation = raw_edge.get("evaluation") if isinstance(raw_edge.get("evaluation"), dict) else {}
+        if edge_id and isinstance(evaluations.get(edge_id), dict):
+            evaluation = evaluations[edge_id]
+        spec = {
+            "edge_id": edge_id,
+            "edge": raw_edge,
+            "upstream_node_id": raw_edge.get("from") or raw_edge.get("source"),
+            "downstream_node_id": raw_edge.get("to") or raw_edge.get("target"),
+            "edge_handoff_instruction": raw_edge.get("instruction") or raw_edge.get("edge_handoff_instruction") or "",
+            "relay_mode": raw_edge.get("relayMode") or raw_edge.get("relay_mode") or "auto_by_target_inputs",
+            "relay_mappings": raw_edge.get("relayMappings") if isinstance(raw_edge.get("relayMappings"), list) else raw_edge.get("relay_mappings"),
+            "evaluation": evaluation,
+        }
+        validation = validate_workflow_edge_draft_input(sop, workflow_id, spec)
+        proposal = proposed_workflow_edge_from_draft(sop, workflow_id, spec)
+        specs.append({
+            "edge_id": proposal.get("id") or edge_id,
+            "source": proposal.get("from", ""),
+            "target": proposal.get("to", ""),
+            "spec": spec,
+            "proposal": proposal,
+            "validation": validation,
+        })
+    return specs
+
+
+def validate_workflow_draft_input(sop, workflow_id, data):
+    data = data if isinstance(data, dict) else {}
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else data
+    nodes = draft.get("nodes") if isinstance(draft.get("nodes"), list) else []
+    edges = draft.get("edges") if isinstance(draft.get("edges"), list) else []
+    known_nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
+    errors = []
+    warnings = []
+    seen_nodes = set()
+    for index, item in enumerate(nodes):
+        node_id = str((item or {}).get("nodeId") or (item or {}).get("node_id") or "").strip() if isinstance(item, dict) else ""
+        if not node_id:
+            errors.append({"field": f"nodes[{index}].nodeId", "code": "required", "message": "nodeId is required"})
+            continue
+        seen_nodes.add(node_id)
+        if node_id not in known_nodes:
+            errors.append({"field": f"nodes[{index}].nodeId", "code": "node_not_found", "message": f"node {node_id!r} does not exist"})
+    edge_specs = workflow_draft_edge_specs(sop, workflow_id, data)
+    if edges and not edge_specs:
+        errors.append({"field": "edges", "code": "invalid_edges", "message": "No valid edge payloads were found"})
+    for edge in edge_specs:
+        validation_errors = (edge.get("validation") or {}).get("errors") or []
+        if validation_errors:
+            warnings.append({
+                "field": f"edges.{edge.get('edge_id')}",
+                "code": "edge_not_ready",
+                "message": "Edge requires a ready AI evaluation and Node Execution Guide before Runtime SOP generation",
+                "errors": validation_errors,
+            })
+        if seen_nodes and (edge.get("source") not in seen_nodes or edge.get("target") not in seen_nodes):
+            warnings.append({
+                "field": f"edges.{edge.get('edge_id')}",
+                "code": "edge_node_outside_draft",
+                "message": "Edge references a node that is not listed in draft.nodes",
+            })
+    status = "failed" if errors else "warning" if warnings else "passed"
+    return {
+        "schema_id": "workflow-draft-schema/v1",
+        "status": status,
+        "errors": errors,
+        "warnings": warnings,
+        "workflow_id": workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or "",
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "ready_edge_count": sum(1 for edge in edge_specs if not (edge.get("validation") or {}).get("errors")),
+    }
+
+
+def create_workflow_draft(sop, workflow_id, data):
+    workflow_id = workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or ""
+    data = data if isinstance(data, dict) else {}
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else data
+    validation = validate_workflow_draft_input(sop, workflow_id, data)
+    name = str(draft.get("name") or "workflow-draft").strip()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    draft_id = slugify(data.get("draft_id") or draft.get("draft_id") or f"{name}-{timestamp}") or f"workflow-draft-{timestamp}"
+    wiki = Path(sop["wiki_local_path"])
+    draft_dir = wiki / "raw" / "workflow-drafts" / draft_id
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    edge_specs = workflow_draft_edge_specs(sop, workflow_id, data)
+    ready_edges = [edge["proposal"] for edge in edge_specs if not (edge.get("validation") or {}).get("errors")]
+    manifest = {
+        "version": 1,
+        "draft_type": "workflow_draft",
+        "draft_id": draft_id,
+        "workflow_id": workflow_id,
+        "name": name,
+        "goal": str(draft.get("goal") or ""),
+        "created_at": _now_iso_utc(),
+        "runtime_id": sop.get("runtime_id", ""),
+        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+        "draft": mask_data(draft),
+        "edge_count": len(edge_specs),
+        "ready_edge_count": len(ready_edges),
+        "runtime_sop_status": "not_generated",
+        "active_runtime_sop_changed": False,
+        "production_dag_changed": False,
+    }
+    write_json(draft_dir / "workflow_draft.json", manifest)
+    (draft_dir / "edges.yaml").write_text(yaml.safe_dump(ready_edges, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    write_json(draft_dir / "edge_validations.json", [mask_data({
+        "edge_id": edge.get("edge_id"),
+        "source": edge.get("source"),
+        "target": edge.get("target"),
+        "validation": edge.get("validation"),
+    }) for edge in edge_specs])
+    write_json(draft_dir / "validation.json", validation)
+    return {
+        "status": "draft_saved",
+        "draft_id": draft_id,
+        "draft_type": "workflow_draft",
+        "draft_path": str(draft_dir),
+        "workflow_id": workflow_id,
+        "validation": validation,
+        "edge_count": len(edge_specs),
+        "ready_edge_count": len(ready_edges),
+        "runtime_sop_result": read_json(draft_dir / "runtime_sop_result.json") or {},
+        "message": (
+            "workflow draft saved; generate Runtime SOP before running"
+            if validation["status"] != "failed" else
+            "workflow draft saved with validation errors"
+        ),
+    }
+
+
+def generate_workflow_draft_runtime_sop(sop, workflow_id, data):
+    workflow_id = workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or ""
+    data = data if isinstance(data, dict) else {}
+    draft_id = str(data.get("draft_id") or data.get("draftId") or "").strip()
+    draft_path = str(data.get("draft_path") or data.get("draftPath") or "").strip()
+    draft_dir = resolve_workflow_draft_dir(sop, draft_id, draft_path)
+    if not draft_dir:
+        return {
+            "status": "failed",
+            "reason": "workflow draft not found",
+            "errors": [{"code": "draft_not_found", "message": "workflow draft path is missing"}],
+            "workflow_id": workflow_id,
+        }
+    validation = read_json(draft_dir / "validation.json") or {}
+    if validation.get("status") != "passed":
+        return {
+            "status": "failed",
+            "reason": "workflow draft is not ready",
+            "errors": [{
+                "code": "edge_evaluation_required",
+                "message": "All edges must have ready AI Edge Handoff evaluations before Runtime SOP generation",
+            }],
+            "validation": validation,
+            "workflow_id": workflow_id,
+            "draft_id": draft_dir.name,
+            "draft_path": str(draft_dir),
+        }
+    proposed_edges = read_yaml(draft_dir / "edges.yaml")
+    if not isinstance(proposed_edges, list) or not proposed_edges:
+        return {
+            "status": "failed",
+            "reason": "workflow draft has no ready edges",
+            "errors": [{"code": "no_ready_edges", "message": "No ready Edge definitions were found for this workflow draft"}],
+            "workflow_id": workflow_id,
+            "draft_id": draft_dir.name,
+            "draft_path": str(draft_dir),
+        }
+    runtime_sop_file = Path(str(sop.get("sop_file") or "")).expanduser()
+    if not runtime_sop_file.exists():
+        return {
+            "status": "failed",
+            "reason": "runtime sop missing",
+            "errors": [{"code": "runtime_sop_missing", "message": "runtime sop.yaml is missing for this instance"}],
+            "workflow_id": workflow_id,
+            "draft_id": draft_dir.name,
+            "draft_path": str(draft_dir),
+        }
+    original_text = runtime_sop_file.read_text(encoding="utf-8")
+    runtime_doc = read_yaml(runtime_sop_file)
+    if not isinstance(runtime_doc, dict):
+        runtime_doc = {}
+    nodes = runtime_doc.get("nodes") if isinstance(runtime_doc.get("nodes"), dict) else {}
+    errors = []
+    edges = runtime_doc.get("edges") if isinstance(runtime_doc.get("edges"), list) else []
+    before_edges = copy.deepcopy(edges)
+    change_count = 0
+    for proposed in proposed_edges:
+        if not isinstance(proposed, dict):
+            continue
+        source = str(proposed.get("from") or "").strip()
+        target = str(proposed.get("to") or "").strip()
+        edge_id = str(proposed.get("id") or f"{source}-to-{target}").strip()
+        if source not in nodes:
+            errors.append({"code": "source_node_not_found", "message": f"source node {source!r} not found in runtime sop", "edge_id": edge_id})
+            continue
+        if target not in nodes:
+            errors.append({"code": "target_node_not_found", "message": f"target node {target!r} not found in runtime sop", "edge_id": edge_id})
+            continue
+        replacement = copy.deepcopy(proposed)
+        replacement["id"] = edge_id
+        replacement["from"] = source
+        replacement["to"] = target
+        existing = next((i for i, item in enumerate(edges) if isinstance(item, dict) and str(item.get("id") or "").strip() == edge_id), None)
+        if existing is None:
+            existing = next((
+                i for i, item in enumerate(edges)
+                if isinstance(item, dict) and str(item.get("from") or "").strip() == source and str(item.get("to") or "").strip() == target
+            ), None)
+        if existing is None:
+            edges.append(replacement)
+            change_count += 1
+        elif edges[existing] != replacement:
+            edges[existing] = replacement
+            change_count += 1
+    if errors:
+        return {
+            "status": "failed",
+            "reason": "workflow draft edges do not match runtime sop nodes",
+            "errors": errors,
+            "workflow_id": workflow_id,
+            "draft_id": draft_dir.name,
+            "draft_path": str(draft_dir),
+        }
+    runtime_doc["edges"] = edges
+    runtime_sop_path = draft_dir / "runtime_sop.yaml"
+    manifest_path = draft_dir / "runtime_sop_result.json"
+    runtime_sop_path.write_text(yaml.safe_dump(runtime_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    before_snapshot = json.dumps(before_edges, ensure_ascii=False, sort_keys=True)
+    after_snapshot = json.dumps(edges, ensure_ascii=False, sort_keys=True)
+    result = {
+        "status": "runtime_sop_ready",
+        "workflow_id": workflow_id,
+        "draft_id": draft_dir.name,
+        "draft_path": str(draft_dir),
+        "runtime_sop_path": str(runtime_sop_path),
+        "runtime_sop_source": str(runtime_sop_file),
+        "edge_count": len(proposed_edges),
+        "change_count": change_count,
+        "hash_before": hashlib.sha256(before_snapshot.encode("utf-8")).hexdigest()[:16] if before_snapshot else "",
+        "hash_after": hashlib.sha256(after_snapshot.encode("utf-8")).hexdigest()[:16] if after_snapshot else "",
+        "active_runtime_sop_changed": False,
+        "production_dag_changed": False,
+        "repo_first_required": False,
+        "message": "workflow draft Runtime SOP snapshot prepared; active sop.yaml is unchanged",
+    }
+    manifest_path.write_text(json.dumps(mask_data(result), ensure_ascii=False, indent=2), encoding="utf-8")
+    draft_manifest = read_json(draft_dir / "workflow_draft.json") or {}
+    draft_manifest["runtime_sop_status"] = "runtime_sop_ready"
+    draft_manifest["runtime_sop_path"] = str(runtime_sop_path)
+    draft_manifest["updated_at"] = _now_iso_utc()
+    draft_manifest["hash_after"] = result["hash_after"]
+    write_json(draft_dir / "workflow_draft.json", draft_manifest)
+    return result
+
+
 def load_workflow_runtime_sop_snapshot(sop, data):
     data = data if isinstance(data, dict) else {}
     simulation_target = str(data.get("simulation_target") or data.get("simulationTarget") or "").strip()
@@ -3758,17 +4046,112 @@ def load_workflow_runtime_sop_snapshot(sop, data):
     return overlay, str(path), None
 
 
+def patch_run_workflow_draft_metadata(sop, pipeline_id, metadata):
+    if not pipeline_id:
+        return {"patched": []}
+    wiki = Path(sop["wiki_local_path"])
+    patched = []
+    targets = [
+        wiki / "raw" / "pipeline-context.json",
+        wiki / "raw" / "pipeline-runs" / pipeline_id / "context.json",
+        wiki / "raw" / "pipeline-runs" / pipeline_id / "run.json",
+    ]
+    for path in targets:
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        if path.name == "run.json":
+            snapshot = data.get("workflow_snapshot") if isinstance(data.get("workflow_snapshot"), dict) else {}
+            data["workflow_snapshot"] = {**snapshot, **metadata}
+            data["workflow_draft_id"] = metadata.get("workflow_draft_id", "")
+            data["run_source"] = "workflow-draft"
+        else:
+            current = data.get("workflow_draft") if isinstance(data.get("workflow_draft"), dict) else {}
+            data["workflow_draft"] = {**current, **metadata}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            patched.append(str(path.relative_to(wiki)))
+        except OSError:
+            continue
+    return {"patched": patched, **metadata}
+
+
+def trigger_workflow_draft_run(sop, workflow_id, data):
+    workflow_id = workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or ""
+    data = data if isinstance(data, dict) else {}
+    draft_id = str(data.get("draft_id") or data.get("draftId") or "").strip()
+    draft_path = str(data.get("draft_path") or data.get("draftPath") or "").strip()
+    draft_dir = resolve_workflow_draft_dir(sop, draft_id, draft_path)
+    if not draft_dir:
+        return 404, {
+            "status": "error",
+            "message": "workflow draft not found",
+            "errors": [{"code": "draft_not_found", "message": "workflow draft path is missing"}],
+        }
+    runtime_sop_path = str(data.get("runtime_sop_path") or data.get("runtimeSopPath") or "").strip()
+    if not runtime_sop_path:
+        runtime_result = read_json(draft_dir / "runtime_sop_result.json") or {}
+        runtime_sop_path = str(runtime_result.get("runtime_sop_path") or "")
+    if not runtime_sop_path or not Path(runtime_sop_path).exists():
+        runtime_result = generate_workflow_draft_runtime_sop(sop, workflow_id, {"draft_id": draft_dir.name, "draft_path": str(draft_dir)})
+        if runtime_result.get("status") == "failed":
+            return 422, runtime_result
+        runtime_sop_path = str(runtime_result.get("runtime_sop_path") or "")
+
+    _overlay, resolved_runtime_sop_path, snapshot_error = load_workflow_runtime_sop_snapshot(sop, {
+        "simulation_target": "runtime-sop",
+        "runtime_sop_path": runtime_sop_path,
+    })
+    if snapshot_error:
+        return 422, snapshot_error
+
+    input_data = data.get("input") if isinstance(data.get("input"), dict) else {}
+    url = str(data.get("url") or input_data.get("url") or "").strip()
+    request_body = {
+        **data,
+        "repo": data.get("repo") or sop.get("repo", ""),
+        "input": {**input_data, "url": url},
+        "url": url,
+        "workflow_id": workflow_id,
+        "workflow_draft_id": draft_dir.name,
+        "workflow_draft_path": str(draft_dir),
+        "runtime_sop_path": resolved_runtime_sop_path,
+        "intent": data.get("intent") or f"workflow draft run: {draft_dir.name}",
+    }
+    status, result = trigger_sop(sop, request_body)
+    pipeline_id = str((result or {}).get("pipeline_id") or "")
+    metadata = {
+        "source": "workflow-draft",
+        "workflow_id": workflow_id,
+        "workflow_draft_id": draft_dir.name,
+        "workflow_draft_path": str(draft_dir),
+        "runtime_sop_path": resolved_runtime_sop_path,
+    }
+    if pipeline_id:
+        result["workflow_draft"] = patch_run_workflow_draft_metadata(sop, pipeline_id, metadata)
+        result["status_url"] = f"/api/sop/{sop['id']}/runs/{pipeline_id}"
+    result["workflow_draft_id"] = draft_dir.name
+    result["runtime_sop_path"] = resolved_runtime_sop_path
+    result["workflow_id"] = workflow_id
+    return status, result
+
+
 def list_workflow_edge_drafts(sop):
     drafts_dir = Path(sop["wiki_local_path"]) / "raw" / "workflow-drafts"
     drafts = []
     if drafts_dir.exists():
         for draft_dir in sorted(drafts_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if draft_dir.is_dir():
+                workflow_draft = read_json(draft_dir / "workflow_draft.json") or {}
                 drafts.append({
                     "draft_id": draft_dir.name,
-                    "draft_type": (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "save_evaluated_edge"),
+                    "draft_type": workflow_draft.get("draft_type") or (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "save_evaluated_edge"),
                     "draft_path": str(draft_dir),
+                    "workflow_draft": workflow_draft,
                     "edge": read_yaml(draft_dir / "edge.yaml"),
+                    "edges": read_yaml(draft_dir / "edges.yaml"),
+                    "edge_validations": read_json(draft_dir / "edge_validations.json") or [],
                     "evaluation": read_json(draft_dir / "evaluation.json") or {},
                     "change_request": read_json(draft_dir / "change_request.json") or {},
                     "validation": read_json(draft_dir / "validation.json") or {},
@@ -10662,7 +11045,19 @@ def trigger_sop(sop, body):
     if not repo or not url:
         return 400, {"status": "error", "message": "repo and input.url are required"}
     env = {**os.environ, "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"}
+    runtime_sop_path = str(body.get("runtime_sop_path") or body.get("runtimeSopPath") or "").strip()
+    if runtime_sop_path:
+        _overlay, resolved_runtime_sop_path, snapshot_error = load_workflow_runtime_sop_snapshot(sop, {
+            "simulation_target": "runtime-sop",
+            "runtime_sop_path": runtime_sop_path,
+        })
+        if snapshot_error:
+            return 422, snapshot_error
+        env["YOUTUBE_WIKI_RUNTIME_SOP_FILE"] = resolved_runtime_sop_path
     command = ["youtube-wiki", "trigger", "--repo", repo, "--wiki-path", sop["wiki_local_path"], "--url", url]
+    intent = str(body.get("intent") or "").strip()
+    if intent:
+        command.extend(["--intent", intent])
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=90)
     if result.returncode != 0:
         return 500, {"status": "error", "message": result.stderr[-1200:] or result.stdout[-1200:]}
@@ -11531,6 +11926,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             http_code, result = simulate_workflow_edge_handoff(sop, path[4], data)
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/drafts  → save full Workflow Draft
+        if (len(path) == 6 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "drafts"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            draft = create_workflow_draft(sop, path[4], data)
+            status = 422 if (draft.get("validation") or {}).get("status") == "failed" else 201
+            return json_response(self, status, draft)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/drafts/runtime-sop
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "drafts" and path[6] == "runtime-sop"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = generate_workflow_draft_runtime_sop(sop, path[4], data)
+            if result.get("status") == "failed":
+                return json_response(self, 422, result)
+            return json_response(self, 200, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/drafts/{draft_id}/runtime-sop
+        if (len(path) == 8 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "drafts" and path[7] == "runtime-sop"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = generate_workflow_draft_runtime_sop(sop, path[4], {**data, "draft_id": path[6]})
+            if result.get("status") == "failed":
+                return json_response(self, 422, result)
+            return json_response(self, 200, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/drafts/{draft_id}/runs
+        if (len(path) == 8 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "drafts" and path[7] == "runs"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = trigger_workflow_draft_run(sop, path[4], {**data, "draft_id": path[6]})
             return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/runs  → trigger
