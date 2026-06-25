@@ -7542,6 +7542,8 @@ def run_workflow_edge_handoff_probe(sop, data, request_payload, relay_package, e
         parsed_response["should_run_real_node"] = True
     else:
         parsed_response.setdefault("should_run_real_node", parsed_response.get("status") == "passed")
+    if parsed_response.get("status") == "needs_review" and parsed_response.get("should_run_real_node") is True and not parsed_response.get("missing_inputs"):
+        parsed_response["status"] = "passed"
     parsed_response.setdefault("summary", "Handoff Probe completed.")
     return parsed_response, {
         "provider": "openai-compatible",
