@@ -3326,7 +3326,9 @@ def proposed_workflow_edge_from_draft(sop, workflow_id, spec):
     relay_mappings = spec.get("relay_mappings")
     if not isinstance(relay_mappings, list):
         relay_mappings = edge.get("relayMappings") if isinstance(edge.get("relayMappings"), list) else []
-    relay_mappings = normalize_relay_mappings(relay_mappings) if relay_mode == "selected_outputs" else []
+    relay_mappings = normalize_relay_mappings(relay_mappings)
+    if not relay_mappings:
+        relay_mappings = workflow_edge_evaluation_relay_mappings(spec)
     guide = evaluation.get("node_execution_guide") if isinstance(evaluation.get("node_execution_guide"), dict) else {}
     return {
         "id": edge_id,
@@ -6544,8 +6546,13 @@ def normalize_relay_mappings(value):
     for item in value:
         if not isinstance(item, dict):
             continue
-        source_output = str(item.get("source_output") or item.get("sourceOutput") or item.get("output") or "").strip()
-        target_input = str(item.get("target_input") or item.get("targetInput") or item.get("input") or "").strip()
+        source_output = str(item.get("source_output") or item.get("sourceOutput") or item.get("output") or item.get("from") or "").strip()
+        target_input = str(item.get("target_input") or item.get("targetInput") or item.get("input") or item.get("to") or "").strip()
+        if ".outputs." in source_output:
+            _source_node, source_output = source_ref_output(source_output)
+        if ".inputs." in target_input:
+            match = re.match(r"^[A-Za-z0-9_-]+\.inputs\.([A-Za-z0-9_.-]+)$", target_input)
+            target_input = match.group(1) if match else target_input
         resolver = str(item.get("resolver") or item.get("resolver_id") or item.get("resolverId") or "").strip()
         if not source_output or not re.match(r"^[A-Za-z0-9_.-]+$", source_output):
             continue
@@ -7109,48 +7116,26 @@ def workflow_edge_instruction_text(data, edge):
     ).strip()
 
 
-def workflow_edge_spec_has_resolver(spec, resolver_id):
-    for resolver in node_input_resolvers(spec if isinstance(spec, dict) else {}):
-        current = str(resolver.get("id") or resolver.get("name") or resolver.get("kind") or resolver.get("type") or "").strip()
-        if current == resolver_id:
-            return True
-    return False
-
-
-def workflow_edge_output_is_json(outputs, output_name):
-    spec = outputs.get(output_name) if isinstance(outputs, dict) else {}
-    spec = spec if isinstance(spec, dict) else {}
-    text = " ".join(str(spec.get(key) or "") for key in ("kind", "type", "value_type", "content_type", "path")).lower()
-    return "json" in text or "metadata" in output_name.lower()
-
-
-def workflow_edge_message_mapping_from_instruction(instruction, outputs, target_spec):
-    if not instruction or not isinstance(outputs, dict):
-        return None
-    lower = instruction.lower()
-    wants_title = "title" in lower or "标题" in instruction
-    wants_description = "description" in lower or "描述" in instruction or "简介" in instruction
-    wants_url = "source_url" in lower or "url" in lower or "链接" in instruction
-    metadata_outputs = [name for name in outputs if workflow_edge_output_is_json(outputs, name)]
-    if wants_title and metadata_outputs and workflow_edge_spec_has_resolver(target_spec, "metadata-title"):
-        return {
-            "source_output": metadata_outputs[0],
-            "target_input": "message",
-            "resolver": "metadata-title",
-        }
-    if wants_description and metadata_outputs and workflow_edge_spec_has_resolver(target_spec, "metadata-description"):
-        return {
-            "source_output": metadata_outputs[0],
-            "target_input": "message",
-            "resolver": "metadata-description",
-        }
-    if wants_url and "source_url" in outputs:
-        return {
-            "source_output": "source_url",
-            "target_input": "message",
-            "resolver": "direct-text" if workflow_edge_spec_has_resolver(target_spec, "direct-text") else "direct",
-        }
-    return None
+def workflow_edge_evaluation_relay_mappings(data):
+    data = data if isinstance(data, dict) else {}
+    candidates = []
+    for source in (
+        data.get("resolved_handoff"),
+        data.get("evaluation"),
+        (data.get("evaluation") or {}).get("resolved_handoff") if isinstance(data.get("evaluation"), dict) else None,
+    ):
+        if not isinstance(source, dict):
+            continue
+        candidates.extend([
+            source.get("relay_mappings"),
+            source.get("relayMappings"),
+            source.get("mappings"),
+        ])
+    for candidate in candidates:
+        rows = normalize_relay_mappings(candidate)
+        if rows:
+            return rows
+    return []
 
 
 def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
@@ -7165,16 +7150,15 @@ def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
         or edge_relay.get("mode")
         or "auto_by_target_inputs"
     ).strip()
-    if relay_mode == "selected_outputs":
-        explicit = normalize_relay_mappings(data.get("relay_mappings") or data.get("relayMappings") or [])
-        if explicit:
-            return explicit
-        edge_mappings = normalize_relay_mappings(edge.get("relayMappings") or [])
-        if edge_mappings:
-            return edge_mappings
-        relay_mappings = normalize_relay_mappings(edge_relay.get("mappings") or edge_relay.get("relay_mappings") or [])
-        if relay_mappings:
-            return relay_mappings
+    explicit = normalize_relay_mappings(data.get("relay_mappings") or data.get("relayMappings") or [])
+    if explicit:
+        return explicit
+    edge_mappings = normalize_relay_mappings(edge.get("relayMappings") or edge.get("relay_mappings") or [])
+    if edge_mappings:
+        return edge_mappings
+    relay_mappings = normalize_relay_mappings(edge_relay.get("mappings") or edge_relay.get("relay_mappings") or [])
+    if relay_mappings:
+        return relay_mappings
     edge_bindings = edge_contract_relay_mappings(sop, edge)
     if edge_bindings:
         return edge_bindings
@@ -7184,11 +7168,13 @@ def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
     sop_edge_mappings = edge_contract_relay_mappings(sop, sop_edge)
     if sop_edge_mappings:
         return sop_edge_mappings
-    instruction = workflow_edge_instruction_text(data, edge)
     outputs = upstream.get("outputs") if isinstance(upstream.get("outputs"), dict) else {}
     required = downstream.get("inputs") if isinstance(downstream.get("inputs"), dict) else {}
     optional = downstream.get("optional_inputs") if isinstance(downstream.get("optional_inputs"), dict) else {}
     mappings = []
+    evaluation_mappings = workflow_edge_evaluation_relay_mappings(data)
+    if evaluation_mappings:
+        return evaluation_mappings
     target_inputs = {**optional, **required}
     for input_name, spec in target_inputs.items():
         spec = spec if isinstance(spec, dict) else {}
@@ -7207,11 +7193,6 @@ def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
                 "resolver": "direct",
             })
             continue
-        if input_name in {"message", "message_payload", "payload", "content", "text", "summary"}:
-            message_mapping = workflow_edge_message_mapping_from_instruction(instruction, outputs, spec)
-            if message_mapping:
-                message_mapping["target_input"] = input_name
-                mappings.append(message_mapping)
     return mappings
 
 

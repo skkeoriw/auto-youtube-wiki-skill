@@ -51,10 +51,19 @@ class WorkflowEdgeSimulationTest(unittest.TestCase):
             },
         }
 
-    def test_instruction_maps_metadata_title_to_tg_message(self):
+    def test_evaluation_mapping_maps_metadata_title_to_tg_message(self):
         upstream = self.youtube_fetch_node()
         downstream = self.tg_notify_node()
-        data = {"edge_handoff_instruction": "从 metadata_file 读取 title 作为 Telegram message。"}
+        data = {
+            "edge_handoff_instruction": "从 metadata_file 读取 title 作为 Telegram message。",
+            "evaluation": {
+                "resolved_handoff": {
+                    "relay_mappings": [
+                        {"source_output": "metadata_file", "target_input": "message", "resolver": "metadata-title"},
+                    ],
+                },
+            },
+        }
 
         mappings = bridge.workflow_edge_simulation_mappings({}, data, upstream, downstream)
         fixture = bridge.workflow_edge_generated_fixture(upstream)
@@ -68,10 +77,35 @@ class WorkflowEdgeSimulationTest(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertEqual(rows[0]["value"], "Generated fixture video title")
 
-    def test_metadata_title_mapping_blocks_when_title_is_missing(self):
+    def test_instruction_without_mapping_does_not_guess_generic_message_input(self):
         upstream = self.youtube_fetch_node()
         downstream = self.tg_notify_node()
         data = {"edge_handoff_instruction": "从 metadata_file 读取 title 作为 Telegram message。"}
+
+        mappings = bridge.workflow_edge_simulation_mappings({}, data, upstream, downstream)
+        fixture = bridge.workflow_edge_generated_fixture(upstream)
+        _rows, missing, _fallback_failures, target_resolutions = bridge.workflow_edge_resolve_simulation_inputs(
+            fixture,
+            downstream,
+            mappings,
+        )
+
+        self.assertEqual(mappings, [])
+        self.assertEqual(missing[0]["input"], "message")
+        self.assertFalse(target_resolutions[0]["resolved"])
+
+    def test_metadata_title_mapping_blocks_when_title_is_missing(self):
+        upstream = self.youtube_fetch_node()
+        downstream = self.tg_notify_node()
+        data = {
+            "evaluation": {
+                "resolved_handoff": {
+                    "relay_mappings": [
+                        {"source_output": "metadata_file", "target_input": "message", "resolver": "metadata-title"},
+                    ],
+                },
+            },
+        }
 
         mappings = bridge.workflow_edge_simulation_mappings({}, data, upstream, downstream)
         fixture = bridge.workflow_edge_generated_fixture(upstream)
@@ -155,6 +189,42 @@ class WorkflowEdgeSimulationTest(unittest.TestCase):
         self.assertNotIn("index", item["inputs"])
         self.assertIn("index", item["optional_inputs"])
         self.assertFalse(item["optional_inputs"]["index"]["required"])
+
+    def test_edge_draft_persists_agent_relay_mappings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki = Path(tmp)
+            sop = {
+                "id": "test-instance",
+                "wiki_local_path": str(wiki),
+                "nodes": {
+                    "youtube-fetch": {"title": "YouTube Fetch", "outputs": {"metadata_file": "raw/metadata.json"}},
+                    "tg-notify": {"title": "TG Notify", "inputs": {"message": {"from": "edge.message"}}},
+                },
+            }
+            result = bridge.create_workflow_edge_draft(sop, "youtube-research-wiki", {
+                "edge_handoff_instruction": "Use the evaluated relay mapping.",
+                "edge": {
+                    "id": "youtube-fetch-to-tg-notify",
+                    "from": "youtube-fetch",
+                    "to": "tg-notify",
+                },
+                "evaluation": {
+                    "status": "trial_ready",
+                    "agent": {"used_ai": True},
+                    "node_execution_guide": {"format": "markdown", "prompt": "Use skill sop-tg-notify."},
+                    "resolved_handoff": {
+                        "relay_mappings": [
+                            {"from": "youtube-fetch.outputs.metadata_file", "to": "tg-notify.inputs.message", "resolver": "metadata-title"},
+                        ],
+                    },
+                },
+            })
+
+        self.assertEqual(result["validation"]["status"], "passed")
+        self.assertEqual(
+            result["edge"]["relay"]["mappings"],
+            [{"source_output": "metadata_file", "target_input": "message", "resolver": "metadata-title"}],
+        )
 
 
 if __name__ == "__main__":
