@@ -7538,7 +7538,7 @@ def run_workflow_edge_handoff_probe(sop, data, request_payload, relay_package, e
         parsed_response["status"] = "needs_review"
     parsed_response.setdefault("missing_inputs", relay_package.get("missing_inputs") or [])
     parsed_response.setdefault("risks", [])
-    if parsed_response.get("status") == "passed" and not parsed_response.get("missing_inputs") and not parsed_response.get("risks"):
+    if parsed_response.get("status") == "passed" and not parsed_response.get("missing_inputs"):
         parsed_response["should_run_real_node"] = True
     else:
         parsed_response.setdefault("should_run_real_node", parsed_response.get("status") == "passed")
