@@ -5851,8 +5851,8 @@ def edge_handoff_evaluator_env(sop, data):
         env["EDGE_HANDOFF_LLM_API_KEY"] = str(api_key.get("value"))
     if not is_blank_value(model.get("value")):
         env["EDGE_HANDOFF_LLM_MODEL"] = str(model.get("value"))
-    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "120")
-    env.setdefault("EDGE_HANDOFF_LLM_MAX_TOKENS", "2048")
+    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "18")
+    env.setdefault("EDGE_HANDOFF_LLM_MAX_TOKENS", "1024")
     return env, {
         "base_url": env_config_item(
             base_url.get("key") or "EDGE_HANDOFF_LLM_BASE_URL",
@@ -5883,9 +5883,9 @@ def edge_handoff_evaluator_env(sop, data):
 def edge_handoff_model_lookup(context):
     groups = [
         ["EDGE_HANDOFF_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", [])],
-        ["WIKI_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", [])],
         ["HERMES_MODEL", *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", [])],
         ["WIKI_DEEPSEEK_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", [])],
+        ["WIKI_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", [])],
     ]
     for group in groups:
         resolved = node_run_config_lookup(context, group[0], group[1:])
@@ -5918,7 +5918,44 @@ def evaluate_edge_handoff(sop, workflow_id, data):
         command = ["python3", str(script), "--request-json", str(request_path), "--output-json", str(output_path), "--require-ai"]
         if allow_deterministic:
             command.append("--allow-deterministic")
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "180") or "180"), env=evaluator_env)
+        evaluator_timeout = int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "22") or "22")
+        try:
+            completed = subprocess.run(command, text=True, capture_output=True, timeout=evaluator_timeout, env=evaluator_env)
+        except subprocess.TimeoutExpired as exc:
+            return 504, {
+                "ok": False,
+                "sop_id": sop.get("id", ""),
+                "workflow_id": request_payload.get("workflow_id", ""),
+                "edge_id": request_payload.get("edge_id", ""),
+                "mode": "edge-handoff-agent-evaluation",
+                "request": request_payload,
+                "config": evaluator_config,
+                "evaluation": {
+                    "status": "blocked",
+                    "summary": f"Edge Handoff Agent timed out after {evaluator_timeout}s.",
+                    "blocking_reasons": [
+                        {
+                            "code": "edge_handoff_timeout",
+                            "message": "The LLM evaluation did not finish within the public runtime timeout budget.",
+                        }
+                    ],
+                    "required_user_inputs": [
+                        {
+                            "field": "EDGE_HANDOFF_LLM_MODEL",
+                            "question": "Use a faster Edge Handoff model or reduce the prompt/output budget.",
+                        }
+                    ],
+                    "agent": {
+                        "provider": "openai-compatible",
+                        "model": evaluator_config.get("model", {}).get("value", ""),
+                        "used_ai": False,
+                    },
+                    "node_execution_guide": {"format": "markdown", "prompt": ""},
+                    "test_plan": ["Fix Edge Handoff LLM timeout/model config and rerun evaluation."],
+                    "resolved_handoff": {},
+                },
+                "stderr": str(exc)[-4000:],
+            }
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
         if output_path.is_file():
