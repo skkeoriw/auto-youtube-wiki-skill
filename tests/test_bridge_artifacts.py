@@ -1746,7 +1746,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             "out=args[args.index('--output-json')+1]\n"
             "assert os.environ.get('EDGE_HANDOFF_LLM_BASE_URL') == 'https://api-proxy.example/v1'\n"
             "assert os.environ.get('EDGE_HANDOFF_LLM_API_KEY') == 'secret-edge-key'\n"
-            "assert os.environ.get('EDGE_HANDOFF_LLM_MODEL') == 'deepseek-v4-flash'\n"
+            "assert os.environ.get('EDGE_HANDOFF_LLM_MODEL') == 'deepseek-v4-pro'\n"
             "evaluation={'status':'needs_instruction','summary':'fake ai eval','node_execution_guide':{'format':'markdown','prompt':''},'agent':{'used_ai':True}}\n"
             "json.dump(evaluation, open(out,'w',encoding='utf-8'))\n"
             "print(json.dumps(evaluation))\n",
@@ -1783,7 +1783,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(response["request"]["downstream"]["skill_id"], "sop-tg-notify")
         self.assertEqual(response["config"]["base_url"]["value"], "https://api-proxy.example/v1")
         self.assertEqual(response["config"]["api_key"]["masked_value"], "sec***key")
-        self.assertEqual(response["config"]["model"]["value"], "deepseek-v4-flash")
+        self.assertEqual(response["config"]["model"]["value"], "deepseek-v4-pro")
         self.assertNotIn("secret-edge-key", json.dumps(response["config"]))
 
     def test_workflow_edge_draft_route_requires_ai_approved_evaluation(self):

@@ -6621,9 +6621,9 @@ def edge_handoff_evaluator_env(sop, data):
 def edge_handoff_model_lookup(context):
     groups = [
         ["EDGE_HANDOFF_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", [])],
+        ["WIKI_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", [])],
         ["HERMES_MODEL", *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", [])],
         ["WIKI_DEEPSEEK_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", [])],
-        ["WIKI_LLM_MODEL", *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", [])],
     ]
     for group in groups:
         resolved = node_run_config_lookup(context, group[0], group[1:])
