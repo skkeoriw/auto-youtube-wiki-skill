@@ -7419,9 +7419,28 @@ def parse_probe_agent_json(raw_text):
 def run_workflow_edge_handoff_probe(sop, data, request_payload, relay_package, evaluation, hermes_request):
     evaluator_env, evaluator_config = edge_handoff_evaluator_env(sop, data)
     missing_config = []
-    base_url = str(evaluator_env.get("EDGE_HANDOFF_LLM_BASE_URL") or evaluator_config.get("base_url", {}).get("value") or "").rstrip("/")
-    api_key = str(evaluator_env.get("EDGE_HANDOFF_LLM_API_KEY") or "").strip()
-    model = str(evaluator_env.get("EDGE_HANDOFF_LLM_MODEL") or evaluator_config.get("model", {}).get("value") or "").strip() or "deepseek-v4-flash"
+    base_url = str(
+        evaluator_env.get("EDGE_HANDOFF_LLM_BASE_URL")
+        or evaluator_env.get("HERMES_MODEL_BASE_URL")
+        or evaluator_env.get("WIKI_LLM_BASE_URL")
+        or evaluator_config.get("base_url", {}).get("value")
+        or ""
+    ).rstrip("/")
+    api_key = str(
+        evaluator_env.get("EDGE_HANDOFF_LLM_API_KEY")
+        or evaluator_env.get("HERMES_OPENAI_API_KEY")
+        or evaluator_env.get("OPENAI_API_KEY")
+        or evaluator_env.get("WIKI_LLM_API_KEY")
+        or ""
+    ).strip()
+    model = str(
+        evaluator_env.get("EDGE_HANDOFF_LLM_MODEL")
+        or evaluator_env.get("HERMES_MODEL")
+        or evaluator_env.get("WIKI_DEEPSEEK_MODEL")
+        or evaluator_env.get("WIKI_LLM_MODEL")
+        or evaluator_config.get("model", {}).get("value")
+        or ""
+    ).strip() or "deepseek-v4-flash"
     if not base_url:
         missing_config.append("base_url")
     if not api_key:
