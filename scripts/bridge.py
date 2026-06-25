@@ -6791,6 +6791,36 @@ def edge_handoff_request_payload(sop, workflow_id, data):
     }
 
 
+def workflow_edge_signature_payload(request_payload):
+    request_payload = request_payload if isinstance(request_payload, dict) else {}
+    edge = request_payload.get("edge") if isinstance(request_payload.get("edge"), dict) else {}
+    return {
+        "edge_id": request_payload.get("edge_id") or edge.get("id") or "",
+        "workflow_id": request_payload.get("workflow_id") or "",
+        "upstream_node_id": (request_payload.get("upstream") or {}).get("node_id") if isinstance(request_payload.get("upstream"), dict) else "",
+        "downstream_node_id": (request_payload.get("downstream") or {}).get("node_id") if isinstance(request_payload.get("downstream"), dict) else "",
+        "edge_handoff_instruction": request_payload.get("edge_handoff_instruction") or "",
+        "relay_mode": edge.get("relayMode") or edge.get("relay_mode") or "",
+        "relay_mappings": edge.get("relayMappings") or edge.get("relay_mappings") or [],
+        "edge": edge,
+    }
+
+
+def workflow_edge_stable_signature(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def workflow_edge_instruction_signature(request_payload):
+    return workflow_edge_stable_signature({
+        "edge_handoff_instruction": (request_payload or {}).get("edge_handoff_instruction") or "",
+    })
+
+
+def workflow_edge_edge_signature(request_payload):
+    return workflow_edge_stable_signature(workflow_edge_signature_payload(request_payload))
+
+
 def edge_handoff_evaluator_env(sop, data):
     context = node_run_config_context(data, sop)
     base_url = node_run_config_lookup(context, "EDGE_HANDOFF_LLM_BASE_URL", [
@@ -6936,6 +6966,10 @@ def evaluate_edge_handoff(sop, workflow_id, data):
                     "blocking_reasons": [{"code": "invalid_evaluator_output", "message": stderr or stdout[-1000:]}],
                 }
         http_status = 200 if completed.returncode == 0 else 500
+        if isinstance(evaluation, dict):
+            evaluation.setdefault("evaluated_instruction_signature", workflow_edge_instruction_signature(request_payload))
+            evaluation.setdefault("evaluated_edge_signature", workflow_edge_edge_signature(request_payload))
+            evaluation.setdefault("evaluated_instruction", request_payload.get("edge_handoff_instruction") or "")
         return http_status, {
             "ok": completed.returncode == 0,
             "sop_id": sop.get("id", ""),
@@ -7302,6 +7336,180 @@ def workflow_edge_hermes_request_preview(request_payload, relay_package, evaluat
     ]).strip() + "\n"
 
 
+def workflow_edge_probe_prompt(request_payload, relay_package, evaluation=None):
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    guide = evaluation.get("node_execution_guide") if isinstance(evaluation.get("node_execution_guide"), dict) else {}
+    guide_prompt = str(guide.get("prompt") or "").strip() or "No approved Node Execution Guide is available yet."
+    downstream = request_payload.get("downstream") if isinstance(request_payload.get("downstream"), dict) else {}
+    upstream = request_payload.get("upstream") if isinstance(request_payload.get("upstream"), dict) else {}
+    return "\n".join([
+        "You are the downstream SOP Agent running a Handoff Probe.",
+        "Do not execute the real downstream skill. Do not call external APIs. Do not write files.",
+        "Only inspect the supplied upstream fixture, relay package, Edge instruction, and Node Execution Guide.",
+        "Return strict JSON only with keys: status, understood_primary_input, understood_supporting_inputs, missing_inputs, risks, downstream_execution_plan, should_run_real_node, summary.",
+        "",
+        "Runtime context:",
+        f"- runtime_id: {request_payload.get('runtime_id') or ''}",
+        f"- instance_id: {request_payload.get('instance_id') or ''}",
+        f"- workflow_id: {request_payload.get('workflow_id') or ''}",
+        f"- edge_id: {request_payload.get('edge_id') or ''}",
+        "",
+        "Edge:",
+        f"- upstream: {upstream.get('node_id') or ''}",
+        f"- downstream: {downstream.get('node_id') or ''}",
+        f"- instruction: {request_payload.get('edge_handoff_instruction') or ''}",
+        "",
+        "Downstream skill:",
+        f"- skill_id: {downstream.get('skill_id') or downstream.get('node_id') or ''}",
+        f"- title: {downstream.get('title') or ''}",
+        f"- required_inputs: {json.dumps(downstream.get('inputs') or {}, ensure_ascii=False)}",
+        "",
+        "Relay package:",
+        "```json",
+        json.dumps(mask_data(relay_package), ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "Node Execution Guide:",
+        guide_prompt,
+    ]).strip() + "\n"
+
+
+def deterministic_handoff_probe(request_payload, relay_package, evaluation=None, reason=""):
+    missing = relay_package.get("missing_inputs") if isinstance(relay_package.get("missing_inputs"), list) else []
+    resolved = relay_package.get("resolved_inputs") if isinstance(relay_package.get("resolved_inputs"), list) else []
+    primary = resolved[0] if resolved else {}
+    status = "blocked" if missing else "passed"
+    risks = []
+    if reason:
+        risks.append(reason)
+    if not (evaluation or {}).get("node_execution_guide"):
+        risks.append("No approved Node Execution Guide was supplied to the probe.")
+        if status == "passed":
+            status = "needs_review"
+    return {
+        "status": status,
+        "understood_primary_input": primary,
+        "understood_supporting_inputs": resolved[1:],
+        "missing_inputs": missing,
+        "risks": risks,
+        "downstream_execution_plan": "Use the resolved primary input from the relay package, then execute the downstream skill only after this probe is accepted.",
+        "should_run_real_node": status == "passed",
+        "summary": "Deterministic probe result based on resolved relay inputs.",
+    }
+
+
+def parse_probe_agent_json(raw_text):
+    raw_text = str(raw_text or "").strip()
+    if not raw_text:
+        return {}
+    try:
+        parsed = json.loads(raw_text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", raw_text)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def run_workflow_edge_handoff_probe(sop, data, request_payload, relay_package, evaluation, hermes_request):
+    evaluator_env, evaluator_config = edge_handoff_evaluator_env(sop, data)
+    missing_config = []
+    base_url = str(evaluator_config.get("base_url", {}).get("value") or "").rstrip("/")
+    api_key = str(evaluator_config.get("api_key", {}).get("value") or "").strip()
+    model = str(evaluator_config.get("model", {}).get("value") or "").strip() or "deepseek-v4-flash"
+    if not base_url:
+        missing_config.append("base_url")
+    if not api_key:
+        missing_config.append("api_key")
+    probe_prompt = workflow_edge_probe_prompt(request_payload, relay_package, evaluation)
+    if missing_config:
+        probe = deterministic_handoff_probe(
+            request_payload,
+            relay_package,
+            evaluation,
+            reason=f"Handoff Probe LLM config missing: {', '.join(missing_config)}",
+        )
+        probe["status"] = "blocked"
+        return probe, {
+            "provider": "openai-compatible",
+            "model": model,
+            "used_ai": False,
+            "config": evaluator_config,
+            "error": f"Handoff Probe LLM config missing: {', '.join(missing_config)}",
+            "prompt": probe_prompt,
+            "response": "",
+        }
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a precise SOP handoff probe agent. Return strict JSON only."},
+            {"role": "user", "content": probe_prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": int(evaluator_env.get("EDGE_HANDOFF_LLM_MAX_TOKENS", "2048") or "2048"),
+        "stream": False,
+    }
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    started = time.time()
+    try:
+        with urllib.request.urlopen(request, timeout=int(evaluator_env.get("EDGE_HANDOFF_LLM_TIMEOUT", "22") or "22")) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        probe = deterministic_handoff_probe(request_payload, relay_package, evaluation, reason=str(exc))
+        probe["status"] = "blocked"
+        return probe, {
+            "provider": "openai-compatible",
+            "model": model,
+            "used_ai": False,
+            "config": evaluator_config,
+            "error": str(exc),
+            "prompt": probe_prompt,
+            "response": "",
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+    parsed_response = {}
+    try:
+        response_json = json.loads(response_text)
+        choices = response_json.get("choices") if isinstance(response_json, dict) else []
+        if choices and isinstance(choices[0], dict):
+            parsed_response = parse_probe_agent_json(((choices[0].get("message") or {}).get("content") or choices[0].get("text") or ""))
+    except Exception:
+        parsed_response = parse_probe_agent_json(response_text)
+    if not parsed_response:
+        parsed_response = deterministic_handoff_probe(request_payload, relay_package, evaluation, reason="Probe agent did not return parseable JSON.")
+        parsed_response["status"] = "needs_review"
+    status = str(parsed_response.get("status") or "").strip()
+    if status not in {"passed", "needs_review", "blocked"}:
+        parsed_response["status"] = "needs_review"
+    parsed_response.setdefault("should_run_real_node", parsed_response.get("status") == "passed")
+    parsed_response.setdefault("missing_inputs", relay_package.get("missing_inputs") or [])
+    parsed_response.setdefault("risks", [])
+    parsed_response.setdefault("summary", "Handoff Probe completed.")
+    return parsed_response, {
+        "provider": "openai-compatible",
+        "model": model,
+        "used_ai": True,
+        "config": evaluator_config,
+        "prompt": probe_prompt,
+        "response": response_text[-8000:],
+        "latency_ms": int((time.time() - started) * 1000),
+    }
+
+
 def simulate_workflow_edge_handoff(sop, workflow_id, data):
     data = data if isinstance(data, dict) else {}
     if workflow_id and not workflow_id_matches(sop, workflow_id):
@@ -7343,15 +7551,21 @@ def simulate_workflow_edge_handoff(sop, workflow_id, data):
     relay_package = workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missing, fallback_failures, target_resolutions)
     evaluation = data.get("evaluation") if isinstance(data.get("evaluation"), dict) else {}
     hermes_request = workflow_edge_hermes_request_preview(request_payload, relay_package, evaluation)
+    probe_requested = str(data.get("mode") or data.get("simulation_mode") or data.get("probe_mode") or "").replace("_", "-") in {"handoff-probe", "probe"} or bool(data.get("handoff_probe"))
     status = "passed" if not missing else "blocked"
+    probe_result = {}
+    probe_trace = {}
+    if probe_requested and not missing:
+        probe_result, probe_trace = run_workflow_edge_handoff_probe(sop, data, request_payload, relay_package, evaluation, hermes_request)
+        status = str(probe_result.get("status") or status)
     return 200, {
         "ok": status == "passed",
-        "mode": "edge-handoff-simulation",
+        "mode": "edge-handoff-probe" if probe_requested else "edge-handoff-simulation",
         "simulation_target": "runtime-sop" if runtime_sop_path else "edge-draft",
         "runtime_sop_path": runtime_sop_path,
         "simulation_id": f"{slugify(request_payload.get('edge_id') or 'edge')}-simulation-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
         "status": status,
-        "verdict": "can_handoff" if status == "passed" else "missing_required_input",
+        "verdict": "can_handoff" if status == "passed" else ("needs_review" if status == "needs_review" else "missing_required_input"),
         "sop_id": sop.get("id", ""),
         "workflow_id": request_payload.get("workflow_id", ""),
         "edge_id": request_payload.get("edge_id", ""),
@@ -7370,9 +7584,11 @@ def simulate_workflow_edge_handoff(sop, workflow_id, data):
         "hermes_request_preview": {
             "format": "markdown",
             "prompt": hermes_request,
-            "source": "edge-handoff-simulation",
+            "source": "edge-handoff-probe" if probe_requested else "edge-handoff-simulation",
             "executes_real_node": False,
         },
+        "handoff_probe": probe_result,
+        "probe_trace": probe_trace,
         "warnings": (
             ["Simulation did not satisfy every required downstream input."] if missing else []
         ) + ([
