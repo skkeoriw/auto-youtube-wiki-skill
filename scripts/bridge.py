@@ -3273,10 +3273,11 @@ def proposed_workflow_edge_from_draft(sop, workflow_id, spec):
     downstream = str(spec.get("downstream_node_id") or edge.get("to") or edge.get("target") or "").strip()
     edge_id = slugify(spec.get("edge_id") or edge.get("id") or f"{upstream}-to-{downstream}")
     instruction = str(spec.get("edge_handoff_instruction") or edge.get("instruction") or "").strip()
+    relay_mode = str(spec.get("relay_mode") or edge.get("relayMode") or "auto_by_target_inputs")
     relay_mappings = spec.get("relay_mappings")
     if not isinstance(relay_mappings, list):
         relay_mappings = edge.get("relayMappings") if isinstance(edge.get("relayMappings"), list) else []
-    relay_mode = str(spec.get("relay_mode") or edge.get("relayMode") or "auto_by_target_inputs")
+    relay_mappings = normalize_relay_mappings(relay_mappings) if relay_mode == "selected_outputs" else []
     guide = evaluation.get("node_execution_guide") if isinstance(evaluation.get("node_execution_guide"), dict) else {}
     return {
         "id": edge_id,
@@ -6287,17 +6288,26 @@ def workflow_edge_generated_fixture(upstream):
 
 def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
     data = data if isinstance(data, dict) else {}
-    explicit = normalize_relay_mappings(data.get("relay_mappings") or data.get("relayMappings") or [])
-    if explicit:
-        return explicit
     edge = data.get("edge") if isinstance(data.get("edge"), dict) else {}
-    edge_mappings = normalize_relay_mappings(edge.get("relayMappings") or [])
-    if edge_mappings:
-        return edge_mappings
     edge_relay = edge.get("relay") if isinstance(edge.get("relay"), dict) else {}
-    relay_mappings = normalize_relay_mappings(edge_relay.get("mappings") or edge_relay.get("relay_mappings") or [])
-    if relay_mappings:
-        return relay_mappings
+    relay_mode = str(
+        data.get("relay_mode")
+        or data.get("relayMode")
+        or edge.get("relayMode")
+        or edge.get("relay_mode")
+        or edge_relay.get("mode")
+        or "auto_by_target_inputs"
+    ).strip()
+    if relay_mode == "selected_outputs":
+        explicit = normalize_relay_mappings(data.get("relay_mappings") or data.get("relayMappings") or [])
+        if explicit:
+            return explicit
+        edge_mappings = normalize_relay_mappings(edge.get("relayMappings") or [])
+        if edge_mappings:
+            return edge_mappings
+        relay_mappings = normalize_relay_mappings(edge_relay.get("mappings") or edge_relay.get("relay_mappings") or [])
+        if relay_mappings:
+            return relay_mappings
     edge_bindings = edge_contract_relay_mappings(sop, edge)
     if edge_bindings:
         return edge_bindings
@@ -6419,23 +6429,74 @@ def workflow_edge_resolve_simulation_inputs(fixture, downstream, mappings):
             "reason": "" if resolved else reason,
         }
         rows.append(row)
-    mapped_targets = {str(item.get("target_input") or "") for item in rows}
+    by_target = {}
+    for row in rows:
+        target = str(row.get("target_input") or "")
+        if not target:
+            continue
+        by_target.setdefault(target, []).append(row)
+    target_resolutions = []
+    fallback_failures = []
+    mapped_targets = set(by_target.keys())
     for input_name in required.keys():
         if input_name not in mapped_targets:
             missing.append({
                 "input": input_name,
                 "reason": "No relay mapping resolved this required downstream input.",
             })
-    for row in rows:
-        if row.get("required") and not row.get("resolved"):
-            missing.append({
-                "input": row.get("target_input"),
-                "reason": row.get("reason") or f"Mapped source output {row.get('source_output')!r} is not available in upstream fixture.",
+            target_resolutions.append({
+                "target_input": input_name,
+                "required": True,
+                "resolved": False,
+                "attempts": [],
+                "reason": "No relay mapping resolved this required downstream input.",
             })
-    return rows, missing
+    for target_input, attempts in by_target.items():
+        required_flag = target_input in required
+        success = next((row for row in attempts if row.get("resolved")), None)
+        failed = [row for row in attempts if not row.get("resolved")]
+        if success:
+            for row in failed:
+                fallback_failures.append({
+                    "target_input": target_input,
+                    "source_output": row.get("source_output"),
+                    "resolver": row.get("resolver"),
+                    "reason": row.get("reason") or "fallback mapping did not resolve",
+                    "blocking": False,
+                })
+        elif required_flag:
+            reason = "; ".join([
+                f"{row.get('source_output') or '?'} via {row.get('resolver') or 'resolver'}: {row.get('reason') or 'not resolved'}"
+                for row in attempts
+            ]) or "No relay mapping resolved this required downstream input."
+            missing.append({
+                "input": target_input,
+                "reason": reason,
+            })
+        else:
+            for row in failed:
+                fallback_failures.append({
+                    "target_input": target_input,
+                    "source_output": row.get("source_output"),
+                    "resolver": row.get("resolver"),
+                    "reason": row.get("reason") or "optional mapping did not resolve",
+                    "blocking": False,
+                })
+        target_resolutions.append({
+            "target_input": target_input,
+            "required": required_flag,
+            "resolved": bool(success),
+            "resolved_source_output": success.get("source_output") if success else "",
+            "resolver": success.get("resolver") if success else "",
+            "attempts": attempts,
+            "reason": "" if success else (missing[-1].get("reason") if required_flag and missing else "not resolved"),
+        })
+    return rows, missing, fallback_failures, target_resolutions
 
 
-def workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missing):
+def workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missing, fallback_failures=None, target_resolutions=None):
+    fallback_failures = fallback_failures if isinstance(fallback_failures, list) else []
+    target_resolutions = target_resolutions if isinstance(target_resolutions, list) else []
     return {
         "edge_id": request_payload.get("edge_id") or "",
         "source_node": (request_payload.get("upstream") or {}).get("node_id") if isinstance(request_payload.get("upstream"), dict) else "",
@@ -6454,6 +6515,8 @@ def workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missi
             for row in resolved_inputs
         ],
         "missing_inputs": missing,
+        "fallback_failures": fallback_failures,
+        "target_resolutions": target_resolutions,
         "fixture": fixture,
     }
 
@@ -6530,8 +6593,8 @@ def simulate_workflow_edge_handoff(sop, workflow_id, data):
         }
     fixture = workflow_edge_generated_fixture(upstream)
     mappings = workflow_edge_simulation_mappings(sop, data, upstream, downstream)
-    resolved_inputs, missing = workflow_edge_resolve_simulation_inputs(fixture, downstream, mappings)
-    relay_package = workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missing)
+    resolved_inputs, missing, fallback_failures, target_resolutions = workflow_edge_resolve_simulation_inputs(fixture, downstream, mappings)
+    relay_package = workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missing, fallback_failures, target_resolutions)
     evaluation = data.get("evaluation") if isinstance(data.get("evaluation"), dict) else {}
     hermes_request = workflow_edge_hermes_request_preview(request_payload, relay_package, evaluation)
     status = "passed" if not missing else "blocked"
@@ -6555,6 +6618,8 @@ def simulate_workflow_edge_handoff(sop, workflow_id, data):
         "relay_mappings": mappings,
         "relay_package": relay_package,
         "resolved_inputs": resolved_inputs,
+        "target_resolutions": target_resolutions,
+        "fallback_failures": fallback_failures,
         "missing_inputs": missing,
         "hermes_request_preview": {
             "format": "markdown",
@@ -6562,7 +6627,11 @@ def simulate_workflow_edge_handoff(sop, workflow_id, data):
             "source": "edge-handoff-simulation",
             "executes_real_node": False,
         },
-        "warnings": [] if not missing else ["Simulation did not satisfy every required downstream input."],
+        "warnings": (
+            ["Simulation did not satisfy every required downstream input."] if missing else []
+        ) + ([
+            "Some fallback relay mappings did not resolve, but required inputs were satisfied."
+        ] if fallback_failures and not missing else []),
         "blocking_reasons": missing,
     }
 

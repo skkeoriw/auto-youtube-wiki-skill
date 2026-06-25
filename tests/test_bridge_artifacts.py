@@ -2064,6 +2064,150 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertTrue(resolved["resolved"])
         self.assertEqual(resolved["value"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
+    def test_workflow_edge_simulation_primary_success_with_fallback_failure_passes(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-fetch"] = {
+            "title": "YouTube Fetch",
+            "outputs": {
+                "source_url": {"kind": "scalar", "value_type": "url"},
+                "metadata_file": {"kind": "file", "value_type": "json"},
+            },
+        }
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "inputs": {
+                "source_url": {
+                    "kind": "scalar",
+                    "value_type": "url",
+                    "required": True,
+                    "resolvers": [
+                        {"id": "direct-url", "kind": "direct"},
+                    ],
+                },
+            },
+        }
+
+        code, simulation = bridge.simulate_workflow_edge_handoff(sop, "youtube-research-wiki", {
+            "edge_id": "youtube-fetch-to-youtube-deep-research",
+            "edge": {"id": "youtube-fetch-to-youtube-deep-research", "from": "youtube-fetch", "to": "youtube-deep-research"},
+            "upstream_node_id": "youtube-fetch",
+            "downstream_node_id": "youtube-deep-research",
+            "relay_mode": "selected_outputs",
+            "relay_mappings": [
+                {"sourceOutput": "source_url", "targetInput": "source_url", "resolver": "direct-url"},
+                {"sourceOutput": "metadata_file", "targetInput": "source_url", "resolver": "direct-url"},
+            ],
+            "input_source": "generated-fixture",
+        })
+
+        self.assertEqual(code, 200)
+        self.assertEqual(simulation["status"], "passed")
+        self.assertEqual(simulation["missing_inputs"], [])
+        self.assertEqual(len(simulation["fallback_failures"]), 1)
+        self.assertEqual(simulation["fallback_failures"][0]["source_output"], "metadata_file")
+        self.assertIn("fallback", simulation["warnings"][0].lower())
+        target = next(item for item in simulation["target_resolutions"] if item["target_input"] == "source_url")
+        self.assertTrue(target["resolved"])
+        self.assertEqual(target["resolved_source_output"], "source_url")
+
+    def test_workflow_edge_simulation_blocks_when_all_required_mappings_fail(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-fetch"] = {
+            "title": "YouTube Fetch",
+            "outputs": {
+                "metadata_file": {"kind": "file", "value_type": "json"},
+            },
+        }
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "inputs": {
+                "source_url": {
+                    "kind": "scalar",
+                    "value_type": "url",
+                    "required": True,
+                    "resolvers": [{"id": "direct-url", "kind": "direct"}],
+                },
+            },
+        }
+
+        code, simulation = bridge.simulate_workflow_edge_handoff(sop, "youtube-research-wiki", {
+            "edge_id": "youtube-fetch-to-youtube-deep-research",
+            "edge": {"id": "youtube-fetch-to-youtube-deep-research", "from": "youtube-fetch", "to": "youtube-deep-research"},
+            "upstream_node_id": "youtube-fetch",
+            "downstream_node_id": "youtube-deep-research",
+            "relay_mode": "selected_outputs",
+            "relay_mappings": [
+                {"sourceOutput": "metadata_file", "targetInput": "source_url", "resolver": "direct-url"},
+            ],
+            "input_source": "generated-fixture",
+        })
+
+        self.assertEqual(code, 200)
+        self.assertEqual(simulation["status"], "blocked")
+        self.assertEqual(simulation["missing_inputs"][0]["input"], "source_url")
+        self.assertIn("metadata_file", simulation["missing_inputs"][0]["reason"])
+
+    def test_workflow_edge_draft_auto_mode_does_not_persist_generated_mappings(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "inputs": {"source_url": {"kind": "scalar", "value_type": "url", "required": True}},
+        }
+        evaluation = {
+            "status": "ready",
+            "score": 0.9,
+            "confidence": 0.88,
+            "agent": {"used_ai": True},
+            "node_execution_guide": {"prompt": "Use source_url."},
+        }
+
+        draft = bridge.create_workflow_edge_draft(sop, "youtube-research-wiki", {
+            "edge": {"id": "youtube-fetch-to-youtube-deep-research", "from": "youtube-fetch", "to": "youtube-deep-research"},
+            "edge_handoff_instruction": "Use source_url.",
+            "relay_mode": "auto_by_target_inputs",
+            "relay_mappings": [
+                {"sourceOutput": "source_url", "targetInput": "source_url", "resolver": "direct-url"},
+                {"sourceOutput": "metadata_file", "targetInput": "source_url", "resolver": "direct-url"},
+            ],
+            "evaluation": evaluation,
+        })
+
+        self.assertEqual(draft["validation"]["status"], "passed")
+        self.assertEqual(draft["edge"]["relay"]["mode"], "auto_by_target_inputs")
+        self.assertEqual(draft["edge"]["relay"]["mappings"], [])
+
+    def test_workflow_edge_draft_selected_outputs_persists_user_mappings(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "inputs": {"source_url": {"kind": "scalar", "value_type": "url", "required": True}},
+        }
+        evaluation = {
+            "status": "ready",
+            "score": 0.9,
+            "confidence": 0.88,
+            "agent": {"used_ai": True},
+            "node_execution_guide": {"prompt": "Use selected source_url."},
+        }
+
+        draft = bridge.create_workflow_edge_draft(sop, "youtube-research-wiki", {
+            "edge": {"id": "youtube-fetch-to-youtube-deep-research", "from": "youtube-fetch", "to": "youtube-deep-research"},
+            "edge_handoff_instruction": "Use selected source_url.",
+            "relay_mode": "selected_outputs",
+            "relay_mappings": [
+                {"sourceOutput": "source_url", "targetInput": "source_url", "resolver": "direct-url"},
+            ],
+            "evaluation": evaluation,
+        })
+
+        self.assertEqual(draft["validation"]["status"], "passed")
+        self.assertEqual(draft["edge"]["relay"]["mode"], "selected_outputs")
+        self.assertEqual(draft["edge"]["relay"]["mappings"][0]["source_output"], "source_url")
+
     def test_workflow_edge_apply_route_prepares_repo_first_patch(self):
         plugin = self.wiki / "plugin"
         template_dir = plugin / "templates" / "wiki-repo"
