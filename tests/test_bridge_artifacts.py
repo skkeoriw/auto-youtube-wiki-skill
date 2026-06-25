@@ -1077,6 +1077,36 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(resolved["value"], "hermes-runtime-test.chxyka.ccwu.cc")
         self.assertEqual(resolved["source"], "bridge-env:WEBHOOK_PUBLIC_HOST")
 
+    def test_node_run_config_context_reads_instance_settings_saved_under_runtime_channel_alias(self):
+        with (
+            patch.object(bridge, "read_env_file_values", return_value={}),
+            patch.object(bridge, "read_runtime_management_config", return_value={
+                "values": {
+                    "instance:runtime-152-32-214-95:test-instance:WIKI_LLM_BASE_URL": "https://api-proxy.example/v1",
+                    "instance:runtime-152-32-214-95:test-instance:WIKI_LLM_API_KEY": "secret-key",
+                },
+                "backend": "file",
+            }),
+            patch.object(bridge, "runtime_info", return_value={
+                "runtime_id": "youtube-wiki",
+                "id": "youtube-wiki",
+                "channel_url": "https://runtime-152-32-214-95.chxyka.ccwu.cc",
+                "spi_base_url": "https://runtime-152-32-214-95.chxyka.ccwu.cc/api/sop",
+            }),
+        ):
+            context = bridge.node_run_config_context({}, {"instance_id": "test-instance", "runtime_id": "youtube-wiki"})
+
+        self.assertEqual(context["runtime_id"], "runtime-152-32-214-95")
+        self.assertIn("youtube-wiki", context["runtime_aliases"])
+        self.assertEqual(
+            bridge.node_run_config_lookup(context, "WIKI_LLM_BASE_URL")["source"],
+            "instance-settings:WIKI_LLM_BASE_URL",
+        )
+        self.assertEqual(
+            bridge.node_run_config_lookup(context, "WIKI_LLM_API_KEY")["value"],
+            "secret-key",
+        )
+
     def test_hermes_agent_check_runs_local_cli_with_prompt(self):
         captured = {}
 

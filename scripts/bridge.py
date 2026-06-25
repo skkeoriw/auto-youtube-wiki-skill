@@ -848,6 +848,50 @@ def scoped_runtime_setting_values(values, scope, runtime_id, instance_id=""):
     return result
 
 
+def runtime_id_from_channel_url(channel_url):
+    parsed = urlparse(str(channel_url or ""))
+    host = parsed.netloc or parsed.path
+    first_label = host.split("/")[0].split(".", 1)[0].strip()
+    if re.fullmatch(r"runtime-\d+-\d+-\d+-\d+", first_label):
+        return first_label
+    return ""
+
+
+def runtime_setting_id_aliases(sop=None, runtime=None):
+    sop = sop if isinstance(sop, dict) else {}
+    runtime = runtime if isinstance(runtime, dict) else runtime_info()
+    candidates = [
+        runtime_id_from_channel_url(runtime.get("channel_url")),
+        sop.get("runtime_id"),
+        runtime.get("runtime_id"),
+        runtime.get("id"),
+        runtime.get("display_name"),
+    ]
+    result = []
+    for value in candidates:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def primary_runtime_setting_id(sop=None, runtime=None):
+    aliases = runtime_setting_id_aliases(sop, runtime)
+    return aliases[0] if aliases else ""
+
+
+def scoped_runtime_setting_values_for_aliases(values, scope, runtime_ids, instance_id=""):
+    if scope == "global":
+        return scoped_runtime_setting_values(values, scope, "", instance_id)
+    result = {}
+    for runtime_id in runtime_ids or []:
+        scoped = scoped_runtime_setting_values(values, scope, runtime_id, instance_id)
+        for key, value in scoped.items():
+            if key not in result:
+                result[key] = value
+    return result
+
+
 def unique_sorted(values):
     return sorted({str(value) for value in values if str(value or "").strip()})
 
@@ -1053,7 +1097,8 @@ def capability_config_fields_for_node(sop, node_id="", workflow_id=""):
 def capability_config_resolution(sop, node_id="", run_overrides=None, workflow_id="", query=None):
     run_overrides = normalize_runtime_settings_values(run_overrides or {})
     runtime = runtime_info()
-    runtime_id = str(sop.get("runtime_id") or runtime.get("runtime_id") or "")
+    runtime_id = primary_runtime_setting_id(sop, runtime)
+    runtime_aliases = runtime_setting_id_aliases(sop, runtime)
     instance_id = str(sop.get("instance_id") or sop.get("id") or "")
     workflow_id = str(workflow_id or workflow_id_for_sop(sop) or "")
     env_file = os.environ.get("YOUTUBE_WIKI_ENV_FILE", str(Path.home() / ".agent-brain-plugins.env"))
@@ -1062,8 +1107,8 @@ def capability_config_resolution(sop, node_id="", run_overrides=None, workflow_i
     settings = read_runtime_management_config()
     all_values = settings.get("values", {})
     global_values = scoped_runtime_setting_values(all_values, "global", runtime_id, instance_id)
-    runtime_values = scoped_runtime_setting_values(all_values, "runtime", runtime_id, instance_id)
-    instance_values = scoped_runtime_setting_values(all_values, "instance", runtime_id, instance_id)
+    runtime_values = scoped_runtime_setting_values_for_aliases(all_values, "runtime", runtime_aliases, instance_id)
+    instance_values = scoped_runtime_setting_values_for_aliases(all_values, "instance", runtime_aliases, instance_id)
     sources = [
         ("node-run-overrides", run_overrides),
         ("instance-settings", instance_values),
@@ -1140,6 +1185,7 @@ def capability_config_resolution(sop, node_id="", run_overrides=None, workflow_i
     groups = runtime_config_group_status(items)
     return {
         "runtime_id": runtime_id,
+        "runtime_aliases": runtime_aliases,
         "instance_id": instance_id,
         "workflow_id": workflow_id,
         "node_id": node_id,
@@ -1166,7 +1212,7 @@ def save_capability_config(sop, values, scope="instance", node_id=""):
     if scope not in {"instance", "runtime", "global"}:
         raise ValueError("scope must be instance, runtime or global")
     runtime = runtime_info()
-    runtime_id = str(sop.get("runtime_id") or runtime.get("runtime_id") or "")
+    runtime_id = primary_runtime_setting_id(sop, runtime)
     instance_id = str(sop.get("instance_id") or sop.get("id") or "")
     allowed = {field["key"] for field in setting_registry_definitions()}
     changed = {}
@@ -7766,13 +7812,16 @@ def node_run_config_context(body=None, sop=None):
     settings = read_runtime_management_config()
     values = settings.get("values", {})
     runtime = runtime_info()
-    runtime_id = str((sop or {}).get("runtime_id") or runtime.get("runtime_id") or "")
+    runtime_id = primary_runtime_setting_id(sop, runtime)
+    runtime_aliases = runtime_setting_id_aliases(sop, runtime)
     instance_id = str((sop or {}).get("instance_id") or (sop or {}).get("id") or "")
     return {
         "overrides": normalize_runtime_settings_values({str(k): str(v) for k, v in overrides.items() if not is_blank_value(v)}),
         "capability_overrides": capability_overrides,
-        "instance_settings_values": scoped_runtime_setting_values(values, "instance", runtime_id, instance_id),
-        "runtime_settings_values": scoped_runtime_setting_values(values, "runtime", runtime_id, instance_id),
+        "runtime_id": runtime_id,
+        "runtime_aliases": runtime_aliases,
+        "instance_settings_values": scoped_runtime_setting_values_for_aliases(values, "instance", runtime_aliases, instance_id),
+        "runtime_settings_values": scoped_runtime_setting_values_for_aliases(values, "runtime", runtime_aliases, instance_id),
         "global_settings_values": scoped_runtime_setting_values(values, "global", runtime_id, instance_id),
         "settings_backend": settings.get("backend", runtime_settings_backend()),
         "runtime_env_file": str(Path(env_file).expanduser()),
