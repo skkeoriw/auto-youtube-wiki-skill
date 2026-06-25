@@ -79,6 +79,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         )
         self.sop = {
             "id": "test",
+            "sop_type": "youtube-research-wiki",
             "wiki_local_path": str(self.wiki),
             "nodes": {
                 "notebooklm-research": {
@@ -1802,6 +1803,220 @@ class ArtifactResolutionTest(unittest.TestCase):
         server.shutdown()
         server.server_close()
         self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
+
+    def test_workflow_edge_simulation_generates_fixture_and_request_preview(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-fetch"] = {
+            "title": "YouTube Fetch",
+            "skill": "sop-youtube-fetch",
+            "webhook_route": "sop-youtube-fetch",
+            "outputs": {
+                "source_url": {"kind": "scalar", "value_type": "url"},
+                "metadata_file": {"kind": "file", "value_type": "json"},
+            },
+        }
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "skill": "sop-youtube-deep-research",
+            "webhook_route": "sop-youtube-deep-research",
+            "inputs": {"source_url": {"kind": "scalar", "value_type": "url", "required": True}},
+            "outputs": {
+                "analysis_file": {"kind": "file", "value_type": "markdown"},
+                "transcript_file": {"kind": "file", "value_type": "text"},
+            },
+        }
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/simulate",
+                method="POST",
+                data=json.dumps({
+                    "edge_id": "youtube-fetch-to-youtube-deep-research",
+                    "upstream_node_id": "youtube-fetch",
+                    "downstream_node_id": "youtube-deep-research",
+                    "edge_handoff_instruction": "把 source_url 作为下游视频 URL。",
+                    "input_source": "generated-fixture",
+                    "evaluation": {
+                        "status": "ready",
+                        "node_execution_guide": {
+                            "format": "markdown",
+                            "prompt": "Use source_url as the target video URL.",
+                        },
+                    },
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                simulation = json.loads(response.read())
+        server.shutdown()
+        server.server_close()
+        self.assertTrue(simulation["ok"])
+        self.assertEqual(simulation["mode"], "edge-handoff-simulation")
+        self.assertEqual(simulation["status"], "passed")
+        self.assertEqual(simulation["resolved_inputs"][0]["target_input"], "source_url")
+        self.assertIn("https://www.youtube.com/watch", simulation["resolved_inputs"][0]["value"])
+        self.assertIn("Use skill sop-youtube-deep-research", simulation["hermes_request_preview"]["prompt"])
+        self.assertFalse(simulation["hermes_request_preview"]["executes_real_node"])
+
+    def test_workflow_edge_simulation_blocks_missing_required_input(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["source-node"] = {
+            "title": "Source Node",
+            "skill": "sop-source-node",
+            "outputs": {
+                "metadata_file": {"kind": "file", "value_type": "json", "path": "raw/source/{pipeline_id}/metadata.json"},
+            },
+        }
+        sop["nodes"]["target-node"] = {
+            "title": "Target Node",
+            "skill": "sop-target-node",
+            "inputs": {
+                "source_url": {"kind": "scalar", "value_type": "url", "required": True},
+            },
+        }
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/simulate",
+                method="POST",
+                data=json.dumps({
+                    "edge_id": "source-to-target",
+                    "upstream_node_id": "source-node",
+                    "downstream_node_id": "target-node",
+                    "relay_mappings": [
+                        {"source_output": "missing_output", "target_input": "source_url", "resolver": "direct"},
+                    ],
+                    "input_source": "generated-fixture",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                simulation = json.loads(response.read())
+        server.shutdown()
+        server.server_close()
+        self.assertFalse(simulation["ok"])
+        self.assertEqual(simulation["status"], "blocked")
+        self.assertEqual(simulation["verdict"], "missing_required_input")
+        self.assertEqual(simulation["missing_inputs"][0]["input"], "source_url")
+        self.assertFalse(simulation["hermes_request_preview"]["executes_real_node"])
+
+    def test_workflow_edge_simulation_uses_sop_edge_binding_resolver(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["source-node"] = {
+            "title": "Source Node",
+            "skill": "sop-source-node",
+            "outputs": {
+                "metadata_file": {"kind": "file", "value_type": "json", "path": "raw/source/{pipeline_id}/metadata.json"},
+            },
+        }
+        sop["nodes"]["target-node"] = {
+            "title": "Target Node",
+            "skill": "sop-target-node",
+            "inputs": {
+                "source_url": {
+                    "kind": "scalar",
+                    "value_type": "url",
+                    "required": True,
+                    "resolvers": [
+                        {"id": "metadata-source-url", "kind": "json_path", "path": "$.source_url"},
+                    ],
+                },
+            },
+        }
+        sop["edges"] = [
+            {
+                "id": "source-to-target",
+                "from": "source-node",
+                "to": "target-node",
+                "relay": {
+                    "bindings": [
+                        {
+                            "target_input": "source_url",
+                            "source": {
+                                "output": "metadata_file",
+                                "extractor": {"kind": "json_path", "path": "$.source_url"},
+                            },
+                        },
+                    ],
+                },
+            }
+        ]
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/simulate",
+                method="POST",
+                data=json.dumps({
+                    "edge_id": "source-to-target",
+                    "upstream_node_id": "source-node",
+                    "downstream_node_id": "target-node",
+                    "input_source": "generated_fixture",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                simulation = json.loads(response.read())
+        server.shutdown()
+        server.server_close()
+        self.assertTrue(simulation["ok"])
+        self.assertEqual(simulation["status"], "passed")
+        self.assertEqual(simulation["relay_mappings"][0]["source_output"], "metadata_file")
+        self.assertEqual(simulation["relay_mappings"][0]["target_input"], "source_url")
+        self.assertEqual(simulation["resolved_inputs"][0]["resolver"], "metadata-source-url")
+        self.assertIn("https://www.youtube.com/watch", simulation["resolved_inputs"][0]["value"])
+
+    def test_workflow_edge_simulation_does_not_single_output_fanout_to_all_inputs(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["source-node"] = {
+            "title": "Source Node",
+            "skill": "sop-source-node",
+            "outputs": {
+                "source_url": {"kind": "scalar", "value_type": "url"},
+            },
+        }
+        sop["nodes"]["target-node"] = {
+            "title": "Target Node",
+            "skill": "sop-target-node",
+            "inputs": {
+                "title": {"kind": "scalar", "value_type": "text", "required": True},
+                "language": {"kind": "scalar", "value_type": "text", "required": True},
+            },
+        }
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/simulate",
+                method="POST",
+                data=json.dumps({
+                    "edge_id": "source-to-target",
+                    "upstream_node_id": "source-node",
+                    "downstream_node_id": "target-node",
+                    "input_source": "generated-fixture",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                simulation = json.loads(response.read())
+        server.shutdown()
+        server.server_close()
+        self.assertFalse(simulation["ok"])
+        self.assertEqual(simulation["status"], "blocked")
+        self.assertEqual({item["input"] for item in simulation["missing_inputs"]}, {"title", "language"})
 
     def test_workflow_edge_apply_route_prepares_repo_first_patch(self):
         plugin = self.wiki / "plugin"

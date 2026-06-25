@@ -5983,6 +5983,366 @@ def evaluate_edge_handoff(sop, workflow_id, data):
         }
 
 
+def workflow_edge_skill_meta(node):
+    node = node if isinstance(node, dict) else {}
+    executor = node.get("executor") if isinstance(node.get("executor"), dict) else {}
+    return {
+        "node_id": node.get("node_id") or "",
+        "title": node.get("title") or node.get("node_id") or "",
+        "skill_id": node.get("skill_id") or executor.get("skill") or node.get("node_id") or "",
+        "description": node.get("skill_summary") or "",
+        "version": node.get("version") or "",
+        "inputs": node.get("inputs") if isinstance(node.get("inputs"), dict) else {},
+        "optional_inputs": node.get("optional_inputs") if isinstance(node.get("optional_inputs"), dict) else {},
+        "outputs": node.get("outputs") if isinstance(node.get("outputs"), dict) else {},
+        "capabilities": node.get("capabilities") if isinstance(node.get("capabilities"), dict) else {},
+        "side_effects": {
+            "telegram": bool((node.get("capabilities") or {}).get("telegram")) or "tg-notify" in str(node.get("skill_id") or ""),
+            "git": bool((node.get("capabilities") or {}).get("git")),
+            "external_api": bool((node.get("capabilities") or {}).get("http") or (node.get("capabilities") or {}).get("worker")),
+        },
+    }
+
+
+def workflow_edge_detail_payload(sop, workflow_id, data):
+    request_payload = edge_handoff_request_payload(sop, workflow_id, data)
+    upstream = request_payload.get("upstream") if isinstance(request_payload.get("upstream"), dict) else {}
+    downstream = request_payload.get("downstream") if isinstance(request_payload.get("downstream"), dict) else {}
+    edge = request_payload.get("edge") if isinstance(request_payload.get("edge"), dict) else {}
+    return {
+        "ok": True,
+        "sop_id": sop.get("id", ""),
+        "workflow_id": request_payload.get("workflow_id", ""),
+        "edge_id": request_payload.get("edge_id", ""),
+        "edge": edge,
+        "upstream": workflow_edge_skill_meta(upstream),
+        "downstream": workflow_edge_skill_meta(downstream),
+        "request": request_payload,
+    }
+
+
+def contract_value_type(spec):
+    spec = spec if isinstance(spec, dict) else {}
+    return str(spec.get("value_type") or spec.get("content_type") or spec.get("kind") or spec.get("type") or "text")
+
+
+def generated_fixture_value(name, spec):
+    spec = spec if isinstance(spec, dict) else {}
+    value_type = contract_value_type(spec)
+    lowered = f"{name} {value_type}".lower()
+    if "url" in lowered:
+        return "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    if "json" in lowered or "metadata" in lowered:
+        return {
+            "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "title": "Generated fixture video title",
+            "description": "Synthetic metadata generated for Edge Handoff Simulation.",
+        }
+    if "markdown" in lowered or name.endswith("_file"):
+        return "# Generated fixture\n\nThis is a synthetic upstream artifact for Edge Handoff Simulation."
+    return f"generated fixture value for {name}"
+
+
+def workflow_edge_generated_fixture(upstream):
+    outputs = upstream.get("outputs") if isinstance(upstream.get("outputs"), dict) else {}
+    items = []
+    for output_name, spec in outputs.items():
+        spec = spec if isinstance(spec, dict) else {}
+        value = generated_fixture_value(output_name, spec)
+        value_type = contract_value_type(spec)
+        kind = str(spec.get("kind") or spec.get("type") or ("file" if str(spec.get("path") or "").strip() else "scalar"))
+        path = str(spec.get("path") or f"raw/node-runs/{{source_node_run_id}}/outputs/files/{output_name}.txt")
+        items.append({
+            "name": output_name,
+            "kind": kind,
+            "value_type": value_type,
+            "path": path,
+            "value": value,
+            "source": "generated-fixture",
+        })
+    return {
+        "source": "generated-fixture",
+        "items": items,
+    }
+
+
+def workflow_edge_simulation_mappings(sop, data, upstream, downstream):
+    data = data if isinstance(data, dict) else {}
+    explicit = normalize_relay_mappings(data.get("relay_mappings") or data.get("relayMappings") or [])
+    if explicit:
+        return explicit
+    edge = data.get("edge") if isinstance(data.get("edge"), dict) else {}
+    edge_mappings = normalize_relay_mappings(edge.get("relayMappings") or [])
+    if edge_mappings:
+        return edge_mappings
+    edge_relay = edge.get("relay") if isinstance(edge.get("relay"), dict) else {}
+    relay_mappings = normalize_relay_mappings(edge_relay.get("mappings") or edge_relay.get("relay_mappings") or [])
+    if relay_mappings:
+        return relay_mappings
+    edge_bindings = edge_contract_relay_mappings(sop, edge)
+    if edge_bindings:
+        return edge_bindings
+    source_node = str(upstream.get("node_id") or "").strip()
+    target_node = str(downstream.get("node_id") or "").strip()
+    sop_edge = workflow_edge_contract(sop, source_node, target_node) if source_node and target_node else {}
+    sop_edge_mappings = edge_contract_relay_mappings(sop, sop_edge)
+    if sop_edge_mappings:
+        return sop_edge_mappings
+    outputs = upstream.get("outputs") if isinstance(upstream.get("outputs"), dict) else {}
+    required = downstream.get("inputs") if isinstance(downstream.get("inputs"), dict) else {}
+    optional = downstream.get("optional_inputs") if isinstance(downstream.get("optional_inputs"), dict) else {}
+    mappings = []
+    target_inputs = {**optional, **required}
+    for input_name, spec in target_inputs.items():
+        spec = spec if isinstance(spec, dict) else {}
+        source_node_id, declared_output = source_ref_output(spec.get("from"))
+        source_output = ""
+        if declared_output and declared_output in outputs and (not source_node_id or source_node_id == source_node):
+            source_output = declared_output
+        elif input_name in outputs:
+            source_output = input_name
+        elif input_name == "source_url" and "source_url" in outputs:
+            source_output = "source_url"
+        if source_output:
+            mappings.append({
+                "source_output": source_output,
+                "target_input": input_name,
+                "resolver": "direct",
+            })
+    return mappings
+
+
+def workflow_edge_simulation_apply_resolver(source_item, target_spec, selected_resolver=""):
+    source_item = source_item if isinstance(source_item, dict) else {}
+    target_spec = target_spec if isinstance(target_spec, dict) else {}
+    value = source_item.get("value")
+    source_path = str(source_item.get("path") or "")
+    resolvers = node_input_resolvers(target_spec)
+    if selected_resolver:
+        preferred = []
+        fallback = []
+        for resolver in resolvers:
+            resolver_id = str(resolver.get("id") or resolver.get("name") or resolver.get("kind") or resolver.get("type") or "").strip()
+            if resolver_id == selected_resolver:
+                preferred.append(resolver)
+            else:
+                fallback.append(resolver)
+        if preferred:
+            resolvers = preferred
+        elif selected_resolver in {"direct", "json_path", "regex", "manifest_item"}:
+            resolvers = [{"kind": selected_resolver}]
+    if not resolvers:
+        resolvers = [{"kind": "direct"}]
+    content = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "")
+    last_reason = ""
+    for resolver in resolvers:
+        kind = str(resolver.get("kind") or resolver.get("type") or "").strip() or "direct"
+        resolver_id = str(resolver.get("id") or resolver.get("name") or kind).strip()
+        resolved = None
+        if kind == "direct":
+            resolved = source_path if str(target_spec.get("kind") or target_spec.get("type") or "").strip() in {"file", "files", "directory"} and source_path else value
+        elif kind in {"whole_file", "text"}:
+            resolved = content
+        elif kind == "json_path":
+            try:
+                parsed = value if isinstance(value, (dict, list)) else json.loads(content)
+                resolved = json_path_lookup(parsed, resolver.get("path"))
+            except Exception:
+                resolved = None
+        elif kind == "regex":
+            pattern = str(resolver.get("pattern") or "").strip()
+            if pattern:
+                try:
+                    match = re.search(pattern, content)
+                except re.error:
+                    match = None
+                if match:
+                    resolved = match.group(1) if match.groups() else match.group(0)
+        elif kind == "manifest_item":
+            resolved = source_path or value
+        if resolved is None:
+            last_reason = f"resolver {resolver_id} did not match"
+            continue
+        if isinstance(resolved, (dict, list)):
+            resolved = json.dumps(resolved, ensure_ascii=False)
+        ok, reason = validate_resolved_input_value(resolved, target_spec)
+        if ok:
+            return resolved, resolver_id, ""
+        last_reason = reason
+    return "", selected_resolver or "", last_reason or "no resolver matched this input"
+
+
+def workflow_edge_resolve_simulation_inputs(fixture, downstream, mappings):
+    by_name = {str(item.get("name") or ""): item for item in fixture.get("items", []) if isinstance(item, dict)}
+    required = downstream.get("inputs") if isinstance(downstream.get("inputs"), dict) else {}
+    optional = downstream.get("optional_inputs") if isinstance(downstream.get("optional_inputs"), dict) else {}
+    target_specs = {**optional, **required}
+    rows = []
+    missing = []
+    for mapping in mappings:
+        source_output = str(mapping.get("source_output") or "")
+        target_input = str(mapping.get("target_input") or source_output)
+        source_item = by_name.get(source_output)
+        required_flag = target_input in required
+        target_spec = target_specs.get(target_input) if isinstance(target_specs.get(target_input), dict) else {}
+        resolved_value, resolver_id, reason = workflow_edge_simulation_apply_resolver(source_item, target_spec, str(mapping.get("resolver") or "")) if source_item else ("", str(mapping.get("resolver") or ""), "source output is not available")
+        resolved = source_item is not None and not is_blank_value(resolved_value)
+        row = {
+            "target_input": target_input,
+            "source_output": source_output,
+            "resolver": resolver_id or mapping.get("resolver") or "direct",
+            "required": required_flag,
+            "resolved": resolved,
+            "value": resolved_value if resolved else "",
+            "value_preview": edge_handoff_compact_text(json.dumps(resolved_value, ensure_ascii=False) if isinstance(resolved_value, (dict, list)) else resolved_value, 240) if resolved else "",
+            "source_path": source_item.get("path") if source_item else "",
+            "target_spec": target_spec,
+            "reason": "" if resolved else reason,
+        }
+        rows.append(row)
+    mapped_targets = {str(item.get("target_input") or "") for item in rows}
+    for input_name in required.keys():
+        if input_name not in mapped_targets:
+            missing.append({
+                "input": input_name,
+                "reason": "No relay mapping resolved this required downstream input.",
+            })
+    for row in rows:
+        if row.get("required") and not row.get("resolved"):
+            missing.append({
+                "input": row.get("target_input"),
+                "reason": row.get("reason") or f"Mapped source output {row.get('source_output')!r} is not available in upstream fixture.",
+            })
+    return rows, missing
+
+
+def workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missing):
+    return {
+        "edge_id": request_payload.get("edge_id") or "",
+        "source_node": (request_payload.get("upstream") or {}).get("node_id") if isinstance(request_payload.get("upstream"), dict) else "",
+        "target_node": (request_payload.get("downstream") or {}).get("node_id") if isinstance(request_payload.get("downstream"), dict) else "",
+        "input_source": "generated-fixture",
+        "status": "passed" if not missing else "blocked",
+        "items": [
+            {
+                "source_output": row.get("source_output"),
+                "target_input": row.get("target_input"),
+                "resolver": row.get("resolver"),
+                "source_path": row.get("source_path"),
+                "value_preview": row.get("value_preview"),
+                "resolved": row.get("resolved"),
+            }
+            for row in resolved_inputs
+        ],
+        "missing_inputs": missing,
+        "fixture": fixture,
+    }
+
+
+def workflow_edge_hermes_request_preview(request_payload, relay_package, evaluation=None):
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    guide = evaluation.get("node_execution_guide") if isinstance(evaluation.get("node_execution_guide"), dict) else {}
+    guide_prompt = str(guide.get("prompt") or "").strip() or "No approved Node Execution Guide is available yet. Run Edge Handoff Agent before a real node run."
+    downstream = request_payload.get("downstream") if isinstance(request_payload.get("downstream"), dict) else {}
+    skill_name = str(downstream.get("skill_id") or downstream.get("node_id") or "downstream-skill")
+    return "\n".join([
+        f"Use skill {skill_name} to execute this Node Execution Request.",
+        "",
+        "# Edge Handoff Simulation Request",
+        "",
+        "Runtime context:",
+        f"- runtime_id: {request_payload.get('runtime_id') or ''}",
+        f"- instance_id: {request_payload.get('instance_id') or ''}",
+        f"- workflow_id: {request_payload.get('workflow_id') or ''}",
+        f"- edge_id: {request_payload.get('edge_id') or ''}",
+        "",
+        "Edge:",
+        f"- upstream: {(request_payload.get('upstream') or {}).get('node_id') if isinstance(request_payload.get('upstream'), dict) else ''}",
+        f"- downstream: {downstream.get('node_id') or ''}",
+        f"- instruction: {request_payload.get('edge_handoff_instruction') or ''}",
+        "",
+        "Resolved relay package:",
+        "```json",
+        json.dumps(mask_data(relay_package), ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "Approved Edge Handoff Guide:",
+        guide_prompt,
+        "",
+        "Simulation rule:",
+        "- This is a handoff simulation only. Do not execute the real downstream node.",
+    ]).strip() + "\n"
+
+
+def simulate_workflow_edge_handoff(sop, workflow_id, data):
+    data = data if isinstance(data, dict) else {}
+    if workflow_id and not workflow_id_matches(sop, workflow_id):
+        return 404, {
+            "ok": False,
+            "status": "blocked",
+            "detail": f"Workflow {workflow_id!r} does not exist on this SOP instance.",
+            "workflow_id": workflow_id,
+        }
+    request_payload = edge_handoff_request_payload(sop, workflow_id, data)
+    upstream = request_payload.get("upstream") if isinstance(request_payload.get("upstream"), dict) else {}
+    downstream = request_payload.get("downstream") if isinstance(request_payload.get("downstream"), dict) else {}
+    if not upstream.get("node_id") or not downstream.get("node_id"):
+        return 422, {
+            "ok": False,
+            "status": "blocked",
+            "detail": "upstream_node_id and downstream_node_id are required",
+            "request": request_payload,
+        }
+    input_source = str((data or {}).get("input_source") or (data or {}).get("source_mode") or "generated-fixture")
+    if input_source == "generated_fixture":
+        input_source = "generated-fixture"
+    if input_source not in {"generated-fixture", "generated_fixture", "manual", "existing-node-run"}:
+        input_source = "generated-fixture"
+    if input_source != "generated-fixture":
+        return 422, {
+            "ok": False,
+            "status": "blocked",
+            "detail": "Only generated-fixture handoff simulation is implemented in this non-executing API.",
+            "request": request_payload,
+            "supported_input_sources": ["generated-fixture"],
+        }
+    fixture = workflow_edge_generated_fixture(upstream)
+    mappings = workflow_edge_simulation_mappings(sop, data, upstream, downstream)
+    resolved_inputs, missing = workflow_edge_resolve_simulation_inputs(fixture, downstream, mappings)
+    relay_package = workflow_edge_relay_package(request_payload, fixture, resolved_inputs, missing)
+    evaluation = data.get("evaluation") if isinstance(data.get("evaluation"), dict) else {}
+    hermes_request = workflow_edge_hermes_request_preview(request_payload, relay_package, evaluation)
+    status = "passed" if not missing else "blocked"
+    return 200, {
+        "ok": status == "passed",
+        "mode": "edge-handoff-simulation",
+        "simulation_id": f"{slugify(request_payload.get('edge_id') or 'edge')}-simulation-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        "status": status,
+        "verdict": "can_handoff" if status == "passed" else "missing_required_input",
+        "sop_id": sop.get("id", ""),
+        "workflow_id": request_payload.get("workflow_id", ""),
+        "edge_id": request_payload.get("edge_id", ""),
+        "request": request_payload,
+        "skill_meta": {
+            "upstream": workflow_edge_skill_meta(upstream),
+            "downstream": workflow_edge_skill_meta(downstream),
+        },
+        "generated_fixture": fixture,
+        "relay_mappings": mappings,
+        "relay_package": relay_package,
+        "resolved_inputs": resolved_inputs,
+        "missing_inputs": missing,
+        "hermes_request_preview": {
+            "format": "markdown",
+            "prompt": hermes_request,
+            "source": "edge-handoff-simulation",
+            "executes_real_node": False,
+        },
+        "warnings": [] if not missing else ["Simulation did not satisfy every required downstream input."],
+        "blocking_reasons": missing,
+    }
+
+
 def relay_context_brief(plan, input_validation=None):
     selection = plan.get("relay_selection") if isinstance(plan.get("relay_selection"), dict) else {}
     edge = selection.get("edge_contract") if isinstance(selection.get("edge_contract"), dict) else plan.get("edge_contract") if isinstance(plan.get("edge_contract"), dict) else {}
@@ -10869,6 +11229,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             http_code, result = evaluate_edge_handoff(sop, path[4], data)
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/edges/simulate
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "edges" and path[6] == "simulate"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = simulate_workflow_edge_handoff(sop, path[4], data)
             return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/runs  → trigger
