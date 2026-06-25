@@ -2018,6 +2018,52 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(simulation["status"], "blocked")
         self.assertEqual({item["input"] for item in simulation["missing_inputs"]}, {"title", "language"})
 
+    def test_workflow_edge_simulation_uses_runtime_contract_for_thin_frontend_payload(self):
+        sop = dict(self.sop)
+        sop["nodes"] = dict(self.sop["nodes"])
+        sop["nodes"]["youtube-fetch"] = {
+            "title": "YouTube Fetch",
+            "outputs": {
+                "source_url": {"kind": "scalar", "value_type": "url"},
+                "metadata_file": {"kind": "file", "value_type": "json"},
+            },
+        }
+        sop["nodes"]["youtube-deep-research"] = {
+            "title": "YouTube Deep Research",
+            "inputs": {"source_url": {"kind": "scalar", "value_type": "url", "required": True}},
+            "outputs": {"analysis_file": {"kind": "file", "value_type": "markdown"}},
+        }
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(bridge, "find_sop", return_value=sop):
+            thread.start()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/simulate",
+                method="POST",
+                data=json.dumps({
+                    "edge_id": "youtube-fetch-to-youtube-deep-research",
+                    "edge": {"id": "youtube-fetch-to-youtube-deep-research", "from": "youtube-fetch", "to": "youtube-deep-research"},
+                    "upstream_node_id": "youtube-fetch",
+                    "downstream_node_id": "youtube-deep-research",
+                    "upstream": {"node_id": "youtube-fetch", "outputs": {}},
+                    "downstream": {"node_id": "youtube-deep-research", "inputs": {}},
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                simulation = json.loads(response.read())
+        server.shutdown()
+        server.server_close()
+
+        self.assertEqual(simulation["status"], "passed")
+        self.assertEqual(simulation["missing_inputs"], [])
+        resolved = simulation["resolved_inputs"][0]
+        self.assertEqual(resolved["source_output"], "source_url")
+        self.assertEqual(resolved["target_input"], "source_url")
+        self.assertTrue(resolved["resolved"])
+        self.assertEqual(resolved["value"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
     def test_workflow_edge_apply_route_prepares_repo_first_patch(self):
         plugin = self.wiki / "plugin"
         template_dir = plugin / "templates" / "wiki-repo"
@@ -2026,8 +2072,19 @@ class ArtifactResolutionTest(unittest.TestCase):
         before_template_text = json.dumps(
             {
                 "nodes": {
-                    "youtube-fetch": {"title": "YouTube Fetch", "skill": "sop-youtube-fetch"},
-                    "youtube-deep-research": {"title": "YouTube Deep Research", "skill": "sop-youtube-deep-research"},
+                    "youtube-fetch": {
+                        "title": "YouTube Fetch",
+                        "skill": "sop-youtube-fetch",
+                        "outputs": {
+                            "source_url": {"kind": "scalar", "value_type": "url"},
+                            "metadata_file": {"kind": "file", "value_type": "json"},
+                        },
+                    },
+                    "youtube-deep-research": {
+                        "title": "YouTube Deep Research",
+                        "skill": "sop-youtube-deep-research",
+                        "inputs": {"source_url": {"kind": "scalar", "value_type": "url", "required": True}},
+                    },
                 },
                 "edges": [
                     {
@@ -2042,9 +2099,12 @@ class ArtifactResolutionTest(unittest.TestCase):
             before_template_text,
             encoding="utf-8",
         )
+        runtime_sop_path = self.wiki / "sop.yaml"
+        runtime_sop_path.write_text(before_template_text, encoding="utf-8")
 
         sop = dict(self.sop)
         sop["nodes"] = dict(self.sop["nodes"])
+        sop["sop_file"] = str(runtime_sop_path)
         sop["nodes"]["youtube-deep-research"] = {
             "title": "YouTube Deep Research",
             "skill": "sop-youtube-deep-research",
@@ -2089,6 +2149,60 @@ class ArtifactResolutionTest(unittest.TestCase):
             with urllib.request.urlopen(approved_request, timeout=3) as response:
                 self.assertEqual(response.status, 201)
                 draft = json.loads(response.read())
+
+            apply_before_runtime_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/apply",
+                method="POST",
+                data=json.dumps({"draft_id": draft["draft_id"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(apply_before_runtime_request, timeout=3)
+            self.assertEqual(ctx.exception.code, 422)
+            blocked = json.loads(ctx.exception.read())
+            self.assertEqual(blocked["status"], "failed")
+            self.assertEqual(blocked["errors"][0]["code"], "runtime_sop_required")
+
+            runtime_sop_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/runtime-sop",
+                method="POST",
+                data=json.dumps({"draft_id": draft["draft_id"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(runtime_sop_request, timeout=3) as response:
+                runtime_sop = json.loads(response.read())
+
+            self.assertEqual(runtime_sop["status"], "runtime_sop_ready")
+            self.assertEqual(runtime_sop["draft_id"], draft["draft_id"])
+            self.assertFalse(runtime_sop["active_runtime_sop_changed"])
+            self.assertFalse(runtime_sop["production_dag_changed"])
+            self.assertTrue(Path(runtime_sop["runtime_sop_path"]).exists())
+            self.assertEqual(runtime_sop_path.read_text(encoding="utf-8"), before_template_text)
+            runtime_candidate = bridge.read_yaml(Path(runtime_sop["runtime_sop_path"]))
+            self.assertEqual(runtime_candidate["edges"][-1]["id"], "youtube-fetch-to-youtube-deep-research")
+
+            simulate_runtime_sop_request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/simulate",
+                method="POST",
+                data=json.dumps({
+                    "edge_id": "youtube-fetch-to-youtube-deep-research",
+                    "edge": {"id": "youtube-fetch-to-youtube-deep-research", "from": "youtube-fetch", "to": "youtube-deep-research"},
+                    "upstream_node_id": "youtube-fetch",
+                    "downstream_node_id": "youtube-deep-research",
+                    "upstream": {"node_id": "youtube-fetch", "outputs": {}},
+                    "downstream": {"node_id": "youtube-deep-research", "inputs": {}},
+                    "simulation_target": "runtime-sop",
+                    "runtime_sop_path": runtime_sop["runtime_sop_path"],
+                    "input_source": "generated-fixture",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(simulate_runtime_sop_request, timeout=3) as response:
+                simulation = json.loads(response.read())
+            self.assertEqual(simulation["simulation_target"], "runtime-sop")
+            self.assertEqual(simulation["runtime_sop_path"], runtime_sop["runtime_sop_path"])
+            self.assertEqual(simulation["status"], "passed")
+            self.assertEqual(simulation["resolved_inputs"][0]["source_output"], "source_url")
 
             apply_request = urllib.request.Request(
                 f"http://127.0.0.1:{server.server_port}/api/sop/test/workflows/youtube-research-wiki/edges/apply",
