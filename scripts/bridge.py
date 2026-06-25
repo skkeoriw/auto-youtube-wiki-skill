@@ -2420,6 +2420,9 @@ def node_registry_item(sop, node_id, endpoint=""):
         return None
     instance_id = sop.get("id") or sop.get("name") or ""
     manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
+    manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+    manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
+    manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
     manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
     node_caps = config.get("capabilities") if isinstance(config.get("capabilities"), dict) else {}
     git_caps = {
@@ -2448,9 +2451,9 @@ def node_registry_item(sop, node_id, endpoint=""):
             "readme_path": static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else "",
             "summary": static.get("skill_readme", ""),
         },
-        "inputs": normalize_contract(static.get("inputs", {}), "input"),
-        "optional_inputs": normalize_contract(static.get("optional_inputs", {}), "input"),
-        "outputs": normalize_contract(static.get("outputs", {}), "output"),
+        "inputs": normalize_contract(manifest_inputs or static.get("inputs", {}), "input"),
+        "optional_inputs": normalize_contract(manifest_optional_inputs or static.get("optional_inputs", {}), "input"),
+        "outputs": normalize_contract(manifest_outputs or static.get("outputs", {}), "output"),
         "capabilities": {
             "git": git_caps,
             "telegram": telegram_caps,

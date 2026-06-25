@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import os
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -84,6 +87,74 @@ class WorkflowEdgeSimulationTest(unittest.TestCase):
         self.assertEqual(missing[0]["input"], "message")
         self.assertFalse(target_resolutions[0]["resolved"])
         self.assertIn("did not match", target_resolutions[0]["reason"])
+
+    def test_registry_item_prefers_skill_contract_over_legacy_instance_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = Path(tmp)
+            skill = plugin / "skills" / "sop-tg-notify"
+            skill.mkdir(parents=True)
+            (skill / "node.yaml").write_text(
+                "\n".join([
+                    "id: tg-notify",
+                    "title: Telegram 通知",
+                    "executor:",
+                    "  type: agent-skill",
+                    "  skill: sop-tg-notify",
+                    "inputs:",
+                    "  message:",
+                    "    required: true",
+                    "    kind: object",
+                    "    type: object",
+                    "    value_type: text",
+                    "optional_inputs:",
+                    "  index:",
+                    "    required: false",
+                    "    kind: file",
+                    "    type: file",
+                    "    value_type: markdown",
+                    "outputs:",
+                    "  telegram_message:",
+                    "    kind: file",
+                    "    type: file",
+                    "    value_type: json",
+                ]),
+                encoding="utf-8",
+            )
+            sop = {
+                "id": "test-instance",
+                "nodes": {
+                    "tg-notify": {
+                        "title": "Telegram 通知",
+                        "skill": "sop-tg-notify",
+                        "inputs": {
+                            "index": {
+                                "required": True,
+                                "kind": "file",
+                                "type": "file",
+                                "value_type": "markdown",
+                                "from": "wiki-build.outputs.index",
+                            },
+                        },
+                        "optional_inputs": {
+                            "message": {
+                                "required": False,
+                                "kind": "scalar",
+                                "type": "string",
+                                "value_type": "text",
+                            },
+                        },
+                        "outputs": {},
+                    },
+                },
+            }
+
+            with patch.dict(os.environ, {"YOUTUBE_WIKI_PLUGIN_DIR": str(plugin)}, clear=False):
+                item = bridge.node_registry_item(sop, "tg-notify")
+
+        self.assertIn("message", item["inputs"])
+        self.assertNotIn("index", item["inputs"])
+        self.assertIn("index", item["optional_inputs"])
+        self.assertFalse(item["optional_inputs"]["index"]["required"])
 
 
 if __name__ == "__main__":
