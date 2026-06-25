@@ -3723,6 +3723,9 @@ def generate_workflow_edge_runtime_sop(sop, workflow_id, data):
     else:
         edges[existing] = replacement
     runtime_doc["edges"] = edges
+    runtime_doc["wiki_local_path"] = sop.get("wiki_local_path", "")
+    if sop.get("repo"):
+        runtime_doc["repo"] = sop.get("repo", "")
     after_edges = copy.deepcopy(edges)
     candidate_text = yaml.safe_dump(runtime_doc, allow_unicode=True, sort_keys=False)
     runtime_sop_path = resolved_path / "runtime_sop.yaml"
@@ -4010,6 +4013,9 @@ def generate_workflow_draft_runtime_sop(sop, workflow_id, data):
             "draft_path": str(draft_dir),
         }
     runtime_doc["edges"] = edges
+    runtime_doc["wiki_local_path"] = sop.get("wiki_local_path", "")
+    if sop.get("repo"):
+        runtime_doc["repo"] = sop.get("repo", "")
     runtime_sop_path = draft_dir / "runtime_sop.yaml"
     manifest_path = draft_dir / "runtime_sop_result.json"
     runtime_sop_path.write_text(yaml.safe_dump(runtime_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
