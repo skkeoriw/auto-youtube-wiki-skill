@@ -6847,8 +6847,9 @@ def edge_handoff_evaluator_env(sop, data):
         env["EDGE_HANDOFF_LLM_API_KEY"] = str(api_key.get("value"))
     if not is_blank_value(model.get("value")):
         env["EDGE_HANDOFF_LLM_MODEL"] = str(model.get("value"))
-    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "40")
-    env.setdefault("EDGE_HANDOFF_LLM_ATTEMPTS", "2")
+    ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_TIMEOUT", 40)
+    ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_ATTEMPTS", 2)
+    ensure_int_env_at_least(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 90)
     env.setdefault("EDGE_HANDOFF_LLM_MAX_TOKENS", "2048")
     return env, {
         "base_url": env_config_item(
@@ -6897,6 +6898,15 @@ def edge_handoff_model_lookup(context):
     return {"key": "EDGE_HANDOFF_LLM_MODEL", "value": os.environ.get("EDGE_HANDOFF_LLM_FALLBACK_MODEL", "deepseek-v4-pro"), "source": "default"}
 
 
+def ensure_int_env_at_least(env, key, minimum):
+    try:
+        current = int(str(env.get(key, "") or "0"))
+    except Exception:
+        current = 0
+    if current < minimum:
+        env[key] = str(minimum)
+
+
 def evaluate_edge_handoff(sop, workflow_id, data):
     request_payload = edge_handoff_request_payload(sop, workflow_id, data)
     if not (request_payload.get("upstream") or {}).get("node_id") or not (request_payload.get("downstream") or {}).get("node_id"):
@@ -6921,7 +6931,7 @@ def evaluate_edge_handoff(sop, workflow_id, data):
         command = ["python3", str(script), "--request-json", str(request_path), "--output-json", str(output_path), "--require-ai"]
         if allow_deterministic:
             command.append("--allow-deterministic")
-        evaluator_timeout = int(os.environ.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "90") or "90")
+        evaluator_timeout = int(evaluator_env.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "90") or "90")
         try:
             completed = subprocess.run(command, text=True, capture_output=True, timeout=evaluator_timeout, env=evaluator_env)
         except subprocess.TimeoutExpired as exc:
