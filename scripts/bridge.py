@@ -6850,7 +6850,7 @@ def edge_handoff_evaluator_env(sop, data):
     ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_TIMEOUT", 40)
     ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_ATTEMPTS", 2)
     ensure_int_env_at_least(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 90)
-    env.setdefault("EDGE_HANDOFF_LLM_MAX_TOKENS", "2048")
+    ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_MAX_TOKENS", 4096)
     return env, {
         "base_url": env_config_item(
             base_url.get("key") or "EDGE_HANDOFF_LLM_BASE_URL",
