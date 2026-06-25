@@ -6850,7 +6850,7 @@ def edge_handoff_evaluator_env(sop, data):
     ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_TIMEOUT", 40)
     ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_ATTEMPTS", 2)
     ensure_int_env_at_least(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 90)
-    ensure_int_env_at_least(env, "EDGE_HANDOFF_LLM_MAX_TOKENS", 4096)
+    clamp_int_env(env, "EDGE_HANDOFF_LLM_MAX_TOKENS", 1024, 1536)
     return env, {
         "base_url": env_config_item(
             base_url.get("key") or "EDGE_HANDOFF_LLM_BASE_URL",
@@ -6905,6 +6905,18 @@ def ensure_int_env_at_least(env, key, minimum):
         current = 0
     if current < minimum:
         env[key] = str(minimum)
+
+
+def clamp_int_env(env, key, minimum, maximum):
+    try:
+        current = int(str(env.get(key, "") or "0"))
+    except Exception:
+        current = 0
+    if current < minimum:
+        current = minimum
+    if current > maximum:
+        current = maximum
+    env[key] = str(current)
 
 
 def evaluate_edge_handoff(sop, workflow_id, data):
