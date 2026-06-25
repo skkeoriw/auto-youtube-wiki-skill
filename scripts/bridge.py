@@ -4183,6 +4183,110 @@ def trigger_workflow_draft_run(sop, workflow_id, data):
     return status, result
 
 
+def publish_workflow_draft_to_runtime(sop, workflow_id, data):
+    workflow_id = workflow_id or workflow_binding(sop).get("workflow_id") or sop.get("id") or ""
+    data = data if isinstance(data, dict) else {}
+    draft_id = str(data.get("draft_id") or data.get("draftId") or "").strip()
+    draft_path = str(data.get("draft_path") or data.get("draftPath") or "").strip()
+    draft_dir = resolve_workflow_draft_dir(sop, draft_id, draft_path)
+    if not draft_dir:
+        return {
+            "status": "failed",
+            "reason": "workflow draft not found",
+            "errors": [{"code": "draft_not_found", "message": "workflow draft path is missing"}],
+            "workflow_id": workflow_id,
+        }
+    runtime_result = read_json(draft_dir / "runtime_sop_result.json") or {}
+    runtime_sop_path = str(runtime_result.get("runtime_sop_path") or "")
+    if not runtime_sop_path or not Path(runtime_sop_path).exists():
+        runtime_result = generate_workflow_draft_runtime_sop(sop, workflow_id, {
+            "draft_id": draft_dir.name,
+            "draft_path": str(draft_dir),
+        })
+        if runtime_result.get("status") == "failed":
+            return runtime_result
+        runtime_sop_path = str(runtime_result.get("runtime_sop_path") or "")
+    runtime_sop_file = Path(runtime_sop_path).expanduser()
+    if not runtime_sop_file.exists():
+        return {
+            "status": "failed",
+            "reason": "runtime SOP snapshot missing",
+            "errors": [{"code": "runtime_sop_missing", "message": "runtime_sop.yaml is missing for this draft"}],
+            "workflow_id": workflow_id,
+            "draft_id": draft_dir.name,
+            "draft_path": str(draft_dir),
+        }
+    draft_manifest = read_json(draft_dir / "workflow_draft.json") or {}
+    draft_payload = draft_manifest.get("draft") if isinstance(draft_manifest.get("draft"), dict) else {}
+    requested_id = (
+        data.get("published_workflow_id")
+        or data.get("publishedWorkflowId")
+        or draft_payload.get("publishedWorkflowId")
+        or draft_payload.get("published_workflow_id")
+    )
+    published_id = slugify(requested_id or f"{workflow_id}-{draft_dir.name}")
+    if published_id == workflow_id:
+        published_id = slugify(f"{workflow_id}-{draft_dir.name}")
+    published_title = str(
+        data.get("title")
+        or draft_payload.get("title")
+        or draft_manifest.get("name")
+        or draft_payload.get("name")
+        or published_id
+    ).strip()
+    published_description = str(
+        data.get("description")
+        or draft_payload.get("goal")
+        or draft_manifest.get("goal")
+        or "Runtime-local workflow published from Workflow Draft."
+    ).strip()
+    publish_dir = runtime_workflows_root(sop) / published_id
+    publish_dir.mkdir(parents=True, exist_ok=True)
+    published_sop_file = publish_dir / "sop.yaml"
+    shutil.copyfile(runtime_sop_file, published_sop_file)
+    doc = read_yaml(published_sop_file)
+    if not isinstance(doc, dict):
+        doc = {}
+    nodes = doc.get("nodes") if isinstance(doc.get("nodes"), dict) else {}
+    edges = workflow_edge_rows(doc)
+    manifest = {
+        "status": "published",
+        "workflow_id": published_id,
+        "source_workflow_id": workflow_id,
+        "name": published_id,
+        "title": published_title,
+        "description": published_description,
+        "version": f"runtime-local-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        "sop_type": doc.get("id") or doc.get("name") or workflow_id,
+        "interpreter": "generic-dag",
+        "workflow_type": "business",
+        "definition_source": "runtime-local-published",
+        "draft_id": draft_dir.name,
+        "draft_path": str(draft_dir),
+        "runtime_sop_source": str(runtime_sop_file),
+        "runtime_sop_path": str(published_sop_file),
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+        "runtime_id": sop.get("runtime_id", ""),
+        "published_at": _now_iso_utc(),
+        "active_runtime_sop_changed": False,
+        "production_dag_changed": False,
+        "repo_first_required": False,
+    }
+    write_json(publish_dir / "workflow.json", manifest)
+    draft_manifest["published_runtime_workflow"] = manifest
+    draft_manifest["runtime_publish_status"] = "published"
+    draft_manifest["updated_at"] = _now_iso_utc()
+    write_json(draft_dir / "workflow_draft.json", draft_manifest)
+    _SOP_READ_CACHE.clear()
+    return {
+        **manifest,
+        "message": "Workflow Draft published as a Runtime-local workflow definition. Source SOP repo is unchanged.",
+        "catalog_url": "/api/sop/v1/workflows",
+    }
+
+
 def list_workflow_edge_drafts(sop):
     drafts_dir = Path(sop["wiki_local_path"]) / "raw" / "workflow-drafts"
     drafts = []
@@ -4941,6 +5045,124 @@ def workflow_binding(sop):
         "node_count": len(business_nodes),
         "enabled_node_count": len(business_nodes),
         "binding_status": "ready" if business_nodes else "invalid",
+    }
+
+
+def workflow_definition_from_sop(sop):
+    binding = workflow_binding(sop)
+    workflow_id = str(binding.get("workflow_id") or "").strip()
+    if not workflow_id:
+        return None
+    workflow_type = "management" if workflow_id == RUNTIME_MANAGEMENT_WORKFLOW_ID or sop.get("sop_type") == RUNTIME_MANAGEMENT_WORKFLOW_ID else "business"
+    interpreter = "runtime-management" if workflow_type == "management" else "generic-dag"
+    return {
+        "id": workflow_id,
+        "workflow_id": workflow_id,
+        "name": workflow_id,
+        "title": binding.get("workflow_name") or workflow_id,
+        "description": sop.get("description") or (
+            "Runtime-local workflow definition loaded from this instance."
+        ),
+        "version": binding.get("workflow_version") or sop.get("version", ""),
+        "sop_type": sop.get("sop_type") or workflow_id,
+        "interpreter": interpreter,
+        "workflow_type": workflow_type,
+        "definition_source": binding.get("definition_source") or "sop.yaml",
+        "definition_path": binding.get("definition_path") or "sop.yaml",
+        "node_count": binding.get("node_count") or 0,
+        "enabled_node_count": binding.get("enabled_node_count") or 0,
+        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+        "runtime_id": sop.get("runtime_id", ""),
+        "published": False,
+    }
+
+
+def runtime_workflows_root(sop):
+    return Path(sop["wiki_local_path"]) / "raw" / "runtime-workflows"
+
+
+def list_published_runtime_workflows_for_sop(sop):
+    root = runtime_workflows_root(sop)
+    workflows = []
+    if not root.exists():
+        return workflows
+    for workflow_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True):
+        manifest = read_json(workflow_dir / "workflow.json") or {}
+        sop_doc = read_yaml(workflow_dir / "sop.yaml")
+        if not isinstance(manifest, dict):
+            manifest = {}
+        if not isinstance(sop_doc, dict):
+            sop_doc = {}
+        workflow_id = str(manifest.get("workflow_id") or workflow_dir.name).strip()
+        if not workflow_id:
+            continue
+        nodes = sop_doc.get("nodes") if isinstance(sop_doc.get("nodes"), dict) else {}
+        business_nodes = [
+            node_id for node_id, config in nodes.items()
+            if node_id != "retry" and (config or {}).get("mode") != "manual"
+        ]
+        workflows.append({
+            "id": workflow_id,
+            "workflow_id": workflow_id,
+            "name": manifest.get("name") or workflow_id,
+            "title": manifest.get("title") or manifest.get("name") or workflow_id,
+            "description": manifest.get("description") or "Published Runtime-local Workflow Draft.",
+            "version": manifest.get("version") or "runtime-local",
+            "sop_type": manifest.get("sop_type") or sop_doc.get("id") or sop_doc.get("name") or workflow_id,
+            "interpreter": manifest.get("interpreter") or "generic-dag",
+            "workflow_type": manifest.get("workflow_type") or "business",
+            "definition_source": "runtime-local-published",
+            "definition_path": str(workflow_dir / "sop.yaml"),
+            "node_count": len(business_nodes),
+            "enabled_node_count": len(business_nodes),
+            "instance_id": sop.get("instance_id") or sop.get("id", ""),
+            "runtime_id": sop.get("runtime_id", ""),
+            "published": True,
+            "published_at": manifest.get("published_at") or "",
+            "draft_id": manifest.get("draft_id") or "",
+            "draft_path": manifest.get("draft_path") or "",
+            "runtime_sop_path": str(workflow_dir / "sop.yaml"),
+        })
+    return workflows
+
+
+def list_runtime_workflow_definitions(query=None):
+    query = query or {}
+    runtime = runtime_info()
+    registry = read_registry()
+    rows = []
+    seen = set()
+    for sop in load_sops():
+        definition = workflow_definition_from_sop(sop)
+        if definition and definition["workflow_id"] not in seen:
+            rows.append(definition)
+            seen.add(definition["workflow_id"])
+        for published in list_published_runtime_workflows_for_sop(sop):
+            workflow_id = published.get("workflow_id")
+            if workflow_id and workflow_id not in seen:
+                rows.append(published)
+                seen.add(workflow_id)
+    q = query_value(query, "q", "").lower().strip()
+    if q:
+        rows = [
+            item for item in rows
+            if q in " ".join(str(item.get(key) or "") for key in (
+                "workflow_id", "title", "description", "sop_type", "definition_source", "instance_id"
+            )).lower()
+        ]
+    page, page_size, offset = page_params(query, 50)
+    items = rows[offset:offset + page_size]
+    return {
+        "runtime_id": runtime["runtime_id"],
+        "runtime": runtime,
+        "channel": {
+            "name": registry.get("channel_name", ""),
+            "url": registry.get("channel_url", ""),
+            "spi_base_url": registry.get("spi_base_url", ""),
+        },
+        "workflows": items,
+        "items": items,
+        "page": page_meta(page, page_size, len(rows)),
     }
 
 
@@ -7786,6 +8008,9 @@ def workflow_id_matches(sop, workflow_id):
         str(sop.get("sop_type") or ""),
         str(sop.get("name") or ""),
     }
+    for item in list_published_runtime_workflows_for_sop(sop):
+        accepted.add(str(item.get("workflow_id") or ""))
+        accepted.add(str(item.get("name") or ""))
     return workflow_id in {item for item in accepted if item}
 
 
@@ -11476,6 +11701,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == ["api", "sop", "v1", "instances"]:
                 cache_key = f"instances:v1:{parsed.query}"
                 return json_response(self, 200, cached_read(cache_key, lambda: sop_instances_v1(query)))
+            if path == ["api", "sop", "v1", "workflows"]:
+                cache_key = f"workflows:v1:{parsed.query}"
+                return json_response(self, 200, cached_read(cache_key, lambda: list_runtime_workflow_definitions(query)))
             if len(path) >= 5 and path[0:4] == ["api", "sop", "v1", "instances"]:
                 sop = find_sop(path[4])
                 if not sop:
@@ -12106,6 +12334,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return json_response(self, 404, {"detail": "SOP not found"})
             http_code, result = trigger_workflow_draft_run(sop, path[4], {**data, "draft_id": path[6]})
             return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/drafts/{draft_id}/publish-runtime
+        if (len(path) == 8 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "drafts" and path[7] == "publish-runtime"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = publish_workflow_draft_to_runtime(sop, path[4], {**data, "draft_id": path[6]})
+            if result.get("status") == "failed":
+                return json_response(self, 422, result)
+            return json_response(self, 200, result)
 
         # POST /api/sop/{instance}/runs  → trigger
         if len(path) == 4 and path[:2] == ["api", "sop"] and path[3] == "runs":
