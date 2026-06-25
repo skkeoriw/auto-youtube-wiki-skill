@@ -6886,8 +6886,14 @@ def edge_handoff_model_lookup(context):
     for group in groups:
         resolved = node_run_config_lookup(context, group[0], group[1:])
         if not is_blank_value(resolved.get("value")):
+            if str(resolved.get("value") or "").strip() == "deepseek-v4-flash":
+                return {
+                    "key": "EDGE_HANDOFF_LLM_MODEL",
+                    "value": os.environ.get("EDGE_HANDOFF_LLM_FALLBACK_MODEL", "deepseek-v4-pro"),
+                    "source": f"{resolved.get('source') or resolved.get('key') or group[0]}:fallback-from-deepseek-v4-flash",
+                }
             return resolved
-    return {"key": "EDGE_HANDOFF_LLM_MODEL", "value": "deepseek-v4-flash", "source": "default"}
+    return {"key": "EDGE_HANDOFF_LLM_MODEL", "value": os.environ.get("EDGE_HANDOFF_LLM_FALLBACK_MODEL", "deepseek-v4-pro"), "source": "default"}
 
 
 def evaluate_edge_handoff(sop, workflow_id, data):
