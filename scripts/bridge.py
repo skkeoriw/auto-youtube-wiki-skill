@@ -6870,12 +6870,12 @@ def edge_handoff_evaluator_env(sop, data):
     # Public runtime channels have a short upstream timeout. Keep synchronous
     # Edge Handoff evaluation inside that budget so the UI receives structured
     # JSON instead of a network-level "Failed to fetch".
-    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "21")
+    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "23")
     env.setdefault("EDGE_HANDOFF_LLM_ATTEMPTS", "1")
-    env.setdefault("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "23")
-    clamp_int_env(env, "EDGE_HANDOFF_LLM_TIMEOUT", 8, 21)
+    env.setdefault("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "24")
+    clamp_int_env(env, "EDGE_HANDOFF_LLM_TIMEOUT", 8, 23)
     clamp_int_env(env, "EDGE_HANDOFF_LLM_ATTEMPTS", 1, 1)
-    clamp_int_env(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 10, 23)
+    clamp_int_env(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 10, 24)
     clamp_int_env(env, "EDGE_HANDOFF_LLM_MAX_TOKENS", 1024, 1536)
     return env, {
         "base_url": env_config_item(
@@ -6903,9 +6903,9 @@ def edge_handoff_evaluator_env(sop, data):
         "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file"],
         "sync_budget": {
             "public_timeout_budget_seconds": 25,
-            "llm_timeout_seconds": int(env.get("EDGE_HANDOFF_LLM_TIMEOUT", "21") or "21"),
+            "llm_timeout_seconds": int(env.get("EDGE_HANDOFF_LLM_TIMEOUT", "23") or "23"),
             "llm_attempts": int(env.get("EDGE_HANDOFF_LLM_ATTEMPTS", "1") or "1"),
-            "evaluator_timeout_seconds": int(env.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "23") or "23"),
+            "evaluator_timeout_seconds": int(env.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "24") or "24"),
         },
     }
 

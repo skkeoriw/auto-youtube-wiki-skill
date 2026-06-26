@@ -1747,9 +1747,9 @@ class ArtifactResolutionTest(unittest.TestCase):
             "assert os.environ.get('EDGE_HANDOFF_LLM_BASE_URL') == 'https://api-proxy.example/v1'\n"
             "assert os.environ.get('EDGE_HANDOFF_LLM_API_KEY') == 'secret-edge-key'\n"
             "assert os.environ.get('EDGE_HANDOFF_LLM_MODEL') == 'deepseek-v4-pro'\n"
-            "assert int(os.environ.get('EDGE_HANDOFF_LLM_TIMEOUT')) <= 21\n"
+            "assert int(os.environ.get('EDGE_HANDOFF_LLM_TIMEOUT')) <= 23\n"
             "assert int(os.environ.get('EDGE_HANDOFF_LLM_ATTEMPTS')) == 1\n"
-            "assert int(os.environ.get('EDGE_HANDOFF_EVALUATOR_TIMEOUT')) <= 23\n"
+            "assert int(os.environ.get('EDGE_HANDOFF_EVALUATOR_TIMEOUT')) <= 24\n"
             "evaluation={'status':'needs_instruction','summary':'fake ai eval','node_execution_guide':{'format':'markdown','prompt':''},'agent':{'used_ai':True}}\n"
             "json.dump(evaluation, open(out,'w',encoding='utf-8'))\n"
             "print(json.dumps(evaluation))\n",
@@ -1787,9 +1787,9 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(response["config"]["base_url"]["value"], "https://api-proxy.example/v1")
         self.assertEqual(response["config"]["api_key"]["masked_value"], "sec***key")
         self.assertEqual(response["config"]["model"]["value"], "deepseek-v4-pro")
-        self.assertLessEqual(response["config"]["sync_budget"]["llm_timeout_seconds"], 21)
+        self.assertLessEqual(response["config"]["sync_budget"]["llm_timeout_seconds"], 23)
         self.assertEqual(response["config"]["sync_budget"]["llm_attempts"], 1)
-        self.assertLessEqual(response["config"]["sync_budget"]["evaluator_timeout_seconds"], 23)
+        self.assertLessEqual(response["config"]["sync_budget"]["evaluator_timeout_seconds"], 24)
         self.assertNotIn("secret-edge-key", json.dumps(response["config"]))
 
     def test_workflow_edge_draft_route_requires_ai_approved_evaluation(self):
