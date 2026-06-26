@@ -6739,13 +6739,22 @@ def edge_handoff_compact_text(value, limit=1800):
     return text[:limit].rstrip() + "\n...[truncated for Edge Handoff evaluation]"
 
 
+def edge_handoff_skill_meta_text(value, limit=420):
+    text = str(value or "").strip()
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end >= 0:
+            return text[:end + 4].strip()
+    return edge_handoff_compact_text(text, limit)
+
+
 def edge_handoff_compact_node_context(node):
     node = node if isinstance(node, dict) else {}
     if not node:
         return {}
     result = dict(node)
-    result["skill_summary"] = edge_handoff_compact_text(result.get("skill_summary") or result.get("description") or "", 600)
-    result["skill_readme"] = edge_handoff_compact_text(result.get("skill_readme") or result.get("readme") or "", 800)
+    result["skill_summary"] = edge_handoff_skill_meta_text(result.get("skill_summary") or result.get("description") or "", 420)
+    result["skill_readme"] = edge_handoff_skill_meta_text(result.get("skill_readme") or result.get("readme") or "", 420)
     return result
 
 
