@@ -4164,12 +4164,30 @@ def trigger_workflow_draft_run(sop, workflow_id, data):
         return 422, snapshot_error
 
     input_data = data.get("input") if isinstance(data.get("input"), dict) else {}
-    url = str(data.get("url") or input_data.get("url") or "").strip()
+    first_node_inputs = data.get("first_node_inputs") if isinstance(data.get("first_node_inputs"), dict) else {}
+    flattened_first_inputs = {}
+    for node_inputs in first_node_inputs.values():
+        if isinstance(node_inputs, dict):
+            flattened_first_inputs.update(node_inputs)
+    url = str(
+        data.get("url")
+        or data.get("source_url")
+        or input_data.get("url")
+        or input_data.get("source_url")
+        or flattened_first_inputs.get("url")
+        or flattened_first_inputs.get("source_url")
+        or ""
+    ).strip()
+    merged_input = {**flattened_first_inputs, **input_data}
+    if url:
+        merged_input.setdefault("url", url)
+        merged_input.setdefault("source_url", url)
     request_body = {
         **data,
         "repo": data.get("repo") or sop.get("repo", ""),
-        "input": {**input_data, "url": url},
+        "input": merged_input,
         "url": url,
+        "source_url": url,
         "workflow_id": workflow_id,
         "workflow_draft_id": draft_dir.name,
         "workflow_draft_path": str(draft_dir),

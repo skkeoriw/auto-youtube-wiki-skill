@@ -2628,13 +2628,15 @@ class ArtifactResolutionTest(unittest.TestCase):
                 "draft_id": draft["draft_id"],
                 "runtime_sop_path": runtime["runtime_sop_path"],
                 "repo": "skkeoriw/wiki-test",
-                "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "input": {"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                "first_node_inputs": {"youtube-fetch": {"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}},
             })
 
         self.assertEqual(code, 200)
         self.assertEqual(result["pipeline_id"], "draft-pipeline-1")
         self.assertEqual(result["workflow_draft_id"], draft["draft_id"])
         self.assertEqual(captured["env"]["YOUTUBE_WIKI_RUNTIME_SOP_FILE"], runtime["runtime_sop_path"])
+        self.assertIn("https://www.youtube.com/watch?v=dQw4w9WgXcQ", captured["command"])
         self.assertIn("--intent", captured["command"])
 
     def test_business_node_test_plan_resolves_generated_fixture(self):
