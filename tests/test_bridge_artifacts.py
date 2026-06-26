@@ -1750,6 +1750,7 @@ class ArtifactResolutionTest(unittest.TestCase):
             "assert int(os.environ.get('EDGE_HANDOFF_LLM_TIMEOUT')) <= 23\n"
             "assert int(os.environ.get('EDGE_HANDOFF_LLM_ATTEMPTS')) == 1\n"
             "assert int(os.environ.get('EDGE_HANDOFF_EVALUATOR_TIMEOUT')) <= 24\n"
+            "assert int(os.environ.get('EDGE_HANDOFF_LLM_MAX_TOKENS')) >= 4096\n"
             "evaluation={'status':'needs_instruction','summary':'fake ai eval','node_execution_guide':{'format':'markdown','prompt':''},'agent':{'used_ai':True}}\n"
             "json.dump(evaluation, open(out,'w',encoding='utf-8'))\n"
             "print(json.dumps(evaluation))\n",
