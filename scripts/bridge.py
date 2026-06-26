@@ -6867,15 +6867,25 @@ def edge_handoff_evaluator_env(sop, data):
         env["EDGE_HANDOFF_LLM_API_KEY"] = str(api_key.get("value"))
     if not is_blank_value(model.get("value")):
         env["EDGE_HANDOFF_LLM_MODEL"] = str(model.get("value"))
+    async_job = bool(data.get("async_job"))
     # Public runtime channels have a short upstream timeout. Keep synchronous
     # Edge Handoff evaluation inside that budget so the UI receives structured
-    # JSON instead of a network-level "Failed to fetch".
-    env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "23")
-    env.setdefault("EDGE_HANDOFF_LLM_ATTEMPTS", "1")
-    env.setdefault("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "24")
-    clamp_int_env(env, "EDGE_HANDOFF_LLM_TIMEOUT", 8, 23)
-    clamp_int_env(env, "EDGE_HANDOFF_LLM_ATTEMPTS", 1, 1)
-    clamp_int_env(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 10, 24)
+    # JSON instead of a network-level "Failed to fetch". Background jobs can
+    # use a longer budget because the browser polls their persisted result.
+    if async_job:
+        env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "75")
+        env.setdefault("EDGE_HANDOFF_LLM_ATTEMPTS", "1")
+        env.setdefault("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "90")
+        clamp_int_env(env, "EDGE_HANDOFF_LLM_TIMEOUT", 20, 75)
+        clamp_int_env(env, "EDGE_HANDOFF_LLM_ATTEMPTS", 1, 1)
+        clamp_int_env(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 30, 90)
+    else:
+        env.setdefault("EDGE_HANDOFF_LLM_TIMEOUT", "23")
+        env.setdefault("EDGE_HANDOFF_LLM_ATTEMPTS", "1")
+        env.setdefault("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "24")
+        clamp_int_env(env, "EDGE_HANDOFF_LLM_TIMEOUT", 8, 23)
+        clamp_int_env(env, "EDGE_HANDOFF_LLM_ATTEMPTS", 1, 1)
+        clamp_int_env(env, "EDGE_HANDOFF_EVALUATOR_TIMEOUT", 10, 24)
     clamp_int_env(env, "EDGE_HANDOFF_LLM_MAX_TOKENS", 1024, 1536)
     return env, {
         "base_url": env_config_item(
@@ -6903,9 +6913,10 @@ def edge_handoff_evaluator_env(sop, data):
         "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file"],
         "sync_budget": {
             "public_timeout_budget_seconds": 25,
-            "llm_timeout_seconds": int(env.get("EDGE_HANDOFF_LLM_TIMEOUT", "23") or "23"),
+            "mode": "async" if async_job else "sync",
+            "llm_timeout_seconds": int(env.get("EDGE_HANDOFF_LLM_TIMEOUT", "75" if async_job else "23") or ("75" if async_job else "23")),
             "llm_attempts": int(env.get("EDGE_HANDOFF_LLM_ATTEMPTS", "1") or "1"),
-            "evaluator_timeout_seconds": int(env.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "24") or "24"),
+            "evaluator_timeout_seconds": int(env.get("EDGE_HANDOFF_EVALUATOR_TIMEOUT", "90" if async_job else "24") or ("90" if async_job else "24")),
         },
     }
 
@@ -7042,6 +7053,113 @@ def evaluate_edge_handoff(sop, workflow_id, data):
             "evaluation": evaluation,
             "stderr": stderr[-4000:],
         }
+
+
+def edge_handoff_evaluation_dir(sop):
+    path = Path(sop["wiki_local_path"]) / "raw" / "workflow-drafts" / "edge-evaluations"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def edge_handoff_evaluation_path(sop, evaluation_id):
+    safe_id = slugify(evaluation_id)
+    return edge_handoff_evaluation_dir(sop) / f"{safe_id}.json"
+
+
+def write_edge_handoff_evaluation(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_edge_handoff_evaluation(sop, evaluation_id):
+    path = edge_handoff_evaluation_path(sop, evaluation_id)
+    if not path.is_file():
+        return None
+    data = read_json(path) or {}
+    data.setdefault("evaluation_id", slugify(evaluation_id))
+    return data
+
+
+def run_edge_handoff_evaluation_job(sop, workflow_id, data, evaluation_id, job_path):
+    started_at = datetime.now(timezone.utc).isoformat()
+    write_edge_handoff_evaluation(job_path, {
+        "ok": False,
+        "status": "running",
+        "mode": "edge-handoff-agent-evaluation-job",
+        "evaluation_id": evaluation_id,
+        "sop_id": sop.get("id", ""),
+        "workflow_id": workflow_id,
+        "edge_id": data.get("edge_id") or (data.get("edge") or {}).get("id") or "",
+        "started_at": started_at,
+    })
+    job_data = dict(data)
+    job_data["async_job"] = True
+    try:
+        http_status, result = evaluate_edge_handoff(sop, workflow_id, job_data)
+        evaluation = result.get("evaluation") if isinstance(result, dict) else {}
+        status = "done" if http_status < 500 and bool(result.get("ok")) else "failed"
+        write_edge_handoff_evaluation(job_path, {
+            "ok": bool(result.get("ok")),
+            "status": status,
+            "http_status": http_status,
+            "mode": "edge-handoff-agent-evaluation-job",
+            "evaluation_id": evaluation_id,
+            "sop_id": sop.get("id", ""),
+            "workflow_id": workflow_id,
+            "edge_id": result.get("edge_id") if isinstance(result, dict) else "",
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "result": result,
+            "evaluation": evaluation if isinstance(evaluation, dict) else {},
+        })
+    except Exception as exc:
+        write_edge_handoff_evaluation(job_path, {
+            "ok": False,
+            "status": "failed",
+            "mode": "edge-handoff-agent-evaluation-job",
+            "evaluation_id": evaluation_id,
+            "sop_id": sop.get("id", ""),
+            "workflow_id": workflow_id,
+            "edge_id": data.get("edge_id") or (data.get("edge") or {}).get("id") or "",
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc),
+            "evaluation": {
+                "status": "blocked",
+                "summary": "Edge Handoff Agent async evaluation failed.",
+                "blocking_reasons": [{"code": "edge_handoff_async_failed", "message": str(exc)}],
+                "agent": {"used_ai": False},
+            },
+        })
+
+
+def start_edge_handoff_evaluation_job(sop, workflow_id, data):
+    edge_id = str(data.get("edge_id") or (data.get("edge") or {}).get("id") or "edge").strip()
+    evaluation_id = f"edge-eval-{slugify(edge_id)}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{hashlib.sha1(os.urandom(16)).hexdigest()[:6]}"
+    job_path = edge_handoff_evaluation_path(sop, evaluation_id)
+    initial = {
+        "ok": False,
+        "status": "queued",
+        "mode": "edge-handoff-agent-evaluation-job",
+        "evaluation_id": evaluation_id,
+        "sop_id": sop.get("id", ""),
+        "workflow_id": workflow_id,
+        "edge_id": edge_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_edge_handoff_evaluation(job_path, initial)
+    thread = threading.Thread(
+        target=run_edge_handoff_evaluation_job,
+        args=(dict(sop), workflow_id, dict(data), evaluation_id, job_path),
+        daemon=True,
+    )
+    thread.start()
+    return {
+        **initial,
+        "poll_url": f"/api/sop/{quote(str(sop.get('id') or sop.get('instance_id') or ''))}/workflows/{quote(str(workflow_id))}/edges/evaluations/{quote(evaluation_id)}",
+    }
 
 
 def workflow_edge_skill_meta(node):
@@ -12416,6 +12534,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "sop_id": sop.get("id", ""),
                         "drafts": list_workflow_edge_drafts(sop),
                     })
+                # GET /api/sop/{instance}/workflows/{workflow_id}/edges/evaluations/{evaluation_id}
+                if (len(path) == 8 and path[3] == "workflows"
+                        and path[5] == "edges" and path[6] == "evaluations"):
+                    job = read_edge_handoff_evaluation(sop, path[7])
+                    return json_response(self, 200 if job else 404, job or {"detail": "Edge Handoff evaluation not found"})
                 # GET /api/sop/{instance}/nodes/{node_id} — static node config
                 if len(path) == 5 and path[3] == "nodes":
                     endpoint = str((sop.get("channel") or {}).get("url") or request_endpoint(self))
@@ -12631,6 +12754,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             workflow_id = str(data.get("workflow_id") or workflow_binding(sop).get("workflow_id") or sop.get("id") or "")
+            if bool(data.get("async") or data.get("async_job")):
+                return json_response(self, 202, start_edge_handoff_evaluation_job(sop, workflow_id, data))
             http_code, result = evaluate_edge_handoff(sop, workflow_id, data)
             return json_response(self, http_code, result)
 
@@ -12640,6 +12765,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
+            if bool(data.get("async") or data.get("async_job")):
+                return json_response(self, 202, start_edge_handoff_evaluation_job(sop, path[4], data))
             http_code, result = evaluate_edge_handoff(sop, path[4], data)
             return json_response(self, http_code, result)
 
