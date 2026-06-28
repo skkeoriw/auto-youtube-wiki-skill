@@ -860,13 +860,29 @@ def runtime_id_from_channel_url(channel_url):
 def runtime_setting_id_aliases(sop=None, runtime=None):
     sop = sop if isinstance(sop, dict) else {}
     runtime = runtime if isinstance(runtime, dict) else runtime_info()
-    candidates = [
-        runtime_id_from_channel_url(runtime.get("channel_url")),
-        sop.get("runtime_id"),
-        runtime.get("runtime_id"),
-        runtime.get("id"),
-        runtime.get("display_name"),
-    ]
+    explicit_runtime_id = str(sop.get("runtime_id") or "").strip()
+    runtime_ids = {
+        str(runtime.get("runtime_id") or "").strip(),
+        str(runtime.get("id") or "").strip(),
+        str(runtime.get("display_name") or "").strip(),
+    }
+    channel_runtime_id = runtime_id_from_channel_url(runtime.get("channel_url"))
+    if explicit_runtime_id and explicit_runtime_id not in runtime_ids:
+        candidates = [
+            explicit_runtime_id,
+            channel_runtime_id,
+            runtime.get("runtime_id"),
+            runtime.get("id"),
+            runtime.get("display_name"),
+        ]
+    else:
+        candidates = [
+            channel_runtime_id,
+            explicit_runtime_id,
+            runtime.get("runtime_id"),
+            runtime.get("id"),
+            runtime.get("display_name"),
+        ]
     result = []
     for value in candidates:
         text = str(value or "").strip()
@@ -2244,8 +2260,14 @@ def node_static_config(sop, node_id):
         ])
     skill_script = next((str(p.relative_to(plugin_dir.parent)) for p in script_candidates if p.exists()), None)
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+    manifest_entry_inputs = manifest.get("entry_inputs") if isinstance(manifest.get("entry_inputs"), dict) else {}
     manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
     manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
+    node_inputs = merge_contracts(
+        manifest_entry_inputs or manifest_inputs,
+        config.get("inputs", {}),
+        "input",
+    )
 
     return {
         "node_id": node_id,
@@ -2261,7 +2283,10 @@ def node_static_config(sop, node_id):
             "skill": configured_executor.get("skill") or config.get("skill") or manifest_executor.get("skill", ""),
             "webhook_route": config.get("webhook_route", ""),
         },
-        "inputs": merge_contracts(manifest_inputs, config.get("inputs", {}), "input"),
+        "inputs": node_inputs,
+        "workflow_inputs": merge_contracts(manifest_inputs, config.get("inputs", {}), "input"),
+        "entry_inputs": merge_contracts(manifest_entry_inputs or manifest_inputs, {}, "input"),
+        "handoff": manifest.get("handoff") if isinstance(manifest.get("handoff"), dict) else {},
         "outputs": merge_contracts(manifest_outputs, config.get("outputs", {}), "output"),
         "optional_inputs": merge_contracts(manifest_optional_inputs, config.get("optional_inputs", {}), "input"),
         "infra": config.get("infra", {"tg_notify": True, "log_record": True}),
@@ -2380,10 +2405,11 @@ def merge_contracts(definition_value, binding_value, direction):
         if isinstance(definition.get(name), dict):
             item.update(definition[name])
         if isinstance(binding.get(name), dict):
-            # Workflow bindings supply runtime wiring such as `from` or path. They
-            # should not erase definition-owned type/resolver metadata.
+            # Input bindings only supply runtime wiring such as `from`; output
+            # bindings may also define whether a value is context/scalar or file.
             for key, value in binding[name].items():
-                if key in {"from", "path", "type"} or key not in item:
+                binding_overrides = {"from", "path", "type"} if direction == "output" else {"from", "path"}
+                if key in binding_overrides or key not in item:
                     item[key] = value
         if direction == "input":
             item.setdefault("required", True)
@@ -2421,6 +2447,7 @@ def node_registry_item(sop, node_id, endpoint=""):
     instance_id = sop.get("id") or sop.get("name") or ""
     manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+    manifest_entry_inputs = manifest.get("entry_inputs") if isinstance(manifest.get("entry_inputs"), dict) else {}
     manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
     manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
     manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
@@ -2451,7 +2478,10 @@ def node_registry_item(sop, node_id, endpoint=""):
             "readme_path": static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else "",
             "summary": static.get("skill_readme", ""),
         },
-        "inputs": normalize_contract(manifest_inputs or static.get("inputs", {}), "input"),
+        "entry_inputs": normalize_contract(manifest_entry_inputs or manifest_inputs or static.get("entry_inputs", {}) or static.get("inputs", {}), "input"),
+        "handoff": manifest.get("handoff") if isinstance(manifest.get("handoff"), dict) else static.get("handoff") or {},
+        "workflow_inputs": normalize_contract(static.get("workflow_inputs") or {}, "input"),
+        "inputs": normalize_contract(manifest_entry_inputs or manifest_inputs or static.get("inputs", {}), "input"),
         "optional_inputs": normalize_contract(manifest_optional_inputs or static.get("optional_inputs", {}), "input"),
         "outputs": normalize_contract(manifest_outputs or static.get("outputs", {}), "output"),
         "capabilities": {
@@ -2805,11 +2835,10 @@ def slugify(value):
 def draft_from_skill(spec):
     node_id = slugify(spec.get("node_id") or spec.get("title") or "new-node")
     skill_id = str(spec.get("skill_id") or node_id)
-    upstream = str(spec.get("upstream") or "")
-    upstream_output = str(spec.get("upstream_output") or "output")
-    input_name = str(spec.get("input_name") or "input")
-    output_name = str(spec.get("output_name") or "artifact")
+    entry_input_name = str(spec.get("entry_input_name") or spec.get("input_name") or "prompt")
+    output_name = str(spec.get("output_name") or "result")
     return {
+        "schema": "node-definition/v1",
         "id": node_id,
         "title": spec.get("title") or node_id,
         "description": spec.get("description") or "",
@@ -2826,18 +2855,40 @@ def draft_from_skill(spec):
             "entry": spec.get("entry") or f"scripts/run_{node_id.replace('-', '_')}.sh",
         },
         "mode": spec.get("mode") or "blocking",
-        "needs": [upstream] if upstream else [],
-        "inputs": {
-            input_name: {
-                "type": spec.get("input_type") or "auto",
+        "entry_inputs": {
+            entry_input_name: {
+                "type": spec.get("input_type") or "string",
+                "kind": "scalar",
+                "value_type": spec.get("input_value_type") or "text",
                 "required": True,
-                "from": f"{upstream}.outputs.{upstream_output}" if upstream else "",
+            }
+        },
+        "handoff": {
+            "accepts": [
+                {"role": "upstream_outputs_dir", "required": False},
+                {"role": "instruction", "required": True},
+                {"role": "context", "required": False},
+            ],
+            "produces": {
+                "outputs_dir": "raw/node-runs/{run_id}/outputs",
+                "manifest": "raw/node-runs/{run_id}/outputs/manifest.json",
+            },
+        },
+        "inputs": {
+            entry_input_name: {
+                "type": spec.get("input_type") or "string",
+                "kind": "scalar",
+                "value_type": spec.get("input_value_type") or "text",
+                "required": True,
             }
         },
         "outputs": {
             output_name: {
                 "type": spec.get("output_type") or "file",
-                "path": spec.get("output_path") or f"raw/{node_id}/{{pipeline_id}}/{output_name}",
+                "kind": spec.get("output_type") or "file",
+                "value_type": spec.get("output_value_type") or "json",
+                "relayable": True,
+                "path": spec.get("output_path") or f"raw/node-runs/{{run_id}}/outputs/outputs/{output_name}.json",
             }
         },
         "capabilities": {
@@ -2880,16 +2931,16 @@ def node_draft_schema():
             {"name": "node_id", "label": "Node ID", "type": "slug", "required": True, "maps_to": "id"},
             {"name": "title", "label": "Title", "type": "string", "required": True, "maps_to": "title"},
             {"name": "description", "label": "Description", "type": "text", "required": False, "maps_to": "description"},
-            {"name": "upstream", "label": "Upstream node", "type": "node_id", "required": False, "maps_to": "needs[0]"},
-            {"name": "upstream_output", "label": "Upstream output", "type": "string", "required": False, "default": "output", "maps_to": "inputs.*.from"},
-            {"name": "input_name", "label": "Input name", "type": "slug", "required": False, "default": "input", "maps_to": "inputs"},
+            {"name": "entry_input_name", "label": "Entry input name", "type": "slug", "required": False, "default": "prompt", "maps_to": "entry_inputs"},
+            {"name": "input_type", "label": "Entry input type", "type": "enum", "required": False, "default": "string", "maps_to": "entry_inputs.*.type"},
+            {"name": "input_value_type", "label": "Entry input value type", "type": "enum", "required": False, "default": "text", "maps_to": "entry_inputs.*.value_type"},
             {"name": "output_name", "label": "Output name", "type": "slug", "required": False, "default": "artifact", "maps_to": "outputs"},
             {
                 "name": "output_path",
                 "label": "Output path",
                 "type": "path_pattern",
                 "required": False,
-                "default": "raw/{node_id}/{pipeline_id}/{output_name}",
+                "default": "raw/node-runs/{run_id}/outputs/outputs/{output_name}.json",
                 "maps_to": "outputs.*.path",
             },
         ],
@@ -2908,7 +2959,8 @@ def node_draft_schema():
             "executor_type": "agent-skill",
             "agent": "hermes",
             "mode": "blocking",
-            "input_type": "auto",
+            "input_type": "string",
+            "input_value_type": "text",
             "output_type": "file",
             "category": "custom",
             "capabilities": {
@@ -2944,7 +2996,7 @@ def validate_node_draft_input(spec, existing_nodes=None):
                 "code": "required",
                 "message": f"{field.get('label', name)} is required",
             })
-    for name in ("skill_id", "node_id", "input_name", "output_name"):
+    for name in ("skill_id", "node_id", "entry_input_name", "input_name", "output_name"):
         value = spec.get(name)
         if value and slugify(str(value)) != str(value).strip().lower():
             errors.append({
@@ -3327,7 +3379,9 @@ def proposed_workflow_edge_from_draft(sop, workflow_id, spec):
     if not isinstance(relay_mappings, list):
         relay_mappings = edge.get("relayMappings") if isinstance(edge.get("relayMappings"), list) else []
     relay_mappings = normalize_relay_mappings(relay_mappings)
-    if not relay_mappings:
+    if relay_mode == "auto_by_target_inputs":
+        relay_mappings = []
+    if relay_mode != "auto_by_target_inputs" and not relay_mappings:
         relay_mappings = workflow_edge_evaluation_relay_mappings(spec)
     guide = evaluation.get("node_execution_guide") if isinstance(evaluation.get("node_execution_guide"), dict) else {}
     return {
@@ -5066,7 +5120,7 @@ def workflow_binding(sop):
             "binding_status": "unbound",
         }
     return {
-        "workflow_id": sop.get("raw_id") or sop.get("sop_type") or sop_id,
+        "workflow_id": sop.get("raw_id") or sop.get("workflow_id") or sop_id or sop.get("sop_type"),
         "workflow_name": sop.get("workflow_title") or sop.get("name") or sop_id,
         "workflow_version": sop.get("version", ""),
         "definition_source": "sop.yaml",
@@ -6136,14 +6190,30 @@ def node_run_input_sources_dir(sop, node_run_id):
 
 
 def node_run_output_files_dir(sop, node_run_id):
+    return node_run_workspace(sop, node_run_id) / "outputs"
+
+
+def node_run_legacy_output_files_dir(sop, node_run_id):
     return node_run_workspace(sop, node_run_id) / "outputs" / "files"
+
+
+def node_run_existing_output_dir(sop, node_run_id):
+    primary = node_run_output_files_dir(sop, node_run_id)
+    legacy = node_run_legacy_output_files_dir(sop, node_run_id)
+    if (primary / "manifest.json").exists():
+        return primary
+    if (legacy / "manifest.json").exists() or legacy.exists():
+        return legacy
+    if primary.exists():
+        return primary
+    return primary
 
 
 def node_run_manifest_path(sop, node_run_id, kind):
     if kind == "input":
         return node_run_input_sources_dir(sop, node_run_id) / "manifest.json"
     if kind == "output":
-        return node_run_output_files_dir(sop, node_run_id) / "manifest.json"
+        return node_run_existing_output_dir(sop, node_run_id) / "manifest.json"
     return node_run_workspace(sop, node_run_id) / f"{kind}-manifest.json"
 
 
@@ -6354,6 +6424,7 @@ def node_run_audit_evidence_paths(sop, node_run_id):
 
     for relative in (
         f"raw/node-runs/{node_run_id}/input.json",
+        f"raw/node-runs/{node_run_id}/request.json",
         f"raw/node-runs/{node_run_id}/result.json",
         f"raw/node-runs/{node_run_id}/events.jsonl",
         f"raw/node-runs/{node_run_id}/executor.log",
@@ -6367,6 +6438,13 @@ def node_run_audit_evidence_paths(sop, node_run_id):
     input_dir = wiki / "raw" / "node-runs" / node_run_id / "inputs" / "sources"
     if input_dir.exists():
         for child in sorted(input_dir.rglob("*")):
+            if child.is_file():
+                rel = safe_relative_file(wiki, child)
+                if rel and rel not in paths:
+                    paths.append(rel)
+    output_dir = wiki / "raw" / "node-runs" / node_run_id / "outputs"
+    if output_dir.exists():
+        for child in sorted(output_dir.rglob("*")):
             if child.is_file():
                 rel = safe_relative_file(wiki, child)
                 if rel and rel not in paths:
@@ -7224,7 +7302,7 @@ def contract_value_type(spec):
     return str(spec.get("value_type") or spec.get("content_type") or spec.get("kind") or spec.get("type") or "text")
 
 
-def generated_fixture_value(name, spec):
+def workflow_edge_generated_fixture_value(name, spec):
     spec = spec if isinstance(spec, dict) else {}
     value_type = contract_value_type(spec)
     lowered = f"{name} {value_type}".lower()
@@ -7246,10 +7324,10 @@ def workflow_edge_generated_fixture(upstream):
     items = []
     for output_name, spec in outputs.items():
         spec = spec if isinstance(spec, dict) else {}
-        value = generated_fixture_value(output_name, spec)
+        value = workflow_edge_generated_fixture_value(output_name, spec)
         value_type = contract_value_type(spec)
         kind = str(spec.get("kind") or spec.get("type") or ("file" if str(spec.get("path") or "").strip() else "scalar"))
-        path = str(spec.get("path") or f"raw/node-runs/{{source_node_run_id}}/outputs/files/{output_name}.txt")
+        path = str(spec.get("path") or f"raw/node-runs/{{source_node_run_id}}/outputs/outputs/{output_name}.txt")
         items.append({
             "name": output_name,
             "kind": kind,
@@ -9830,10 +9908,12 @@ def node_run_source_manifest_items(sop, source_node_run_id):
     if not source_node_run_id:
         return []
 
-    output_dir = node_run_output_files_dir(sop, source_node_run_id)
+    output_dir = node_run_existing_output_dir(sop, source_node_run_id)
     manifest = read_json(output_dir / "manifest.json") or {}
     rows = []
     raw_items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    if not raw_items and isinstance(manifest.get("produced"), list):
+        raw_items = manifest.get("produced")
     for item in raw_items:
         if not isinstance(item, dict):
             continue
@@ -9858,7 +9938,7 @@ def node_run_source_manifest_items(sop, source_node_run_id):
 
     if output_dir.exists():
         for path in sorted(output_dir.rglob("*")):
-            if not path.is_file() or path.name == "manifest.json":
+            if not path.is_file() or path.name in {"manifest.json", "report.json"}:
                 continue
             rel = safe_relative_file(wiki, path)
             if rel:
@@ -10378,6 +10458,45 @@ def apply_resolved_inputs_to_pipeline_context(sop, wiki, ctx, plan, node_id, nod
     return ctx, input_info
 
 
+def write_node_execution_request(sop, wiki, node_run_id, node_id, plan, input_info):
+    source_node_run_id = sanitize_node_run_id(plan.get("source_node_run_id") or "")
+    handoff_sources = []
+    if source_node_run_id:
+        source_output_dir = node_run_existing_output_dir(sop, source_node_run_id)
+        handoff_sources.append({
+            "from_node": ((plan.get("relay_selection") or {}).get("source_node") or ""),
+            "from_run_id": source_node_run_id,
+            "outputs_dir": safe_relative_file(wiki, source_output_dir),
+            "manifest": safe_relative_file(wiki, source_output_dir / "manifest.json"),
+        })
+    request_path = node_run_workspace(sop, node_run_id) / "request.json"
+    entry_inputs = {}
+    resolved_values = input_info.get("resolved_values") if isinstance(input_info.get("resolved_values"), dict) else {}
+    for key, value in resolved_values.items():
+        if not is_blank_value(value):
+            entry_inputs[key] = value
+    request = {
+        "schema": "node-execution-request/v1",
+        "runtime_id": plan.get("runtime_id") or runtime_info().get("runtime_id", ""),
+        "instance_id": plan.get("instance_id") or sop.get("id") or sop.get("instance_id") or "",
+        "workflow_id": plan.get("workflow_id") or sop.get("id") or sop.get("name") or "",
+        "node_id": node_id,
+        "run_id": node_run_id,
+        "entry_inputs": entry_inputs,
+        "handoff_sources": handoff_sources,
+        "handoff_instruction": plan.get("relay_instruction") or (plan.get("node_execution_guide") or {}).get("prompt") or "",
+        "input_manifest": input_info.get("manifest_path") or "",
+        "input_directory": input_info.get("directory") or "",
+        "outputs_dir": safe_relative_file(wiki, node_run_output_files_dir(sop, node_run_id)),
+        "output_manifest": safe_relative_file(wiki, node_run_output_files_dir(sop, node_run_id) / "manifest.json"),
+        "edge_contract": input_info.get("edge_contract") or plan.get("edge_contract") or {},
+        "node_execution_guide": input_info.get("node_execution_guide") or plan.get("node_execution_guide") or {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(request_path, request)
+    return safe_relative_file(wiki, request_path), request
+
+
 def prepare_real_node_context(sop, node_run_id, node_id, plan):
     wiki = Path(sop["wiki_local_path"]).expanduser()
     ctx_file = wiki / "raw" / "pipeline-context.json"
@@ -10385,6 +10504,7 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
     if not isinstance(ctx, dict):
         ctx = {}
     ctx, input_info = apply_resolved_inputs_to_pipeline_context(sop, wiki, ctx, plan, node_id, node_run_id)
+    request_path, execution_request = write_node_execution_request(sop, wiki, node_run_id, node_id, plan, input_info)
     ctx.update({
         "pipeline_id": node_run_id,
         "node_run": {
@@ -10397,6 +10517,8 @@ def prepare_real_node_context(sop, node_run_id, node_id, plan):
             "input_manifest": input_info.get("manifest_path"),
             "input_directory": input_info.get("directory"),
             "input_files": input_info.get("files") or [],
+            "execution_request": request_path,
+            "execution_request_data": execution_request,
             "edge_contract": input_info.get("edge_contract") or plan.get("edge_contract") or {},
             "node_execution_guide": input_info.get("node_execution_guide") or plan.get("node_execution_guide") or {},
             "workflow_revision": input_info.get("workflow_revision") or plan.get("workflow_revision") or {},
@@ -10464,6 +10586,7 @@ def node_run_subprocess_env(sop, node_run_id, plan):
         "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:{os.environ.get('PATH', '')}",
         "YOUTUBE_WIKI_NODE_RUN": "1",
         "YOUTUBE_WIKI_NODE_RUN_ID": safe_id,
+        "YOUTUBE_WIKI_NODE_EXECUTION_REQUEST": str(node_run_workspace(sop, safe_id) / "request.json"),
         "YOUTUBE_WIKI_NODE_RUN_INPUT_DIR": str(input_dir),
         "YOUTUBE_WIKI_NODE_RUN_INPUT_MANIFEST": str(input_dir / "manifest.json"),
         "YOUTUBE_WIKI_NODE_RUN_OUTPUT_DIR": str(output_dir),
@@ -10551,7 +10674,7 @@ def collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs
         if rel:
             run_records.append(rel)
     run_records = ordered_unique(path for path in run_records if path not in core_set and path not in set(raw_files))
-    node_run_outputs = files_under_relative_dir(wiki, f"raw/node-runs/{node_run_id}/outputs/files")
+    node_run_outputs = files_under_relative_dir(wiki, f"raw/node-runs/{node_run_id}/outputs")
     node_run_outputs = ordered_unique(node_run_outputs)
 
     return {
@@ -10575,7 +10698,7 @@ def collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs
         },
         "node_run_outputs": {
             "title": "统一输出目录",
-            "description": "本次 Node Run 写入 outputs/files 的可中继产物，供下游节点作为目录输入。",
+            "description": "本次 Node Run 写入标准 outputs 目录的可中继产物，供下游节点作为目录输入。",
             "files": node_run_outputs,
             "count": len(node_run_outputs),
         },
@@ -10669,7 +10792,7 @@ def node_run_business_artifacts_from_core(core_outputs):
 
 def node_run_relay_package(sop, node_run_id, node_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
-    output_dir = node_run_output_files_dir(sop, node_run_id)
+    output_dir = node_run_existing_output_dir(sop, node_run_id)
     manifest_path = output_dir / "manifest.json"
     records = node_run_output_manifest_records(sop, node_run_id)
     items = []
@@ -10748,9 +10871,11 @@ def hydrate_node_run_result_views(sop, result):
 
 def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
-    output_dir = node_run_output_files_dir(sop, node_run_id)
+    output_dir = node_run_existing_output_dir(sop, node_run_id)
     manifest = read_json(output_dir / "manifest.json") or {}
     items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    if not items and isinstance(manifest.get("produced"), list):
+        items = manifest.get("produced")
     artifacts = []
     if not items and output_dir.exists():
         items = [
@@ -10786,9 +10911,11 @@ def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
 
 def node_run_output_manifest_records(sop, node_run_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
-    output_dir = node_run_output_files_dir(sop, node_run_id)
+    output_dir = node_run_existing_output_dir(sop, node_run_id)
     manifest = read_json(output_dir / "manifest.json") or {}
     items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    if not items and isinstance(manifest.get("produced"), list):
+        items = manifest.get("produced")
     records = []
     for item in items:
         if not isinstance(item, dict):

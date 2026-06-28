@@ -2830,7 +2830,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(manifest["items"][0]["source"], "node-run")
         self.assertEqual(manifest["items"][0]["source_node"], "youtube-deep-research")
         self.assertEqual(manifest["items"][0]["source_run_id"], source_run)
-        self.assertEqual(manifest["items"][0]["source_path"], f"raw/node-runs/{source_run}/outputs/files/analysis.md")
+        self.assertEqual(manifest["items"][0]["source_path"], f"raw/node-runs/{source_run}/outputs/analysis.md")
         self.assertEqual((input_dir / "0001.md").read_text(encoding="utf-8"), "# Dynamic analysis\n")
         self.assertEqual(ctx["stage_b"]["output_files"], [
             f"raw/node-runs/{target_run}/inputs/sources/0001.md",
