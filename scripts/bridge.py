@@ -3989,7 +3989,10 @@ def run_node_draft_probe(sop, draft_id, data=None):
         "mode": "real-node",
         "input_source": "manual",
         "manual_inputs": manual_inputs,
-        "sync": bool(data.get("sync", True)),
+        # Probe runs can call long-running skills such as image generation.
+        # Default to background execution so public runtime gateways do not
+        # terminate the request before the node has written its run evidence.
+        "sync": bool(data.get("sync", False)),
         "capability_overrides": capability_overrides,
         "node_run_id": data.get("node_run_id") or "",
         "source": "node-draft-probe",

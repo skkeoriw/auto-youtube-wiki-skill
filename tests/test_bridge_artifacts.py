@@ -1750,6 +1750,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         node_run_id = "node-run-runtime-image-node-probe"
 
         def fake_create_node_run(sop, workflow_id, node_id, body):
+            self.assertFalse(body.get("sync"))
             output_dir = bridge.node_run_output_files_dir(sop, node_run_id)
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "image.json").write_text("{}", encoding="utf-8")
