@@ -3702,6 +3702,35 @@ def read_node_draft_probe(sop, draft_id, probe_id):
     return payload if isinstance(payload, dict) and payload else None
 
 
+def node_run_result_probe_summary(result):
+    result = result if isinstance(result, dict) else {}
+    steps = []
+    for step in result.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        steps.append({
+            "id": step.get("id") or step.get("step_id") or "",
+            "title": step.get("title") or "",
+            "status": step.get("status") or "",
+            "summary": step.get("summary") or "",
+            "started_at": step.get("started_at") or "",
+            "finished_at": step.get("finished_at") or "",
+            "elapsed_ms": step.get("elapsed_ms"),
+        })
+    return {
+        "node_run_id": result.get("node_run_id") or result.get("pipeline_id") or "",
+        "status": result.get("status") or "",
+        "pending": result.get("pending", False),
+        "started_at": result.get("started_at") or "",
+        "finished_at": result.get("finished_at") or "",
+        "elapsed_ms": result.get("elapsed_ms"),
+        "validation": result.get("validation") or {},
+        "output_manifest": result.get("output_manifest") or "",
+        "output_directory": result.get("output_directory") or "",
+        "steps": steps,
+    }
+
+
 def reconcile_node_draft_probe_payload(sop, draft_id, probe_id, payload, path=None):
     if not isinstance(payload, dict):
         return payload
@@ -3729,8 +3758,9 @@ def reconcile_node_draft_probe_payload(sop, draft_id, probe_id, payload, path=No
         "node_id": node_id,
         "node_run_id": node_run_id,
         "http_status": 200 if run_status in {"done", "warning", "running", "queued"} else payload.get("http_status", 500),
-        "result": result,
+        "result": node_run_result_probe_summary(result),
         "manifest": manifest if isinstance(manifest, dict) else {},
+        "output_manifest": result.get("output_manifest") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir / "manifest.json") if output_dir else "",
         "manifest_records": [
             {key: value for key, value in record.items() if key != "file"}
             for record in records
@@ -3832,8 +3862,9 @@ def run_node_draft_probe(sop, draft_id, data=None):
         "mode": "node-draft-probe-run",
         "manual_inputs": mask_data(manual_inputs),
         "capability_overrides": capability_overrides,
-        "result": result if isinstance(result, dict) else {},
+        "result": node_run_result_probe_summary(result if isinstance(result, dict) else {}),
         "manifest": manifest if isinstance(manifest, dict) else {},
+        "output_manifest": safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir / "manifest.json") if output_dir else "",
         "manifest_records": [
             {key: value for key, value in record.items() if key != "file"}
             for record in records
@@ -11933,13 +11964,29 @@ def hydrate_node_run_result_views(sop, result):
     return result
 
 
+def node_run_output_manifest_items(manifest):
+    manifest = manifest if isinstance(manifest, dict) else {}
+    items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    if not items and isinstance(manifest.get("produced"), list):
+        items = manifest.get("produced")
+    if not items and isinstance(manifest.get("outputs"), dict):
+        items = []
+        for name, spec in manifest.get("outputs", {}).items():
+            if isinstance(spec, dict):
+                item = dict(spec)
+            else:
+                item = {"value": spec}
+            item.setdefault("name", str(name))
+            item.setdefault("output", str(name))
+            items.append(item)
+    return [item for item in items if isinstance(item, dict)]
+
+
 def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     output_dir = node_run_existing_output_dir(sop, node_run_id)
     manifest = read_json(output_dir / "manifest.json") or {}
-    items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
-    if not items and isinstance(manifest.get("produced"), list):
-        items = manifest.get("produced")
+    items = node_run_output_manifest_items(manifest)
     artifacts = []
     if not items and output_dir.exists():
         items = [
@@ -11978,9 +12025,7 @@ def node_run_output_manifest_records(sop, node_run_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     output_dir = node_run_existing_output_dir(sop, node_run_id)
     manifest = read_json(output_dir / "manifest.json") or {}
-    items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
-    if not items and isinstance(manifest.get("produced"), list):
-        items = manifest.get("produced")
+    items = node_run_output_manifest_items(manifest)
     records = []
     for item in items:
         if not isinstance(item, dict):
@@ -12119,6 +12164,9 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     )
     static = node_static_config(sop, node_id) or {}
     declared_outputs = normalized_contract(static.get("outputs") or node_state.get("declared_outputs") or {}, "output")
+    manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
+    raw_manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    expected_output_contract = isinstance(raw_manifest_outputs.get("expected"), dict)
     actual_outputs = {}
     artifacts = []
 
@@ -12172,10 +12220,14 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     existing_artifact_paths = {artifact.get("path") for artifact in artifacts if isinstance(artifact, dict)}
     artifacts.extend([artifact for artifact in manifest_artifacts if artifact.get("path") not in existing_artifact_paths])
 
-    missing = [
-        name for name, value in actual_outputs.items()
-        if value is None or value == "" or value == []
-    ]
+    missing = []
+    for name, value in actual_outputs.items():
+        if value not in (None, "", []):
+            continue
+        spec = declared_outputs.get(name) if isinstance(declared_outputs.get(name), dict) else {}
+        if expected_output_contract and spec.get("required") is not True:
+            continue
+        missing.append(name)
     core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
     return {
         "declared_outputs": declared_outputs,
