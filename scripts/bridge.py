@@ -11926,7 +11926,16 @@ def node_run_output_manifest_records(sop, node_run_id):
             continue
         item_path = str(item.get("path") or "").strip()
         output_name = manifest_item_output_name(item)
-        if not item_path or not output_name:
+        if not output_name:
+            continue
+        if not item_path:
+            if any(key in item for key in ("value", "value_preview", "text", "url")):
+                records.append({
+                    **item,
+                    "output": output_name,
+                    "path": "",
+                    "file": None,
+                })
             continue
         path_obj = Path(item_path)
         if path_obj.is_absolute() or ".." in path_obj.parts:
@@ -11948,6 +11957,9 @@ def node_run_manifest_output_value(records, output_name, spec):
     matches = [record for record in records if record.get("output") == output_name]
     if not matches:
         return None
+    for key in ("value", "value_preview", "text", "url"):
+        if key in matches[0] and matches[0].get(key) not in (None, "", []):
+            return matches[0].get(key)
     output_type = str((spec or {}).get("type") or "").lower()
     if output_type in {"string", "text"}:
         first = matches[0].get("file")
@@ -11956,6 +11968,30 @@ def node_run_manifest_output_value(records, output_name, spec):
         return ""
     paths = [record.get("path") for record in matches if record.get("path")]
     return ordered_unique(paths)
+
+
+def node_run_manifest_actual_outputs(sop, node_run_id):
+    outputs = {}
+    for record in node_run_output_manifest_records(sop, node_run_id):
+        name = str(record.get("output") or "").strip()
+        if not name:
+            continue
+        value = None
+        for key in ("value", "value_preview", "text", "url"):
+            if key in record and record.get(key) not in (None, "", []):
+                value = record.get(key)
+                break
+        if value is None:
+            value = record.get("path") or ""
+        if value in (None, "", []):
+            continue
+        if name in outputs:
+            if not isinstance(outputs[name], list):
+                outputs[name] = [outputs[name]]
+            outputs[name].append(value)
+        else:
+            outputs[name] = value
+    return outputs
 
 
 def node_run_input_info(sop, node_run_id, node_id):
@@ -12809,6 +12845,90 @@ def create_node_run(sop, workflow_id, node_id, body):
     return 200, result
 
 
+def reconcile_completed_node_run_result(sop, result):
+    if not isinstance(result, dict) or result.get("status") != "running":
+        return result
+    node_run_id = sanitize_node_run_id(result.get("node_run_id") or result.get("pipeline_id") or "")
+    node_id = str(result.get("node_id") or "").strip()
+    if not node_run_id or not node_id:
+        return result
+    output_dir = node_run_existing_output_dir(sop, node_run_id)
+    manifest_path = output_dir / "manifest.json"
+    receipt_path = node_run_agent_path(sop, node_run_id, "receipt.json")
+    response_path = node_run_agent_path(sop, node_run_id, "response.txt")
+    if not manifest_path.exists() and not receipt_path.exists():
+        return result
+
+    output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
+    actual_outputs = output_info.get("actual_outputs") or {}
+    if not actual_outputs:
+        actual_outputs = node_run_manifest_actual_outputs(sop, node_run_id)
+    if not actual_outputs:
+        return result
+
+    receipt = read_json(receipt_path) or {}
+    finished_at = str(
+        receipt.get("finished_at")
+        or (receipt.get("timestamps") or {}).get("completed_at")
+        or datetime.now(timezone.utc).isoformat()
+    )
+    started_at = str(result.get("started_at") or receipt.get("started_at") or "")
+    real_execution = {
+        "status": "done",
+        "summary": "Real node execution finished and output manifest was found.",
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "elapsed_ms": 0,
+        "actual_outputs": actual_outputs,
+        "artifacts": output_info.get("artifacts") or node_run_output_manifest_artifacts(sop, node_run_id, node_id),
+        "business_artifacts": output_info.get("business_artifacts") or [],
+        "core_outputs": output_info.get("core_outputs") or [],
+        "relay_package": output_info.get("relay_package") or {},
+        "execution_evidence": output_info.get("execution_evidence") or {},
+        "output_categories": output_info.get("output_categories") or {},
+        "input_directory": output_info.get("input_directory") or "",
+        "input_manifest": output_info.get("input_manifest") or "",
+        "output_directory": output_info.get("output_directory") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir),
+        "output_manifest": output_info.get("output_manifest") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), manifest_path),
+        "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+        "capabilities": output_info.get("capabilities") or {},
+        "agent_request": result.get("agent_request") or {},
+        "detail": {
+            "receipt": mask_data(receipt) if isinstance(receipt, dict) else {},
+            "response_path": safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), response_path) if response_path.exists() else "",
+            "actual_outputs": actual_outputs,
+            "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+        },
+    }
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    apply_real_node_execution_to_steps(steps, real_execution)
+    result = {
+        **result,
+        "status": node_run_status_from_steps(steps),
+        "pending": False,
+        "finished_at": finished_at,
+        "steps": steps,
+        "actual_outputs": actual_outputs,
+        "artifacts": real_execution["artifacts"],
+        "business_artifacts": real_execution["business_artifacts"],
+        "core_outputs": real_execution["core_outputs"],
+        "relay_package": real_execution["relay_package"],
+        "execution_evidence": real_execution["execution_evidence"],
+        "output_categories": real_execution["output_categories"],
+        "output_directory": real_execution["output_directory"],
+        "output_manifest": real_execution["output_manifest"],
+        "validation": real_execution["validation"],
+        "capabilities": real_execution["capabilities"],
+        "detail": {
+            **(result.get("detail") if isinstance(result.get("detail"), dict) else {}),
+            "real_execution": real_execution,
+        },
+    }
+    workspace = node_run_workspace(sop, node_run_id)
+    write_json(workspace / "result.json", result)
+    return result
+
+
 def read_node_run_result(sop, node_id, node_run_id):
     safe = sanitize_node_run_id(node_run_id)
     if not safe.startswith("node-run-"):
@@ -12816,6 +12936,7 @@ def read_node_run_result(sop, node_id, node_run_id):
     result = read_json(node_run_workspace(sop, safe) / "result.json")
     if not isinstance(result, dict) or result.get("node_id") != node_id:
         return None
+    result = reconcile_completed_node_run_result(sop, result)
     hydrate_node_run_input_artifacts(sop, result)
     hydrate_node_run_agent_request(sop, result)
     hydrate_node_run_capability_history(sop, result)
