@@ -3483,7 +3483,8 @@ def evaluate_node_builder(sop, data):
         command = ["python3", str(script), "--request-json", str(request_path), "--output-json", str(output_path), "--require-ai"]
         if data.get("allow_deterministic") or data.get("allow_fallback"):
             command.append("--allow-deterministic")
-        timeout = int(env.get("NODE_BUILDER_EVALUATOR_TIMEOUT", env.get("NODE_BUILDER_LLM_TIMEOUT", "75")) or "75")
+        default_llm_timeout = int(env.get("NODE_BUILDER_LLM_TIMEOUT", "120") or "120")
+        timeout = int(env.get("NODE_BUILDER_EVALUATOR_TIMEOUT", str(max(default_llm_timeout + 30, 150))) or "150")
         try:
             completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, env=env)
         except subprocess.TimeoutExpired as exc:
