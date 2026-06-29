@@ -297,7 +297,7 @@ def json_response(handler, status, data):
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    handler.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization")
     handler.end_headers()
     handler.wfile.write(body)
@@ -3035,10 +3035,8 @@ def node_draft_schema():
             {"name": "node_id", "label": "Node ID", "type": "node_id", "required": True, "maps_to": "id"},
             {"name": "title", "label": "Title", "type": "string", "required": False, "maps_to": "title"},
             {"name": "description", "label": "Description", "type": "text", "required": False, "maps_to": "description"},
-            {"name": "mode", "label": "Mode", "type": "enum", "required": False, "maps_to": "mode"},
-            {"name": "needs", "label": "Needs", "type": "list", "required": False, "maps_to": "needs"},
-            {"name": "inputs", "label": "Inputs Contract", "type": "json", "required": False, "maps_to": "inputs"},
-            {"name": "optional_inputs", "label": "Optional Inputs Contract", "type": "json", "required": False, "maps_to": "optional_inputs"},
+            {"name": "entry_inputs", "label": "Entry Inputs", "type": "json", "required": False, "maps_to": "entry_inputs"},
+            {"name": "inputs", "label": "Runtime Inputs", "type": "json", "required": False, "maps_to": "inputs"},
             {"name": "outputs", "label": "Outputs Contract", "type": "json", "required": False, "maps_to": "outputs"},
             {"name": "capabilities", "label": "Capabilities", "type": "json", "required": False, "maps_to": "capabilities"},
         ],
@@ -3641,6 +3639,7 @@ def read_node_draft(sop, draft_id):
     draft_dir = node_draft_dir(sop, draft_id)
     if not draft_dir.exists():
         return None
+    probe_runs = list_node_draft_probe_runs(sop, draft_dir.name)
     return {
         "draft_id": draft_dir.name,
         "draft_type": (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "create_node"),
@@ -3651,10 +3650,374 @@ def read_node_draft(sop, draft_id):
         "change_request": read_json(draft_dir / "change_request.json") or {},
         "validation": read_json(draft_dir / "validation.json") or {},
         "draft_test": read_json(draft_dir / "draft-test.json") or {},
+        "probe_runs": probe_runs,
+        "latest_probe": probe_runs[0] if probe_runs else {},
+        "contract_synthesis": read_json(draft_dir / "contract-synthesis.json") or {},
         "runtime_publish": read_json(draft_dir / "runtime-publish.json") or {},
         "persistence_plan": read_json(draft_dir / "official-patch.json") or {},
         "trace": read_json(draft_dir / "trace.json") or {},
     }
+
+
+def node_draft_probe_runs_dir(sop, draft_id):
+    path = node_draft_dir(sop, draft_id) / "probe-runs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def node_draft_probe_path(sop, draft_id, probe_id):
+    return node_draft_probe_runs_dir(sop, draft_id) / f"{slugify(probe_id)}.json"
+
+
+def list_node_draft_probe_runs(sop, draft_id):
+    root = node_draft_dir(sop, draft_id) / "probe-runs"
+    if not root.exists():
+        return []
+    rows = []
+    for path in sorted(root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        payload = read_json(path) or {}
+        if isinstance(payload, dict):
+            payload.setdefault("probe_id", path.stem)
+            rows.append(payload)
+    return rows
+
+
+def read_node_draft_probe(sop, draft_id, probe_id):
+    payload = read_json(node_draft_probe_path(sop, draft_id, probe_id)) or {}
+    return payload if isinstance(payload, dict) and payload else None
+
+
+def node_draft_temp_sop(sop, node):
+    temp_sop = copy.deepcopy(sop)
+    nodes = copy.deepcopy(temp_sop.get("nodes") if isinstance(temp_sop.get("nodes"), dict) else {})
+    node_id = str((node or {}).get("id") or (node or {}).get("node_id") or "").strip()
+    if node_id:
+        nodes[node_id] = copy.deepcopy(node)
+    temp_sop["nodes"] = nodes
+    return temp_sop
+
+
+def node_draft_default_probe_inputs(node):
+    entry_inputs = normalize_contract((node or {}).get("entry_inputs") or (node or {}).get("inputs") or {}, "input")
+    inputs = {}
+    for name, spec in entry_inputs.items():
+        spec = spec if isinstance(spec, dict) else {}
+        default = spec.get("default") or spec.get("example") or spec.get("sample")
+        if default not in (None, ""):
+            inputs[name] = default
+            continue
+        value_type = str(spec.get("value_type") or spec.get("type") or "").lower()
+        lowered = f"{name} {value_type}".lower()
+        if "url" in lowered:
+            inputs[name] = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        elif "image" in lowered or "file" in lowered:
+            inputs[name] = ""
+        else:
+            inputs[name] = "Generated safe probe input"
+    return inputs
+
+
+def run_node_draft_probe(sop, draft_id, data=None):
+    data = data if isinstance(data, dict) else {}
+    draft = read_node_draft(sop, draft_id)
+    if not draft:
+        return {"status": "failed", "detail": "Node draft not found"}
+    node = draft.get("node") if isinstance(draft.get("node"), dict) else {}
+    node_id = str(node.get("id") or node.get("node_id") or "").strip()
+    if not node_id:
+        return {"status": "failed", "detail": "node.id is required before Probe Run"}
+    temp_sop = node_draft_temp_sop(sop, node)
+    manual_inputs = data.get("manual_inputs") if isinstance(data.get("manual_inputs"), dict) else {}
+    if not manual_inputs:
+        manual_inputs = data.get("probe_inputs") if isinstance(data.get("probe_inputs"), dict) else {}
+    if not manual_inputs:
+        manual_inputs = node_draft_default_probe_inputs(node)
+    capability_overrides = data.get("capability_overrides") if isinstance(data.get("capability_overrides"), dict) else {}
+    capability_overrides = {
+        "git": {"enabled": False, **(capability_overrides.get("git") if isinstance(capability_overrides.get("git"), dict) else {})},
+        "telegram": {"enabled": False, **(capability_overrides.get("telegram") if isinstance(capability_overrides.get("telegram"), dict) else {})},
+        **{key: value for key, value in capability_overrides.items() if key not in {"git", "telegram"}},
+    }
+    body = {
+        "mode": "real-node",
+        "input_source": "manual",
+        "manual_inputs": manual_inputs,
+        "sync": bool(data.get("sync", True)),
+        "capability_overrides": capability_overrides,
+        "node_run_id": data.get("node_run_id") or "",
+        "source": "node-draft-probe",
+    }
+    workflow_id = str(data.get("workflow_id") or workflow_binding(sop).get("workflow_id") or sop.get("id") or "")
+    http_code, result = create_node_run(temp_sop, workflow_id, node_id, body)
+    node_run_id = sanitize_node_run_id((result or {}).get("node_run_id") or (result or {}).get("pipeline_id") or "")
+    output_dir = node_run_existing_output_dir(sop, node_run_id) if node_run_id else Path()
+    manifest = read_json(output_dir / "manifest.json") if output_dir else {}
+    records = node_run_output_manifest_records(sop, node_run_id) if node_run_id else []
+    probe_id = f"{node_id}-probe-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{hashlib.sha1(os.urandom(8)).hexdigest()[:6]}"
+    payload = {
+        "status": "passed" if http_code < 400 and (result or {}).get("status") in {"done", "warning"} else "failed",
+        "probe_id": probe_id,
+        "draft_id": draft_id,
+        "node_id": node_id,
+        "node_run_id": node_run_id,
+        "http_status": http_code,
+        "mode": "node-draft-probe-run",
+        "manual_inputs": mask_data(manual_inputs),
+        "capability_overrides": capability_overrides,
+        "result": result if isinstance(result, dict) else {},
+        "manifest": manifest if isinstance(manifest, dict) else {},
+        "manifest_records": [
+            {key: value for key, value in record.items() if key != "file"}
+            for record in records
+        ],
+        "validation": (result or {}).get("validation") or ((result or {}).get("real_execution") or {}).get("validation") or {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(node_draft_probe_path(sop, draft_id, probe_id), payload)
+    return payload
+
+
+def manifest_item_output_name(item):
+    item = item if isinstance(item, dict) else {}
+    for key in ("output", "output_name", "target_output", "name", "id"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def manifest_item_contract_fields(item):
+    item = item if isinstance(item, dict) else {}
+    excluded = {
+        "path", "output", "output_name", "target_output", "name", "id", "kind", "type",
+        "value_type", "source", "source_node", "source_run_id", "source_path",
+        "input_name", "target_input", "materialized_path", "value_preview",
+    }
+    fields = {}
+    for key, value in item.items():
+        if key in excluded or value in (None, ""):
+            continue
+        if isinstance(value, bool):
+            field_type = "boolean"
+        elif isinstance(value, int) and not isinstance(value, bool):
+            field_type = "integer"
+        elif isinstance(value, float):
+            field_type = "number"
+        elif isinstance(value, list):
+            field_type = "array"
+        elif isinstance(value, dict):
+            field_type = "object"
+        else:
+            field_type = "string"
+        fields[key] = {
+            "type": field_type,
+            "sample": mask_data(value),
+        }
+    return fields
+
+
+def synthesize_output_contract_from_manifest_records(node_run_id, records):
+    grouped = {}
+    for record in records or []:
+        name = manifest_item_output_name(record)
+        if not name:
+            continue
+        grouped.setdefault(name, []).append(record)
+    outputs = {}
+    for name, items in grouped.items():
+        paths = ordered_unique([str(item.get("path") or "") for item in items if str(item.get("path") or "").strip()])
+        value_types = ordered_unique([str(item.get("value_type") or node_run_manifest_value_type(item.get("path")) or "text") for item in items])
+        first = items[0] if items else {}
+        kind = "files" if len(paths) > 1 else "file" if paths else str(first.get("kind") or first.get("type") or "scalar")
+        path_pattern = paths[0] if len(paths) == 1 else common_path_pattern(paths)
+        if node_run_id and path_pattern:
+            path_pattern = path_pattern.replace(node_run_id, "{run_id}")
+        fields = {}
+        for item in items:
+            fields.update(manifest_item_contract_fields(item))
+        outputs[name] = {
+            "kind": kind,
+            "type": "files" if kind == "files" else "file" if kind == "file" else "string",
+            "value_type": value_types[0] if len(value_types) == 1 else "mixed",
+            "relayable": True,
+            **({"path": path_pattern} if path_pattern else {}),
+            **({"fields": fields} if fields else {}),
+        }
+    return outputs
+
+
+def common_path_pattern(paths):
+    paths = [str(path or "").strip() for path in paths if str(path or "").strip()]
+    if not paths:
+        return ""
+    try:
+        common = os.path.commonpath(paths)
+    except ValueError:
+        return ""
+    if common and common not in {".", "/"}:
+        return common.rstrip("/") + "/**"
+    return ""
+
+
+def synthesize_node_draft_contract(sop, draft_id, data=None):
+    data = data if isinstance(data, dict) else {}
+    draft = read_node_draft(sop, draft_id)
+    if not draft:
+        return {"status": "failed", "detail": "Node draft not found"}
+    node = copy.deepcopy(draft.get("node") if isinstance(draft.get("node"), dict) else {})
+    node_id = str(node.get("id") or node.get("node_id") or "").strip()
+    probe_id = str(data.get("probe_id") or "").strip()
+    probe = read_node_draft_probe(sop, draft_id, probe_id) if probe_id else None
+    if not probe:
+        probes = list_node_draft_probe_runs(sop, draft_id)
+        probe = probes[0] if probes else None
+    if not probe:
+        return {"status": "failed", "detail": "Run a Node Draft Probe before contract synthesis"}
+    node_run_id = sanitize_node_run_id(probe.get("node_run_id") or "")
+    records = probe.get("manifest_records") if isinstance(probe.get("manifest_records"), list) else []
+    if not records and node_run_id:
+        records = [
+            {key: value for key, value in record.items() if key != "file"}
+            for record in node_run_output_manifest_records(sop, node_run_id)
+        ]
+    outputs = synthesize_output_contract_from_manifest_records(node_run_id, records)
+    if not outputs:
+        result = {
+            "status": "failed",
+            "draft_id": draft_id,
+            "node_id": node_id,
+            "probe_id": probe.get("probe_id") or "",
+            "node_run_id": node_run_id,
+            "detail": "Probe Run did not produce a usable output manifest",
+            "outputs": {},
+        }
+        write_json(node_draft_dir(sop, draft_id) / "contract-synthesis.json", result)
+        return result
+    node["outputs"] = outputs
+    node.setdefault("analysis", {})
+    if isinstance(node["analysis"], dict):
+        node["analysis"]["contract_synthesis"] = {
+            "source": "node-draft-probe",
+            "probe_id": probe.get("probe_id") or "",
+            "node_run_id": node_run_id,
+            "manifest_record_count": len(records),
+            "synthesized_at": datetime.now(timezone.utc).isoformat(),
+        }
+    draft_dir = node_draft_dir(sop, draft_id)
+    (draft_dir / "node.yaml").write_text(yaml.safe_dump(node, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    validation = read_json(draft_dir / "validation.json") or {}
+    validation.update({
+        "status": "passed",
+        "contract_synthesis": "passed",
+        "output_count": len(outputs),
+        "production_dag_changed": False,
+    })
+    write_json(draft_dir / "validation.json", validation)
+    result = {
+        "status": "synthesized",
+        "draft_id": draft_id,
+        "node_id": node_id,
+        "probe_id": probe.get("probe_id") or "",
+        "node_run_id": node_run_id,
+        "outputs": outputs,
+        "node": node,
+        "validation": validation,
+        "synthesized_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(draft_dir / "contract-synthesis.json", result)
+    return result
+
+
+def node_reference_text_refs(value, node_id, path=""):
+    refs = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            refs.extend(node_reference_text_refs(item, node_id, f"{path}.{key}" if path else str(key)))
+        return refs
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            refs.extend(node_reference_text_refs(item, node_id, f"{path}[{index}]"))
+        return refs
+    text = str(value or "")
+    if not text:
+        return refs
+    if re.search(rf"(^|[^A-Za-z0-9_-]){re.escape(node_id)}(\.outputs\.|$|[^A-Za-z0-9_-])", text):
+        refs.append({"path": path, "value": text})
+    return refs
+
+
+def runtime_node_delete_references(sop, node_id):
+    refs = []
+    nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
+    if node_id in nodes:
+        refs.append({
+            "kind": "official-node",
+            "node_id": node_id,
+            "reason": "Node is defined by the active SOP and must be changed repo-first.",
+        })
+    for current_id, node in nodes.items():
+        if current_id == node_id or not isinstance(node, dict):
+            continue
+        needs = node.get("needs") if isinstance(node.get("needs"), list) else []
+        if node_id in [str(item) for item in needs]:
+            refs.append({"kind": "needs", "node_id": current_id, "path": f"nodes.{current_id}.needs"})
+        for block_name in ("inputs", "optional_inputs"):
+            for row in node_reference_text_refs(node.get(block_name), node_id, f"nodes.{current_id}.{block_name}"):
+                refs.append({"kind": block_name, "node_id": current_id, **row})
+    for draft in list_workflow_edge_drafts(sop):
+        edge = draft.get("edge") if isinstance(draft.get("edge"), dict) else {}
+        if edge.get("from") == node_id or edge.get("to") == node_id:
+            refs.append({
+                "kind": "workflow-edge-draft",
+                "draft_id": draft.get("draft_id") or "",
+                "edge_id": edge.get("id") or draft.get("edge_id") or "",
+                "path": draft.get("draft_path") or "",
+            })
+    return refs
+
+
+def delete_runtime_node(sop, node_id, data=None):
+    node_id = str(node_id or "").strip()
+    if not node_id:
+        return {"status": "failed", "detail": "node_id is required"}
+    runtime_node = runtime_node_catalog_item(node_id)
+    if runtime_node is None:
+        if node_id in (sop.get("nodes") or {}):
+            return {
+                "status": "blocked",
+                "node_id": node_id,
+                "detail": "This node is part of the official SOP and cannot be deleted from the Runtime catalog.",
+                "references": runtime_node_delete_references(sop, node_id),
+            }
+        return {"status": "not_found", "node_id": node_id, "detail": "Runtime node was not found"}
+    refs = runtime_node_delete_references(sop, node_id)
+    blocking_refs = refs
+    if blocking_refs:
+        result = {
+            "status": "blocked",
+            "node_id": node_id,
+            "detail": "Node is still referenced by the active SOP.",
+            "references": refs,
+        }
+        audit_dir = Path(sop["wiki_local_path"]) / "raw" / "node-drafts" / "deletions"
+        write_json(audit_dir / f"{slugify(node_id)}-blocked-{int(time.time())}.json", result)
+        return result
+    target_dir = runtime_node_catalog_dir() / node_id
+    backup_dir = Path(sop["wiki_local_path"]) / "raw" / "node-drafts" / "deleted-runtime-nodes" / f"{slugify(node_id)}-{int(time.time())}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if (target_dir / "node.yaml").is_file():
+        shutil.copy2(target_dir / "node.yaml", backup_dir / "node.yaml")
+    shutil.rmtree(target_dir, ignore_errors=True)
+    _SOP_READ_CACHE.clear()
+    result = {
+        "status": "deleted",
+        "node_id": node_id,
+        "backup_path": str(backup_dir),
+        "references": refs,
+        "deleted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(backup_dir / "delete-result.json", result)
+    return result
 
 
 def test_node_draft(sop, draft_id, data=None):
@@ -3673,7 +4036,7 @@ def test_node_draft(sop, draft_id, data=None):
     add("validate-node-yaml", "Validate node-definition/v1", node.get("schema") == "node-definition/v1", "schema must be node-definition/v1")
     add("inspect-install-command", "Inspect skill install command", bool(str(skill.get("install_command") or "").strip()), "install command is required before real install")
     add("hermes-skill-check", "Check Hermes skill target", bool(executor.get("skill") or skill.get("id")), "executor.skill or skill.id is required")
-    accepts = handoff.get("accepts") if isinstance(handoff.get("accepts"), dict) else {}
+    accepts = normalize_handoff_accepts(handoff.get("accepts"))
     add("handoff-contract-check", "Check handoff contract", "instruction" in accepts and "upstream_outputs_dir" in accepts, "must accept instruction and upstream_outputs_dir")
     add("manifest-contract-check", "Check outputs manifest contract", bool(outputs.get("manifest") or ((handoff.get("produces") or {}).get("manifest") if isinstance(handoff.get("produces"), dict) else "")), "manifest path is required")
     status = "passed" if all(step["status"] == "done" for step in steps) else "failed"
@@ -3692,7 +4055,26 @@ def test_node_draft(sop, draft_id, data=None):
     return result
 
 
+def normalize_handoff_accepts(value):
+    if isinstance(value, dict):
+        return {str(key): item for key, item in value.items()}
+    if not isinstance(value, list):
+        return {}
+    rows = {}
+    for item in value:
+        if isinstance(item, str):
+            rows[item] = {"role": item}
+            continue
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("role") or item.get("name") or item.get("id") or "").strip()
+        if key:
+            rows[key] = item
+    return rows
+
+
 def publish_node_draft_to_runtime(sop, draft_id, data=None):
+    data = data if isinstance(data, dict) else {}
     draft = read_node_draft(sop, draft_id)
     if not draft:
         return {"status": "failed", "detail": "Node draft not found"}
@@ -3703,10 +4085,35 @@ def publish_node_draft_to_runtime(sop, draft_id, data=None):
     if node_id in (sop.get("nodes") or {}):
         return {"status": "failed", "detail": f"node_id {node_id} already exists in sop.yaml"}
     target_dir = runtime_node_catalog_dir() / node_id
+    if target_dir.exists() and not data.get("confirm_overwrite"):
+        return {
+            "status": "failed",
+            "detail": f"runtime catalog node {node_id} already exists; confirm_overwrite is required",
+            "runtime_catalog_path": str(target_dir / "node.yaml"),
+        }
+    synthesis = draft.get("contract_synthesis") if isinstance(draft.get("contract_synthesis"), dict) else {}
+    latest_probe = draft.get("latest_probe") if isinstance(draft.get("latest_probe"), dict) else {}
+    if synthesis.get("status") != "synthesized" and not data.get("allow_unsynthesized"):
+        return {
+            "status": "failed",
+            "detail": "Contract Synthesis is required before publishing this Runtime Node.",
+            "required_step": "contract-synthesis",
+            "latest_probe_status": latest_probe.get("status") or "",
+        }
+    target_dir = runtime_node_catalog_dir() / node_id
     target_dir.mkdir(parents=True, exist_ok=True)
     node_to_write = copy.deepcopy(node)
     node_to_write["id"] = node_id
     node_to_write["source"] = "runtime-catalog"
+    node_to_write["provenance"] = {
+        **(node_to_write.get("provenance") if isinstance(node_to_write.get("provenance"), dict) else {}),
+        "source": "node-builder",
+        "draft_id": draft_id,
+        "probe_id": latest_probe.get("probe_id") or synthesis.get("probe_id") or "",
+        "node_run_id": latest_probe.get("node_run_id") or synthesis.get("node_run_id") or "",
+        "contract_synthesis_status": synthesis.get("status") or "",
+        "published_at": datetime.now(timezone.utc).isoformat(),
+    }
     (target_dir / "node.yaml").write_text(yaml.safe_dump(node_to_write, allow_unicode=True, sort_keys=False), encoding="utf-8")
     _SOP_READ_CACHE.clear()
     visible = node_registry_item(sop, node_id) is not None
@@ -10459,6 +10866,8 @@ def node_run_source_manifest_items(sop, source_node_run_id):
             continue
         rows.append({
             **item,
+            "output": manifest_item_output_name(item),
+            "source_output": item.get("source_output") or manifest_item_output_name(item),
             "source_path": source_rel,
             "source_node": item.get("source_node") or manifest.get("node_id") or "",
             "source_run_id": item.get("source_run_id") or source_node_run_id,
@@ -10525,7 +10934,7 @@ def copy_node_run_input_file(wiki, source_rel, target_dir, index, item=None):
         "source_path": source_rel,
         "source_node": (item or {}).get("source_node") or "",
         "source_run_id": (item or {}).get("source_run_id") or "",
-        "source_output": (item or {}).get("output") or (item or {}).get("source_output") or "",
+        "source_output": manifest_item_output_name(item or {}) or (item or {}).get("source_output") or "",
         "input_name": (item or {}).get("input_name") or "",
         "target_input": (item or {}).get("target_input") or (item or {}).get("input_name") or "",
         "value_preview": preview,
@@ -11349,9 +11758,10 @@ def node_run_relay_package(sop, node_run_id, node_id):
     records = node_run_output_manifest_records(sop, node_run_id)
     items = []
     for record in records:
-        artifact = artifact_record(sop, node_id, str(record.get("output") or "files"), record.get("file"), "node-run-output-manifest")
+        output_name = manifest_item_output_name(record) or "files"
+        artifact = artifact_record(sop, node_id, output_name, record.get("file"), "node-run-output-manifest")
         items.append({
-            "output": record.get("output") or "",
+            "output": output_name,
             "path": record.get("path") or "",
             "relative_path": record.get("path", "").replace(safe_relative_file(wiki, output_dir).rstrip("/") + "/", "", 1) if record.get("path") else "",
             "value_type": record.get("value_type") or node_run_manifest_value_type(record.get("file")),
@@ -11448,7 +11858,8 @@ def node_run_output_manifest_artifacts(sop, node_run_id, node_id):
         path = safe_artifact_path(wiki, rel)
         if not path or not path.is_file():
             continue
-        record = artifact_record(sop, node_id, str(item.get("output") or "files"), path, "node-run-output-manifest")
+        output_name = manifest_item_output_name(item) or "files"
+        record = artifact_record(sop, node_id, output_name, path, "node-run-output-manifest")
         if record:
             record["metadata"] = {**(record.get("metadata") or {}), "manifest_item": mask_data(item)}
             artifacts.append(record)
@@ -11473,7 +11884,7 @@ def node_run_output_manifest_records(sop, node_run_id):
         if not isinstance(item, dict):
             continue
         item_path = str(item.get("path") or "").strip()
-        output_name = str(item.get("output") or "").strip()
+        output_name = manifest_item_output_name(item)
         if not item_path or not output_name:
             continue
         path_obj = Path(item_path)
@@ -12856,7 +13267,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization")
         self.end_headers()
 
@@ -13224,6 +13635,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(path) == 5 and path[3] == "node-drafts":
                     draft = read_node_draft(sop, path[4])
                     return json_response(self, 200 if draft else 404, draft or {"detail": "Node draft not found"})
+                # GET /api/sop/{instance}/node-drafts/{draft_id}/probe-runs
+                if len(path) == 6 and path[3] == "node-drafts" and path[5] == "probe-runs":
+                    draft = read_node_draft(sop, path[4])
+                    if not draft:
+                        return json_response(self, 404, {"detail": "Node draft not found"})
+                    return json_response(self, 200, {
+                        "sop_id": sop.get("id", ""),
+                        "draft_id": path[4],
+                        "probe_runs": list_node_draft_probe_runs(sop, path[4]),
+                    })
                 # GET /api/sop/{instance}/workflow-drafts/schema — workflow edge draft schema
                 if len(path) == 5 and path[3] == "workflow-drafts" and path[4] == "schema":
                     return json_response(self, 200, {
@@ -13370,6 +13791,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 break
         self.close_connection = True
+
+    def do_DELETE(self):
+        path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "nodes":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = delete_runtime_node(sop, path[4], {})
+            status = 200 if result.get("status") in {"deleted", "not_found"} else 422
+            return json_response(self, status, result)
+        return json_response(self, 404, {"detail": "Not found"})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -13654,6 +14086,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             status = 200 if result.get("status") == "passed" else 422
             return json_response(self, status, result)
 
+        # POST /api/sop/{instance}/node-drafts/{draft_id}/probe-run
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "node-drafts" and path[5] == "probe-run":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = run_node_draft_probe(sop, path[4], data)
+            status = 200 if result.get("status") in {"passed", "warning"} else 422
+            return json_response(self, status, result)
+
+        # POST /api/sop/{instance}/node-drafts/{draft_id}/contract-synthesis
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "node-drafts" and path[5] == "contract-synthesis":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = synthesize_node_draft_contract(sop, path[4], data)
+            status = 200 if result.get("status") == "synthesized" else 422
+            return json_response(self, status, result)
+
         # POST /api/sop/{instance}/node-drafts/{draft_id}/publish-runtime
         if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "node-drafts" and path[5] == "publish-runtime":
             sop = find_sop(path[2])
@@ -13670,6 +14120,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return json_response(self, 404, {"detail": "SOP not found"})
             result = node_draft_persistence_plan(sop, path[4], data)
             status = 200 if result.get("status") == "generated" else 422
+            return json_response(self, status, result)
+
+        # POST /api/sop/{instance}/nodes/{node_id}/delete
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "nodes" and path[5] == "delete":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = delete_runtime_node(sop, path[4], data)
+            status = 200 if result.get("status") in {"deleted", "not_found"} else 422
             return json_response(self, status, result)
 
         # POST /api/sop/{instance}/workflows/{workflow_id}/edges/drafts

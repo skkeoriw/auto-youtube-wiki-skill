@@ -1559,9 +1559,13 @@ class ArtifactResolutionTest(unittest.TestCase):
                 schema_response = json.loads(response.read())
             schema = schema_response["schema"]
             fields = {field["name"]: field for field in schema["fields"]}
+            edit_fields = {field["name"]: field for field in schema["edit_fields"]}
             self.assertEqual(schema["schema_id"], "node-draft-schema/v1")
             self.assertTrue(fields["skill_install_command"]["required"])
             self.assertEqual(fields["output_path"]["type"], "path_pattern")
+            self.assertNotIn("needs", edit_fields)
+            self.assertNotIn("mode", edit_fields)
+            self.assertIn("entry_inputs", edit_fields)
             self.assertIn("edit_node_definition", [item["id"] for item in schema["draft_types"]])
             self.assertFalse(schema["safety"]["production_dag_changed"])
             request = urllib.request.Request(
@@ -1696,6 +1700,88 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual((self.wiki / "sop.yaml").read_text(encoding="utf-8"), before)
         server.shutdown()
         server.server_close()
+
+    def test_node_run_output_manifest_accepts_generic_output_names(self):
+        node_run_id = "node-run-generic-output-manifest"
+        output_dir = bridge.node_run_output_files_dir(self.sop, node_run_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "image.json").write_text("{}", encoding="utf-8")
+        (output_dir / "analysis.md").write_text("# Analysis", encoding="utf-8")
+        bridge.write_json(output_dir / "manifest.json", {
+            "items": [
+                {
+                    "path": "image.json",
+                    "output_name": "generated_image",
+                    "value_type": "json",
+                    "public_image_url": "https://resource.example/image.png",
+                },
+                {
+                    "path": "analysis.md",
+                    "target_output": "analysis_file",
+                    "value_type": "markdown",
+                },
+            ]
+        })
+        records = bridge.node_run_output_manifest_records(self.sop, node_run_id)
+        self.assertEqual([record["output"] for record in records], ["generated_image", "analysis_file"])
+        relay = bridge.node_run_relay_package(self.sop, node_run_id, "wiki-build")
+        self.assertEqual([item["output"] for item in relay["items"]], ["generated_image", "analysis_file"])
+
+    def test_node_draft_probe_synthesizes_contract_from_manifest(self):
+        draft = bridge.create_node_draft(self.sop, {
+            "node_draft": {
+                "schema": "node-definition/v1",
+                "id": "runtime-image-node",
+                "title": "Runtime Image Node",
+                "skill": {"id": "runtime-image-skill", "install_command": "bash <(curl -fsSL https://skill.example/install.sh)"},
+                "executor": {"type": "agent-skill", "agent": "hermes", "skill": "runtime-image-skill"},
+                "entry_inputs": {
+                    "prompt": {"kind": "scalar", "type": "string", "value_type": "text", "required": True}
+                },
+                "inputs": {
+                    "prompt": {"kind": "scalar", "type": "string", "value_type": "text", "required": True}
+                },
+                "outputs": {
+                    "result": {"kind": "file", "type": "file", "value_type": "json", "path": "raw/node-runs/{run_id}/outputs/result.json"}
+                },
+            }
+        })
+        self.assertEqual(draft["validation"]["status"], "passed")
+        node_run_id = "node-run-runtime-image-node-probe"
+
+        def fake_create_node_run(sop, workflow_id, node_id, body):
+            output_dir = bridge.node_run_output_files_dir(sop, node_run_id)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "image.json").write_text("{}", encoding="utf-8")
+            bridge.write_json(output_dir / "manifest.json", {
+                "items": [{
+                    "path": "image.json",
+                    "output_name": "generated_image",
+                    "value_type": "json",
+                    "public_image_url": "https://resource.example/generated.png",
+                    "task_id": "task-123",
+                }]
+            })
+            return 200, {
+                "status": "done",
+                "node_run_id": node_run_id,
+                "validation": {"status": "passed", "missing_outputs": []},
+            }
+
+        with patch.object(bridge, "create_node_run", side_effect=fake_create_node_run):
+            probe = bridge.run_node_draft_probe(self.sop, draft["draft_id"], {
+                "manual_inputs": {"prompt": "draw a small cat"},
+            })
+        self.assertEqual(probe["status"], "passed")
+        self.assertEqual(probe["manifest_records"][0]["output"], "generated_image")
+        synthesis = bridge.synthesize_node_draft_contract(self.sop, draft["draft_id"], {
+            "probe_id": probe["probe_id"],
+        })
+        self.assertEqual(synthesis["status"], "synthesized")
+        self.assertIn("generated_image", synthesis["outputs"])
+        self.assertIn("public_image_url", synthesis["outputs"]["generated_image"]["fields"])
+        refreshed = bridge.read_node_draft(self.sop, draft["draft_id"])
+        self.assertIn("generated_image", refreshed["node"]["outputs"])
 
     def test_trigger_node_test_for_node_without_engine_contract_returns_404(self):
         # Single-node test is only supported for nodes the provisioning engine
