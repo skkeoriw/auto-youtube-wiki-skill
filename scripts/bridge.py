@@ -3804,8 +3804,34 @@ def business_actual_outputs(actual_outputs):
     }
 
 
-def business_output_status_for(sop, node_id, actual_outputs, declared_outputs=None, artifacts=None):
-    declared_outputs = declared_outputs if isinstance(declared_outputs, dict) else normalized_contract((node_static_config(sop, node_id) or {}).get("outputs") or {}, "output")
+def declared_outputs_from_node_run_result(sop, node_id, result=None, declared_outputs=None):
+    if isinstance(declared_outputs, dict) and declared_outputs:
+        return normalized_contract(declared_outputs, "output")
+    result = result if isinstance(result, dict) else {}
+    candidates = []
+    if isinstance(result.get("declared_outputs"), dict):
+        candidates.append(result.get("declared_outputs"))
+    workflow_revision = result.get("workflow_revision") if isinstance(result.get("workflow_revision"), dict) else {}
+    workflow_nodes = workflow_revision.get("nodes") if isinstance(workflow_revision.get("nodes"), dict) else {}
+    workflow_node = workflow_nodes.get(node_id) if isinstance(workflow_nodes.get(node_id), dict) else {}
+    if isinstance(workflow_node.get("outputs"), dict):
+        candidates.append(workflow_node.get("outputs"))
+    detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
+    real_execution = detail.get("real_execution") if isinstance(detail.get("real_execution"), dict) else {}
+    if isinstance(real_execution.get("declared_outputs"), dict):
+        candidates.append(real_execution.get("declared_outputs"))
+    static = node_static_config(sop, node_id) or {}
+    if isinstance(static.get("outputs"), dict):
+        candidates.append(static.get("outputs"))
+    for candidate in candidates:
+        outputs = normalized_contract(candidate, "output")
+        if outputs:
+            return outputs
+    return {}
+
+
+def business_output_status_for(sop, node_id, actual_outputs, declared_outputs=None, artifacts=None, result=None):
+    declared_outputs = declared_outputs_from_node_run_result(sop, node_id, result, declared_outputs)
     expected_names = [name for name in declared_outputs.keys() if is_business_output_name(name)]
     required_names = [
         name
@@ -3839,14 +3865,15 @@ def node_draft_probe_status_from_result(sop, node_id, result):
     result = result if isinstance(result, dict) else {}
     run_status = str(result.get("status") or "").lower()
     if run_status in {"running", "queued"}:
-        return "running", business_output_status_for(sop, node_id, result.get("actual_outputs") or {}, artifacts=result.get("business_artifacts") or [])
+        return "running", business_output_status_for(sop, node_id, result.get("actual_outputs") or {}, artifacts=result.get("business_artifacts") or [], result=result)
     if run_status not in {"done", "warning"}:
-        return "failed", business_output_status_for(sop, node_id, result.get("actual_outputs") or {}, artifacts=result.get("business_artifacts") or [])
-    output_status = result.get("business_output_status") if isinstance(result.get("business_output_status"), dict) else business_output_status_for(
+        return "failed", business_output_status_for(sop, node_id, result.get("actual_outputs") or {}, artifacts=result.get("business_artifacts") or [], result=result)
+    output_status = business_output_status_for(
         sop,
         node_id,
         result.get("actual_outputs") or {},
         artifacts=result.get("business_artifacts") or [],
+        result=result,
     )
     return ("passed" if output_status.get("status") == "passed" else "needs_review"), output_status
 
@@ -12109,8 +12136,7 @@ def hydrate_node_run_result_views(sop, result):
     node_id = str(result.get("node_id") or "")
     if not node_run_id or not node_id:
         return result
-    static = node_static_config(sop, node_id) or {}
-    declared_outputs = normalized_contract(static.get("outputs") or {}, "output")
+    declared_outputs = declared_outputs_from_node_run_result(sop, node_id, result)
     actual_outputs = result.get("actual_outputs") if isinstance(result.get("actual_outputs"), dict) else {}
     artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
     core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
