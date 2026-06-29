@@ -4022,6 +4022,37 @@ def delete_runtime_node(sop, node_id, data=None):
     return result
 
 
+def delete_node_draft(sop, draft_id, data=None):
+    draft_id = str(draft_id or "").strip()
+    if not draft_id:
+        return {"status": "failed", "detail": "draft_id is required"}
+    draft = read_node_draft(sop, draft_id)
+    if not draft:
+        return {"status": "not_found", "draft_id": draft_id, "detail": "Node draft was not found"}
+    draft_dir = node_draft_dir(sop, draft_id)
+    if not draft_dir.is_dir() or draft_dir.name != slugify(draft_id):
+        return {"status": "blocked", "draft_id": draft_id, "detail": "Invalid draft path"}
+    node = draft.get("node") if isinstance(draft.get("node"), dict) else {}
+    node_id = str(node.get("id") or node.get("node_id") or "").strip()
+    runtime_publish = draft.get("runtime_publish") if isinstance(draft.get("runtime_publish"), dict) else {}
+    runtime_visible = bool(runtime_publish.get("visible_in_nodes_api")) and str(runtime_publish.get("status") or "").lower() == "published"
+    backup_dir = Path(sop["wiki_local_path"]) / "raw" / "node-draft-deletions" / f"{draft_dir.name}-{int(time.time())}"
+    backup_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(draft_dir, backup_dir, dirs_exist_ok=True)
+    shutil.rmtree(draft_dir, ignore_errors=True)
+    result = {
+        "status": "deleted",
+        "draft_id": draft_id,
+        "node_id": node_id,
+        "backup_path": str(backup_dir),
+        "runtime_node_still_published": runtime_visible,
+        "detail": "Node draft was deleted. Runtime Node is not deleted by this operation." if runtime_visible else "Node draft was deleted.",
+        "deleted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(backup_dir / "delete-result.json", result)
+    return result
+
+
 def test_node_draft(sop, draft_id, data=None):
     data = data if isinstance(data, dict) else {}
     draft = read_node_draft(sop, draft_id)
@@ -13796,6 +13827,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "node-drafts":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = delete_node_draft(sop, path[4], {})
+            status = 200 if result.get("status") in {"deleted", "not_found"} else 422
+            return json_response(self, status, result)
         if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "nodes":
             sop = find_sop(path[2])
             if not sop:
@@ -14122,6 +14160,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return json_response(self, 404, {"detail": "SOP not found"})
             result = node_draft_persistence_plan(sop, path[4], data)
             status = 200 if result.get("status") == "generated" else 422
+            return json_response(self, status, result)
+
+        # POST /api/sop/{instance}/node-drafts/{draft_id}/delete
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "node-drafts" and path[5] == "delete":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = delete_node_draft(sop, path[4], data)
+            status = 200 if result.get("status") in {"deleted", "not_found"} else 422
             return json_response(self, status, result)
 
         # POST /api/sop/{instance}/nodes/{node_id}/delete
