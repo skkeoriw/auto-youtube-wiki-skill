@@ -3690,13 +3690,62 @@ def list_node_draft_probe_runs(sop, draft_id):
         payload = read_json(path) or {}
         if isinstance(payload, dict):
             payload.setdefault("probe_id", path.stem)
+            payload = reconcile_node_draft_probe_payload(sop, draft_id, payload.get("probe_id") or path.stem, payload, path)
             rows.append(payload)
     return rows
 
 
 def read_node_draft_probe(sop, draft_id, probe_id):
-    payload = read_json(node_draft_probe_path(sop, draft_id, probe_id)) or {}
+    path = node_draft_probe_path(sop, draft_id, probe_id)
+    payload = read_json(path) or {}
+    payload = reconcile_node_draft_probe_payload(sop, draft_id, probe_id, payload, path) if isinstance(payload, dict) else payload
     return payload if isinstance(payload, dict) and payload else None
+
+
+def reconcile_node_draft_probe_payload(sop, draft_id, probe_id, payload, path=None):
+    if not isinstance(payload, dict):
+        return payload
+    node_run_id = sanitize_node_run_id(payload.get("node_run_id") or "")
+    node_id = str(payload.get("node_id") or "").strip()
+    if not node_run_id or not node_id:
+        return payload
+    result = read_node_run_result(sop, node_id, node_run_id)
+    if not isinstance(result, dict):
+        return payload
+    run_status = str(result.get("status") or "").lower()
+    probe_status = (
+        "passed" if run_status in {"done", "warning"} else
+        "running" if run_status in {"running", "queued"} else
+        "failed"
+    )
+    output_dir = node_run_existing_output_dir(sop, node_run_id)
+    manifest = read_json(output_dir / "manifest.json") if output_dir else {}
+    records = node_run_output_manifest_records(sop, node_run_id) if node_run_id else []
+    updated = {
+        **payload,
+        "status": probe_status,
+        "probe_id": payload.get("probe_id") or probe_id,
+        "draft_id": payload.get("draft_id") or draft_id,
+        "node_id": node_id,
+        "node_run_id": node_run_id,
+        "http_status": 200 if run_status in {"done", "warning", "running", "queued"} else payload.get("http_status", 500),
+        "result": result,
+        "manifest": manifest if isinstance(manifest, dict) else {},
+        "manifest_records": [
+            {key: value for key, value in record.items() if key != "file"}
+            for record in records
+        ],
+        "validation": result.get("validation") or {},
+        "actual_outputs": result.get("actual_outputs") or {},
+        "reconciled_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if path:
+        try:
+            if updated != payload:
+                write_json(path, updated)
+        except OSError:
+            pass
+    return updated
 
 
 def node_draft_temp_sop(sop, node):
