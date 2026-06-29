@@ -1947,6 +1947,105 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(hydrated["validation"]["business_output_status"]["status"], "failed_execution")
         self.assertIn("download dialog timed out", hydrated["detail"]["real_execution"]["summary"])
 
+    def test_node_run_output_categories_ignore_scalar_json_and_urls(self):
+        node_run_id = "node-run-runtime-image-node-scalar-output"
+        categories = bridge.collect_node_run_output_categories(self.sop, node_run_id, "runtime-image-node", {
+            "public_image_url": "https://resource.example/generated.png",
+            "status_json": {
+                "status": "succeeded",
+                "publicImageUrl": "https://resource.example/generated.png",
+            },
+            "generated_images": ["https://resource.example/generated.png"],
+        })
+
+        self.assertEqual(categories["core_outputs"]["files"], [])
+        self.assertEqual(categories["core_outputs"]["count"], 0)
+
+    def test_async_node_run_reconcile_recovers_failed_result_with_successful_receipt(self):
+        node_id = "runtime-image-node"
+        node_run_id = "node-run-runtime-image-node-successful-probe"
+        image_url = "https://resource.example/generated.png"
+        self.sop["nodes"][node_id] = {
+            "title": "Runtime Image Node",
+            "outputs": {
+                "expected": {
+                    "public_image_url": {"value_type": "url", "relayable": True},
+                    "status": {"value_type": "text", "relayable": True},
+                    "task_id": {"value_type": "text", "relayable": True},
+                    "status_json": {"value_type": "json", "relayable": False},
+                    "generated_images": {"value_type": "image", "relayable": True},
+                },
+            },
+        }
+        result = {
+            "status": "failed",
+            "pending": False,
+            "node_run_id": node_run_id,
+            "pipeline_id": node_run_id,
+            "node_id": node_id,
+            "started_at": "2026-06-29T00:00:00+00:00",
+            "workflow_revision": {
+                "nodes": {
+                    node_id: {
+                        "outputs": self.sop["nodes"][node_id]["outputs"],
+                    },
+                },
+            },
+            "steps": [
+                {
+                    "id": "execute-or-dry-run",
+                    "status": "failed",
+                    "summary": "Real node execution crashed before completion.",
+                },
+                {
+                    "id": "validate-outputs",
+                    "status": "failed",
+                    "summary": "Declared outputs are missing.",
+                },
+            ],
+            "actual_outputs": {},
+            "artifacts": [],
+            "validation": {},
+        }
+        bridge.write_json(bridge.node_run_workspace(self.sop, node_run_id) / "result.json", result)
+        bridge.write_json(bridge.node_run_output_files_dir(self.sop, node_run_id) / "manifest.json", {
+            "node_run_id": node_run_id,
+            "node_id": node_id,
+            "status": "succeeded",
+            "created_at": "2026-06-29T00:01:00Z",
+            "items": [
+                {"output": "public_image_url", "url": image_url, "value_type": "url"},
+                {"output": "status", "value": "succeeded", "value_type": "text"},
+                {"output": "task_id", "value": "task-123", "value_type": "text"},
+                {
+                    "output": "status_json",
+                    "value": {
+                        "status": "succeeded",
+                        "publicImageUrl": image_url,
+                    },
+                    "value_type": "json",
+                },
+                {"output": "generated_images", "url": image_url, "value_type": "image"},
+            ],
+        })
+        bridge.write_json(bridge.node_run_agent_path(self.sop, node_run_id, "receipt.json"), {
+            "node_run_id": node_run_id,
+            "node_id": node_id,
+            "status": "succeeded",
+            "exit_code": 0,
+            "completed_at": "2026-06-29T00:01:00Z",
+            "public_image_url": image_url,
+        })
+
+        hydrated = bridge.read_node_run_result(self.sop, node_id, node_run_id)
+
+        self.assertEqual(hydrated["status"], "done")
+        self.assertFalse(hydrated["pending"])
+        self.assertEqual(hydrated["actual_outputs"]["public_image_url"], image_url)
+        self.assertEqual(hydrated["actual_outputs"]["status_json"]["status"], "succeeded")
+        self.assertEqual(hydrated["validation"]["status"], "passed")
+        self.assertEqual(hydrated["business_output_status"]["status"], "passed")
+
     def test_trigger_node_test_for_node_without_engine_contract_returns_404(self):
         # Single-node test is only supported for nodes the provisioning engine
         # classifies (runtime-management nodes). A youtube-research node like

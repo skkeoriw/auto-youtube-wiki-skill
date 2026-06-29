@@ -11930,6 +11930,11 @@ def collect_node_run_output_categories(sop, node_run_id, node_id, actual_outputs
     for value in (actual_outputs or {}).values():
         values = value if isinstance(value, list) else [value]
         for relative in values:
+            if not isinstance(relative, str):
+                continue
+            relative = relative.strip()
+            if not relative or "://" in relative:
+                continue
             path = safe_artifact_path(wiki, relative)
             if path and path.is_file():
                 rel = safe_relative_file(wiki, path)
@@ -11999,6 +12004,8 @@ def node_run_actual_output_file_paths(actual_outputs):
     for value in (actual_outputs or {}).values():
         values = value if isinstance(value, list) else [value]
         for item in values:
+            if not isinstance(item, str):
+                continue
             text = str(item or "").strip()
             if not text or "://" in text:
                 continue
@@ -13076,6 +13083,21 @@ def persist_node_run_result(sop, node_run_id, body, result, events):
         persist_node_run_audit_evidence_to_git(sop, node_run_id)
 
 
+def receipt_successful(receipt):
+    receipt = receipt if isinstance(receipt, dict) else {}
+    status = str(receipt.get("status") or receipt.get("execution_status") or "").lower()
+    if status in {"done", "success", "succeeded", "passed"}:
+        return True
+    for key in ("returncode", "return_code", "exit_code", "exitCode"):
+        if key not in receipt:
+            continue
+        try:
+            return int(receipt.get(key)) == 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
 def complete_real_node_run_async(sop, workflow_id, node_id, node_run_id, body, started_at):
     try:
         plan = build_node_run_plan(sop, workflow_id, node_id, body)
@@ -13321,7 +13343,7 @@ def reconcile_completed_node_run_result(sop, result):
     manifest = read_json(manifest_path) or {}
     evidence_status = str(receipt.get("status") or manifest.get("status") or "").lower()
     evidence_failed = evidence_status in {"failed", "error", "cancelled", "canceled", "timeout", "timed_out"}
-    if current_status == "failed" and (not manifest_path.exists() or receipt.get("returncode") != 0):
+    if current_status == "failed" and (not manifest_path.exists() or (receipt and not receipt_successful(receipt))):
         return result
 
     output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
