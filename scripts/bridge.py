@@ -1845,6 +1845,11 @@ def run_context(sop, pipeline_id):
 
 
 def normalized_contract(value, direction):
+    if direction == "output" and isinstance(value, dict) and isinstance(value.get("expected"), dict):
+        # Node Builder drafts may store output contract metadata as:
+        # outputs.root / outputs.manifest / outputs.expected. Only expected
+        # entries are business outputs that should participate in validation.
+        value = value.get("expected") or {}
     result = {}
     if not isinstance(value, dict):
         return result
@@ -2465,6 +2470,10 @@ def node_cli_examples(endpoint, instance_id, node_id, pipeline_id="<pipeline_id>
 def normalize_contract(value, direction):
     if not isinstance(value, dict):
         return {}
+    if direction == "output" and isinstance(value.get("expected"), dict):
+        # Runtime Node drafts use outputs.expected to keep the business output
+        # contract separate from output workspace metadata such as root/manifest.
+        value = value.get("expected") or {}
     result = {}
     for name, spec in value.items():
         if isinstance(spec, dict):
@@ -12849,7 +12858,10 @@ def create_node_run(sop, workflow_id, node_id, body):
 
 
 def reconcile_completed_node_run_result(sop, result):
-    if not isinstance(result, dict) or result.get("status") != "running":
+    if not isinstance(result, dict):
+        return result
+    current_status = str(result.get("status") or "").lower()
+    if current_status not in {"running", "failed"}:
         return result
     node_run_id = sanitize_node_run_id(result.get("node_run_id") or result.get("pipeline_id") or "")
     node_id = str(result.get("node_id") or "").strip()
@@ -12861,6 +12873,9 @@ def reconcile_completed_node_run_result(sop, result):
     response_path = node_run_agent_path(sop, node_run_id, "response.txt")
     if not manifest_path.exists() and not receipt_path.exists():
         return result
+    receipt = read_json(receipt_path) or {}
+    if current_status == "failed" and (not manifest_path.exists() or receipt.get("returncode") != 0):
+        return result
 
     output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
     actual_outputs = output_info.get("actual_outputs") or {}
@@ -12868,8 +12883,10 @@ def reconcile_completed_node_run_result(sop, result):
         actual_outputs = node_run_manifest_actual_outputs(sop, node_run_id)
     if not actual_outputs:
         return result
+    validation = output_info.get("validation") if isinstance(output_info.get("validation"), dict) else {}
+    if validation.get("status") and validation.get("status") != "passed":
+        return result
 
-    receipt = read_json(receipt_path) or {}
     finished_at = str(
         receipt.get("finished_at")
         or (receipt.get("timestamps") or {}).get("completed_at")
@@ -12893,14 +12910,14 @@ def reconcile_completed_node_run_result(sop, result):
         "input_manifest": output_info.get("input_manifest") or "",
         "output_directory": output_info.get("output_directory") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir),
         "output_manifest": output_info.get("output_manifest") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), manifest_path),
-        "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+        "validation": validation or {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
         "capabilities": output_info.get("capabilities") or {},
         "agent_request": result.get("agent_request") or {},
         "detail": {
             "receipt": mask_data(receipt) if isinstance(receipt, dict) else {},
             "response_path": safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), response_path) if response_path.exists() else "",
             "actual_outputs": actual_outputs,
-            "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+            "validation": validation or {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
         },
     }
     steps = result.get("steps") if isinstance(result.get("steps"), list) else []
