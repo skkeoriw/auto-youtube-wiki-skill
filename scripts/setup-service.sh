@@ -115,8 +115,26 @@ else
   echo "[setup-service] Cloudflare route ensure skipped: CF_EMAIL/CF_API_KEY not set"
 fi
 
-bash "$SCRIPT_DIR/start-local-service.sh" --stop >/dev/null 2>&1 || true
-bash "$SCRIPT_DIR/start-local-service.sh" --port="$PORT" --daemon
+# Start the bridge as a persistent systemd service when available; fallback to nohup.
+export BRIDGE_NAME="${NAME}"
+if bash "$SCRIPT_DIR/start-local-service.sh" --name="$BRIDGE_NAME" --stop-service >/dev/null 2>&1; then
+  echo "[setup-service] stopped existing bridge service for $BRIDGE_NAME"
+else
+  bash "$SCRIPT_DIR/start-local-service.sh" --name="$BRIDGE_NAME" --stop >/dev/null 2>&1 || true
+fi
+
+if bash "$SCRIPT_DIR/start-local-service.sh" --name="$BRIDGE_NAME" --install-service >/dev/null 2>&1; then
+  if bash "$SCRIPT_DIR/start-local-service.sh" --name="$BRIDGE_NAME" --port="$PORT" --start-service >/dev/null 2>&1; then
+    echo "[setup-service] bridge service started with systemd for $BRIDGE_NAME"
+  else
+    echo "[setup-service] systemd start failed, fallback to daemon mode" >&2
+    bash "$SCRIPT_DIR/start-local-service.sh" --name="$BRIDGE_NAME" --port="$PORT" --daemon
+  fi
+else
+  echo "[setup-service] systemd unavailable, fallback to daemon mode" >&2
+  bash "$SCRIPT_DIR/start-local-service.sh" --name="$BRIDGE_NAME" --port="$PORT" --daemon
+fi
+
 if ! curl -sf "http://127.0.0.1:$PORT" >/dev/null; then
   echo "bridge did not start on port $PORT" >&2
   exit 1
