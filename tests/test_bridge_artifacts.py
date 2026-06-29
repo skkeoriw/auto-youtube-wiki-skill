@@ -1836,6 +1836,35 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(business["expected_outputs"], ["public_image_url"])
         self.assertEqual(business["present_outputs"], ["public_image_url"])
 
+    def test_node_run_detail_hydrates_business_output_status_from_workflow_revision(self):
+        node_run_id = "node-run-runtime-image-node-probe"
+        result = {
+            "status": "done",
+            "node_run_id": node_run_id,
+            "pipeline_id": node_run_id,
+            "node_id": "runtime-image-node",
+            "workflow_revision": {
+                "nodes": {
+                    "runtime-image-node": {
+                        "outputs": {
+                            "expected": {
+                                "public_image_url": {"value_type": "url", "relayable": True},
+                            },
+                        }
+                    }
+                }
+            },
+            "actual_outputs": {
+                "manifest": f"raw/node-runs/{node_run_id}/outputs/manifest.json",
+            },
+            "artifacts": [],
+            "validation": {"status": "passed"},
+        }
+        hydrated = bridge.hydrate_node_run_result_views(self.sop, result)
+        self.assertEqual(hydrated["business_output_status"]["status"], "missing_business_outputs")
+        self.assertEqual(hydrated["business_output_status"]["expected_outputs"], ["public_image_url"])
+        self.assertEqual(hydrated["validation"]["business_output_status"]["status"], "missing_business_outputs")
+
     def test_trigger_node_test_for_node_without_engine_contract_returns_404(self):
         # Single-node test is only supported for nodes the provisioning engine
         # classifies (runtime-management nodes). A youtube-research node like

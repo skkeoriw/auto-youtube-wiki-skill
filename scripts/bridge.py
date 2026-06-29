@@ -12140,8 +12140,12 @@ def hydrate_node_run_result_views(sop, result):
     actual_outputs = result.get("actual_outputs") if isinstance(result.get("actual_outputs"), dict) else {}
     artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
     core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
+    business_status = business_output_status_for(sop, node_id, actual_outputs, declared_outputs, artifacts, result=result)
     result["core_outputs"] = core_outputs
     result["business_artifacts"] = node_run_business_artifacts_from_core(core_outputs)
+    result["business_output_status"] = business_status
+    validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
+    result["validation"] = {**validation, "business_output_status": business_status}
     result["relay_package"] = node_run_relay_package(sop, node_run_id, node_id)
     result["execution_evidence"] = node_run_execution_evidence(sop, node_run_id, node_id, artifacts)
     return result
