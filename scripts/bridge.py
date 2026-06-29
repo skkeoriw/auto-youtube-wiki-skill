@@ -11800,12 +11800,15 @@ def node_run_relay_package(sop, node_run_id, node_id):
     items = []
     for record in records:
         output_name = manifest_item_output_name(record) or "files"
-        artifact = artifact_record(sop, node_id, output_name, record.get("file"), "node-run-output-manifest")
+        record_file = record.get("file")
+        artifact = artifact_record(sop, node_id, output_name, record_file, "node-run-output-manifest") if record_file else None
         items.append({
             "output": output_name,
             "path": record.get("path") or "",
             "relative_path": record.get("path", "").replace(safe_relative_file(wiki, output_dir).rstrip("/") + "/", "", 1) if record.get("path") else "",
-            "value_type": record.get("value_type") or node_run_manifest_value_type(record.get("file")),
+            "value_type": record.get("value_type") or node_run_manifest_value_type(record_file),
+            "value": mask_data(record.get("value")) if "value" in record else "",
+            "value_preview": mask_data(record.get("value_preview")) if "value_preview" in record else "",
             "source": record.get("source") or "",
             "source_node": record.get("source_node") or "",
             "source_run_id": record.get("source_run_id") or "",
