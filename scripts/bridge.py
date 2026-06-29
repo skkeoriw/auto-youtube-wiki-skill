@@ -3639,6 +3639,8 @@ def read_node_draft(sop, draft_id):
     draft_dir = node_draft_dir(sop, draft_id)
     if not draft_dir.exists():
         return None
+    if not (draft_dir / "node.yaml").is_file():
+        return None
     probe_runs = list_node_draft_probe_runs(sop, draft_dir.name)
     return {
         "draft_id": draft_dir.name,
