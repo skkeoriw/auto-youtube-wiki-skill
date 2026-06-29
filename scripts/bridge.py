@@ -3745,7 +3745,7 @@ def run_node_draft_probe(sop, draft_id, data=None):
         "mode": "real-node",
         "input_source": "manual",
         "manual_inputs": manual_inputs,
-        "sync": bool(data.get("sync", True)),
+        "sync": bool(data.get("sync", False)),
         "capability_overrides": capability_overrides,
         "node_run_id": data.get("node_run_id") or "",
         "source": "node-draft-probe",
@@ -3759,7 +3759,13 @@ def run_node_draft_probe(sop, draft_id, data=None):
     records = node_run_output_manifest_records(sop, node_run_id) if node_run_id else []
     probe_id = f"{node_id}-probe-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{hashlib.sha1(os.urandom(8)).hexdigest()[:6]}"
     payload = {
-        "status": "passed" if http_code < 400 and (result or {}).get("status") in {"done", "warning"} else "failed",
+        "status": (
+            "passed"
+            if http_code < 400 and (result or {}).get("status") in {"done", "warning"}
+            else "running"
+            if http_code < 400 and (result or {}).get("status") in {"running", "queued"}
+            else "failed"
+        ),
         "probe_id": probe_id,
         "draft_id": draft_id,
         "node_id": node_id,
@@ -14135,7 +14141,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             result = run_node_draft_probe(sop, path[4], data)
-            status = 200 if result.get("status") in {"passed", "warning"} else 422
+            status = 200 if result.get("status") in {"passed", "warning", "running"} else 422
             return json_response(self, status, result)
 
         # POST /api/sop/{instance}/node-drafts/{draft_id}/contract-synthesis
