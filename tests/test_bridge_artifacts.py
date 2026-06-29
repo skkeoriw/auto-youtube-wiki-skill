@@ -1894,6 +1894,50 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(hydrated["business_output_status"]["expected_outputs"], ["public_image_url"])
         self.assertEqual(hydrated["validation"]["business_output_status"]["status"], "missing_business_outputs")
 
+    def test_node_run_detail_hydrates_stale_validate_step_when_business_outputs_pass(self):
+        node_run_id = "node-run-runtime-image-node-stale-validation"
+        result = {
+            "status": "done",
+            "node_run_id": node_run_id,
+            "pipeline_id": node_run_id,
+            "node_id": "runtime-image-node",
+            "workflow_revision": {
+                "nodes": {
+                    "runtime-image-node": {
+                        "outputs": {
+                            "expected": {
+                                "public_image_url": {"value_type": "url", "relayable": True},
+                            },
+                        }
+                    }
+                }
+            },
+            "actual_outputs": {
+                "public_image_url": "https://resource.example/generated.png",
+            },
+            "steps": [
+                {
+                    "id": "validate-outputs",
+                    "status": "warning",
+                    "summary": "Execution finished, but no business output was captured.",
+                    "detail": {
+                        "status": "passed",
+                        "business_output_status": {"status": "no_declared_business_outputs"},
+                    },
+                }
+            ],
+            "artifacts": [],
+            "validation": {"status": "passed"},
+        }
+
+        hydrated = bridge.hydrate_node_run_result_views(self.sop, result)
+        validate_step = next(step for step in hydrated["steps"] if step["id"] == "validate-outputs")
+
+        self.assertEqual(hydrated["business_output_status"]["status"], "passed")
+        self.assertEqual(validate_step["status"], "done")
+        self.assertEqual(validate_step["summary"], "Declared business outputs were found.")
+        self.assertEqual(validate_step["detail"]["business_output_status"]["status"], "passed")
+
     def test_async_node_run_reconcile_marks_failed_manifest_as_failed(self):
         node_run_id = "node-run-runtime-image-node-failed-probe"
         result = {

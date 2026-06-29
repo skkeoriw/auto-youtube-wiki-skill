@@ -12167,6 +12167,18 @@ def hydrate_node_run_result_views(sop, result):
     result["business_output_status"] = business_status
     validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
     result["validation"] = {**validation, "business_output_status": business_status}
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    if business_status.get("status") == "passed" and result["validation"].get("status") == "passed":
+        for step in steps:
+            if not isinstance(step, dict) or step.get("id") != "validate-outputs":
+                continue
+            step["status"] = "done"
+            step["summary"] = "Declared business outputs were found."
+            step["detail"] = {
+                **(step.get("detail") if isinstance(step.get("detail"), dict) else {}),
+                **result["validation"],
+                "business_output_status": business_status,
+            }
     result["relay_package"] = node_run_relay_package(sop, node_run_id, node_id)
     result["execution_evidence"] = node_run_execution_evidence(sop, node_run_id, node_id, artifacts)
     return result
