@@ -3749,6 +3749,7 @@ def run_node_draft_probe(sop, draft_id, data=None):
         "capability_overrides": capability_overrides,
         "node_run_id": data.get("node_run_id") or "",
         "source": "node-draft-probe",
+        "_skip_definition_scope_reports": True,
     }
     workflow_id = str(data.get("workflow_id") or workflow_binding(sop).get("workflow_id") or sop.get("id") or "")
     http_code, result = create_node_run(temp_sop, workflow_id, node_id, body)
@@ -12676,17 +12677,18 @@ def read_jsonl(path):
 
 
 def create_node_run(sop, workflow_id, node_id, body):
+    body = body if isinstance(body, dict) else {}
     config, _config_source = node_config_for(sop, node_id)
     if not workflow_id_matches(sop, workflow_id) or not isinstance(config, dict):
         return 404, {"status": "error", "message": f"Node {node_id!r} or workflow {workflow_id!r} not found"}
     token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     digest = hashlib.sha1(json.dumps(body if isinstance(body, dict) else {}, sort_keys=True).encode("utf-8")).hexdigest()[:6]
     node_run_id = sanitize_node_run_id(body.get("node_run_id") if isinstance(body, dict) else "") or f"node-run-{node_id}-{token}-{digest}"
-    body = body if isinstance(body, dict) else {}
     capability_overrides = normalize_node_run_capability_overrides(sop, node_id, body)
-    definition_scope_reports = node_run_definition_scope_reports(sop, node_id, node_run_id, capability_overrides)
+    skip_definition_scope_reports = bool(body.get("_skip_definition_scope_reports"))
+    definition_scope_reports = {} if skip_definition_scope_reports else node_run_definition_scope_reports(sop, node_id, node_run_id, capability_overrides)
     sop_file = Path(str(sop.get("sop_file") or "")).expanduser()
-    if definition_scope_reports.get("instance_override", {}).get("status") in {"saved", "unchanged"} and sop_file.exists():
+    if not skip_definition_scope_reports and definition_scope_reports.get("instance_override", {}).get("status") in {"saved", "unchanged"} and sop_file.exists():
         updated = read_yaml(sop_file)
         for key in ("nodes", "pipeline", "notify", "repo", "repo_branch", "name", "title", "version"):
             if key in updated:
