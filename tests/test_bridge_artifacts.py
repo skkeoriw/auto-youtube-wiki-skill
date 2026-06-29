@@ -1784,6 +1784,40 @@ class ArtifactResolutionTest(unittest.TestCase):
         refreshed = bridge.read_node_draft(self.sop, draft["draft_id"])
         self.assertIn("generated_image", refreshed["node"]["outputs"])
 
+    def test_node_draft_probe_runs_sort_by_probe_created_at_not_file_mtime(self):
+        draft = bridge.create_node_draft(self.sop, {
+            "node_draft": {
+                "schema": "node-definition/v1",
+                "id": "runtime-image-node",
+                "title": "Runtime Image Node",
+            },
+            "skill_install_command": "bash <(curl -fsSL https://skill.vyibc.com/install-runtime-image-node.sh)",
+            "skill_id": "runtime-image-node",
+            "node_id": "runtime-image-node",
+            "title": "Runtime Image Node",
+        })
+        root = bridge.node_draft_probe_runs_dir(self.sop, draft["draft_id"])
+        older = root / "runtime-image-node-probe-20260629t100000z-old.json"
+        newer = root / "runtime-image-node-probe-20260629t110000z-new.json"
+        bridge.write_json(newer, {
+            "probe_id": "runtime-image-node-probe-20260629T110000Z-new",
+            "status": "running",
+            "created_at": "2026-06-29T11:00:00+00:00",
+        })
+        bridge.write_json(older, {
+            "probe_id": "runtime-image-node-probe-20260629T100000Z-old",
+            "status": "passed",
+            "created_at": "2026-06-29T10:00:00+00:00",
+        })
+        now = time.time()
+        os.utime(newer, (now - 100, now - 100))
+        os.utime(older, (now, now))
+
+        rows = bridge.list_node_draft_probe_runs(self.sop, draft["draft_id"])
+
+        self.assertEqual(rows[0]["probe_id"], "runtime-image-node-probe-20260629T110000Z-new")
+        self.assertEqual(rows[1]["probe_id"], "runtime-image-node-probe-20260629T100000Z-old")
+
     def test_node_draft_probe_uses_workflow_revision_expected_outputs(self):
         result = {
             "status": "done",

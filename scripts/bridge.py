@@ -3719,18 +3719,35 @@ def node_draft_probe_path(sop, draft_id, probe_id):
     return node_draft_probe_runs_dir(sop, draft_id) / f"{slugify(probe_id)}.json"
 
 
+def node_draft_probe_sort_key(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    raw_time = str(
+        payload.get("created_at")
+        or payload.get("started_at")
+        or payload.get("finished_at")
+        or ""
+    ).strip()
+    timestamp = 0.0
+    if raw_time:
+        try:
+            timestamp = datetime.fromisoformat(raw_time.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            timestamp = 0.0
+    return (timestamp, str(payload.get("probe_id") or ""))
+
+
 def list_node_draft_probe_runs(sop, draft_id):
     root = node_draft_dir(sop, draft_id) / "probe-runs"
     if not root.exists():
         return []
     rows = []
-    for path in sorted(root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+    for path in root.glob("*.json"):
         payload = read_json(path) or {}
         if isinstance(payload, dict):
             payload.setdefault("probe_id", path.stem)
             payload = reconcile_node_draft_probe_payload(sop, draft_id, payload.get("probe_id") or path.stem, payload, path)
             rows.append(payload)
-    return rows
+    return sorted(rows, key=node_draft_probe_sort_key, reverse=True)
 
 
 def read_node_draft_probe(sop, draft_id, probe_id):
