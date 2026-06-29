@@ -13307,6 +13307,9 @@ def reconcile_completed_node_run_result(sop, result):
     if not manifest_path.exists() and not receipt_path.exists():
         return result
     receipt = read_json(receipt_path) or {}
+    manifest = read_json(manifest_path) or {}
+    evidence_status = str(receipt.get("status") or manifest.get("status") or "").lower()
+    evidence_failed = evidence_status in {"failed", "error", "cancelled", "canceled", "timeout", "timed_out"}
     if current_status == "failed" and (not manifest_path.exists() or receipt.get("returncode") != 0):
         return result
 
@@ -13318,15 +13321,39 @@ def reconcile_completed_node_run_result(sop, result):
             for name, value in node_run_manifest_actual_outputs(sop, node_run_id).items()
             if is_business_output_name(name)
         }
-    if not actual_outputs:
+    if not actual_outputs and not evidence_failed:
         return result
     validation = output_info.get("validation") if isinstance(output_info.get("validation"), dict) else {}
-    if validation.get("status") and validation.get("status") != "passed":
+    if validation.get("status") and validation.get("status") != "passed" and not evidence_failed:
         return result
+    business_status = output_info.get("business_output_status") if isinstance(output_info.get("business_output_status"), dict) else {}
+    if not business_status.get("expected_outputs") and isinstance(result.get("workflow_revision"), dict):
+        business_status = business_output_status_for(sop, node_id, actual_outputs, result=result)
+    if evidence_failed:
+        receipt_error = receipt.get("error") if isinstance(receipt.get("error"), dict) else {}
+        manifest_error = manifest.get("error") if isinstance(manifest.get("error"), dict) else {}
+        manifest_summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+        failure_summary = (
+            receipt_error.get("summary")
+            or manifest_summary.get("result")
+            or manifest_error.get("error")
+            or "Real node execution failed after the async run wrote failure evidence."
+        )
+        validation = {
+            **validation,
+            "status": "failed",
+            "execution_status": evidence_status or "failed",
+            "error": mask_data(receipt_error or manifest_error),
+            "business_output_status": business_status,
+        }
+    else:
+        failure_summary = ""
 
     finished_at = str(
         receipt.get("finished_at")
         or (receipt.get("timestamps") or {}).get("completed_at")
+        or receipt.get("completed_at")
+        or manifest.get("created_at")
         or datetime.now(timezone.utc).isoformat()
     )
     started_at = str(result.get("started_at") or receipt.get("started_at") or "")
@@ -13343,8 +13370,8 @@ def reconcile_completed_node_run_result(sop, result):
     if isinstance(executor, dict) and executor:
         agent_request = {**agent_request, **{k: v for k, v in executor.items() if k != "rendered_request"}}
     real_execution = {
-        "status": "done",
-        "summary": "Real node execution finished and output manifest was found.",
+        "status": "failed" if evidence_failed else "done",
+        "summary": failure_summary if evidence_failed else "Real node execution finished and output manifest was found.",
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_ms": 0,
@@ -13360,11 +13387,14 @@ def reconcile_completed_node_run_result(sop, result):
         "output_directory": output_info.get("output_directory") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir),
         "output_manifest": output_info.get("output_manifest") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), manifest_path),
         "validation": validation or {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
-        "business_output_status": output_info.get("business_output_status") or ((validation or {}).get("business_output_status") if isinstance(validation, dict) else {}),
+        "business_output_status": business_status or ((validation or {}).get("business_output_status") if isinstance(validation, dict) else {}),
         "capabilities": output_info.get("capabilities") or {},
         "agent_request": agent_request,
         "detail": {
             "receipt": mask_data(receipt) if isinstance(receipt, dict) else {},
+            "manifest_status": manifest.get("status") if isinstance(manifest, dict) else "",
+            "manifest_summary": mask_data(manifest.get("summary") or {}) if isinstance(manifest, dict) else {},
+            "manifest_error": mask_data(manifest.get("error") or {}) if isinstance(manifest, dict) else {},
             "response_path": safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), response_path) if response_path.exists() else "",
             "actual_outputs": actual_outputs,
             "validation": validation or {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},

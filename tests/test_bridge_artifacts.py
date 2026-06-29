@@ -1866,6 +1866,59 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(hydrated["business_output_status"]["expected_outputs"], ["public_image_url"])
         self.assertEqual(hydrated["validation"]["business_output_status"]["status"], "missing_business_outputs")
 
+    def test_async_node_run_reconcile_marks_failed_manifest_as_failed(self):
+        node_run_id = "node-run-runtime-image-node-failed-probe"
+        result = {
+            "status": "running",
+            "pending": True,
+            "node_run_id": node_run_id,
+            "pipeline_id": node_run_id,
+            "node_id": "runtime-image-node",
+            "started_at": "2026-06-29T00:00:00+00:00",
+            "workflow_revision": {
+                "nodes": {
+                    "runtime-image-node": {
+                        "outputs": {
+                            "expected": {
+                                "public_image_url": {"value_type": "url", "relayable": True},
+                            },
+                        }
+                    }
+                }
+            },
+            "steps": [
+                {"id": "execute-or-dry-run", "status": "running", "summary": "running"},
+                {"id": "validate-outputs", "status": "waiting", "summary": "waiting"},
+            ],
+            "actual_outputs": {},
+            "artifacts": [],
+            "validation": {},
+        }
+        bridge.write_json(bridge.node_run_workspace(self.sop, node_run_id) / "result.json", result)
+        bridge.write_json(bridge.node_run_output_files_dir(self.sop, node_run_id) / "manifest.json", {
+            "node_run_id": node_run_id,
+            "node_id": "runtime-image-node",
+            "status": "failed",
+            "summary": {"result": "download dialog timed out"},
+            "error": {"error": "Worker exited with code 1"},
+            "created_at": "2026-06-29T00:01:00Z",
+        })
+        bridge.write_json(bridge.node_run_agent_path(self.sop, node_run_id, "receipt.json"), {
+            "node_run_id": node_run_id,
+            "node_id": "runtime-image-node",
+            "status": "failed",
+            "completed_at": "2026-06-29T00:01:00Z",
+            "error": {"summary": "download dialog timed out"},
+        })
+
+        hydrated = bridge.read_node_run_result(self.sop, "runtime-image-node", node_run_id)
+
+        self.assertEqual(hydrated["status"], "failed")
+        self.assertFalse(hydrated["pending"])
+        self.assertEqual(hydrated["validation"]["status"], "failed")
+        self.assertEqual(hydrated["validation"]["business_output_status"]["status"], "missing_business_outputs")
+        self.assertIn("download dialog timed out", hydrated["detail"]["real_execution"]["summary"])
+
     def test_trigger_node_test_for_node_without_engine_contract_returns_404(self):
         # Single-node test is only supported for nodes the provisioning engine
         # classifies (runtime-management nodes). A youtube-research node like
