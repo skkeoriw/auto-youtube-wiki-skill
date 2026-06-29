@@ -3765,8 +3765,90 @@ def node_run_result_probe_summary(result):
         "validation": result.get("validation") or {},
         "output_manifest": result.get("output_manifest") or "",
         "output_directory": result.get("output_directory") or "",
+        "actual_outputs": result.get("actual_outputs") or {},
+        "business_artifacts": result.get("business_artifacts") or [],
+        "core_outputs": result.get("core_outputs") or [],
         "steps": steps,
     }
+
+
+DIAGNOSTIC_OUTPUT_NAMES = {
+    "manifest",
+    "input_manifest",
+    "output_manifest",
+    "node_run_result",
+    "node_run_events",
+    "agent_request",
+    "agent_response",
+    "agent_receipt",
+    "agent_executor",
+    "executor_log",
+    "stage_events",
+}
+
+
+def is_business_output_name(name):
+    return str(name or "").strip().lower() not in DIAGNOSTIC_OUTPUT_NAMES
+
+
+def output_value_present(value):
+    return value not in (None, "", [])
+
+
+def business_actual_outputs(actual_outputs):
+    actual_outputs = actual_outputs if isinstance(actual_outputs, dict) else {}
+    return {
+        name: value
+        for name, value in actual_outputs.items()
+        if is_business_output_name(name) and output_value_present(value)
+    }
+
+
+def business_output_status_for(sop, node_id, actual_outputs, declared_outputs=None, artifacts=None):
+    declared_outputs = declared_outputs if isinstance(declared_outputs, dict) else normalized_contract((node_static_config(sop, node_id) or {}).get("outputs") or {}, "output")
+    expected_names = [name for name in declared_outputs.keys() if is_business_output_name(name)]
+    required_names = [
+        name
+        for name, spec in declared_outputs.items()
+        if is_business_output_name(name) and isinstance(spec, dict) and spec.get("required") is True
+    ]
+    business_outputs = business_actual_outputs(actual_outputs)
+    present_names = [name for name in expected_names if output_value_present((actual_outputs or {}).get(name))]
+    missing_required = [name for name in required_names if name not in present_names]
+    artifact_count = len([item for item in (artifacts or []) if isinstance(item, dict) and is_business_output_name(item.get("output") or item.get("name") or item.get("id"))])
+    if missing_required:
+        status = "missing_required_outputs"
+    elif expected_names and not present_names and not business_outputs and artifact_count == 0:
+        status = "missing_business_outputs"
+    elif not expected_names and not business_outputs and artifact_count == 0:
+        status = "no_declared_business_outputs"
+    else:
+        status = "passed"
+    return {
+        "status": status,
+        "expected_outputs": expected_names,
+        "required_outputs": required_names,
+        "present_outputs": present_names or sorted(business_outputs.keys()),
+        "missing_required_outputs": missing_required,
+        "business_outputs": business_outputs,
+        "business_artifact_count": artifact_count,
+    }
+
+
+def node_draft_probe_status_from_result(sop, node_id, result):
+    result = result if isinstance(result, dict) else {}
+    run_status = str(result.get("status") or "").lower()
+    if run_status in {"running", "queued"}:
+        return "running", business_output_status_for(sop, node_id, result.get("actual_outputs") or {}, artifacts=result.get("business_artifacts") or [])
+    if run_status not in {"done", "warning"}:
+        return "failed", business_output_status_for(sop, node_id, result.get("actual_outputs") or {}, artifacts=result.get("business_artifacts") or [])
+    output_status = result.get("business_output_status") if isinstance(result.get("business_output_status"), dict) else business_output_status_for(
+        sop,
+        node_id,
+        result.get("actual_outputs") or {},
+        artifacts=result.get("business_artifacts") or [],
+    )
+    return ("passed" if output_status.get("status") == "passed" else "needs_review"), output_status
 
 
 def reconcile_node_draft_probe_payload(sop, draft_id, probe_id, payload, path=None):
@@ -3779,24 +3861,30 @@ def reconcile_node_draft_probe_payload(sop, draft_id, probe_id, payload, path=No
     result = read_node_run_result(sop, node_id, node_run_id)
     if not isinstance(result, dict):
         return payload
-    run_status = str(result.get("status") or "").lower()
-    probe_status = (
-        "passed" if run_status in {"done", "warning"} else
-        "running" if run_status in {"running", "queued"} else
-        "failed"
-    )
     output_dir = node_run_existing_output_dir(sop, node_run_id)
     manifest = read_json(output_dir / "manifest.json") if output_dir else {}
     records = node_run_output_manifest_records(sop, node_run_id) if node_run_id else []
+    status_actual_outputs = result.get("actual_outputs") if isinstance(result.get("actual_outputs"), dict) else {}
+    if not business_actual_outputs(status_actual_outputs):
+        status_actual_outputs = {
+            name: value
+            for name, value in node_run_manifest_actual_outputs(sop, node_run_id).items()
+            if is_business_output_name(name)
+        }
+    status_result = {**result, "actual_outputs": status_actual_outputs}
+    probe_status, business_output_status = node_draft_probe_status_from_result(sop, node_id, status_result)
+    run_status = str(status_result.get("status") or "").lower()
     updated = {
         **payload,
         "status": probe_status,
+        "execution_status": run_status,
+        "business_output_status": business_output_status,
         "probe_id": payload.get("probe_id") or probe_id,
         "draft_id": payload.get("draft_id") or draft_id,
         "node_id": node_id,
         "node_run_id": node_run_id,
         "http_status": 200 if run_status in {"done", "warning", "running", "queued"} else payload.get("http_status", 500),
-        "result": node_run_result_probe_summary(result),
+        "result": node_run_result_probe_summary(status_result),
         "manifest": manifest if isinstance(manifest, dict) else {},
         "output_manifest": result.get("output_manifest") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir / "manifest.json") if output_dir else "",
         "manifest_records": [
@@ -3804,7 +3892,10 @@ def reconcile_node_draft_probe_payload(sop, draft_id, probe_id, payload, path=No
             for record in records
         ],
         "validation": result.get("validation") or {},
-        "actual_outputs": result.get("actual_outputs") or {},
+        "actual_outputs": status_actual_outputs or result.get("actual_outputs") or {},
+        "business_outputs": business_output_status.get("business_outputs") or {},
+        "business_artifacts": result.get("business_artifacts") or [],
+        "core_outputs": result.get("core_outputs") or [],
         "reconciled_at": datetime.now(timezone.utc).isoformat(),
     }
     if path:
@@ -3871,7 +3962,7 @@ def run_node_draft_probe(sop, draft_id, data=None):
         "mode": "real-node",
         "input_source": "manual",
         "manual_inputs": manual_inputs,
-        "sync": bool(data.get("sync", False)),
+        "sync": bool(data.get("sync", True)),
         "capability_overrides": capability_overrides,
         "node_run_id": data.get("node_run_id") or "",
         "source": "node-draft-probe",
@@ -3883,15 +3974,20 @@ def run_node_draft_probe(sop, draft_id, data=None):
     output_dir = node_run_existing_output_dir(sop, node_run_id) if node_run_id else Path()
     manifest = read_json(output_dir / "manifest.json") if output_dir else {}
     records = node_run_output_manifest_records(sop, node_run_id) if node_run_id else []
+    status_actual_outputs = (result or {}).get("actual_outputs") if isinstance((result or {}).get("actual_outputs"), dict) else {}
+    if not business_actual_outputs(status_actual_outputs):
+        status_actual_outputs = {
+            name: value
+            for name, value in node_run_manifest_actual_outputs(sop, node_run_id).items()
+            if is_business_output_name(name)
+        }
+    status_result = {**(result if isinstance(result, dict) else {}), "actual_outputs": status_actual_outputs}
+    probe_status, business_output_status = node_draft_probe_status_from_result(sop, node_id, status_result)
     probe_id = f"{node_id}-probe-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{hashlib.sha1(os.urandom(8)).hexdigest()[:6]}"
     payload = {
-        "status": (
-            "passed"
-            if http_code < 400 and (result or {}).get("status") in {"done", "warning"}
-            else "running"
-            if http_code < 400 and (result or {}).get("status") in {"running", "queued"}
-            else "failed"
-        ),
+        "status": probe_status if http_code < 400 else "failed",
+        "execution_status": (result or {}).get("status") or "",
+        "business_output_status": business_output_status,
         "probe_id": probe_id,
         "draft_id": draft_id,
         "node_id": node_id,
@@ -3900,7 +3996,7 @@ def run_node_draft_probe(sop, draft_id, data=None):
         "mode": "node-draft-probe-run",
         "manual_inputs": mask_data(manual_inputs),
         "capability_overrides": capability_overrides,
-        "result": node_run_result_probe_summary(result if isinstance(result, dict) else {}),
+        "result": node_run_result_probe_summary(status_result),
         "manifest": manifest if isinstance(manifest, dict) else {},
         "output_manifest": safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir / "manifest.json") if output_dir else "",
         "manifest_records": [
@@ -3908,6 +4004,10 @@ def run_node_draft_probe(sop, draft_id, data=None):
             for record in records
         ],
         "validation": (result or {}).get("validation") or ((result or {}).get("real_execution") or {}).get("validation") or {},
+        "actual_outputs": status_actual_outputs or (result or {}).get("actual_outputs") or {},
+        "business_outputs": business_output_status.get("business_outputs") or {},
+        "business_artifacts": (result or {}).get("business_artifacts") or [],
+        "core_outputs": (result or {}).get("core_outputs") or [],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     write_json(node_draft_probe_path(sop, draft_id, probe_id), payload)
@@ -3957,7 +4057,7 @@ def synthesize_output_contract_from_manifest_records(node_run_id, records):
     grouped = {}
     for record in records or []:
         name = manifest_item_output_name(record)
-        if not name:
+        if not name or not is_business_output_name(name):
             continue
         grouped.setdefault(name, []).append(record)
     outputs = {}
@@ -3981,6 +4081,20 @@ def synthesize_output_contract_from_manifest_records(node_run_id, records):
             **({"fields": fields} if fields else {}),
         }
     return outputs
+
+
+def manifest_records_from_actual_outputs(actual_outputs):
+    records = []
+    for name, value in (actual_outputs or {}).items():
+        if not is_business_output_name(name) or not output_value_present(value):
+            continue
+        if isinstance(value, list):
+            for item in value:
+                if output_value_present(item):
+                    records.append({"output": name, "path": item if isinstance(item, str) and item.startswith("raw/") else "", "value": "" if isinstance(item, str) and item.startswith("raw/") else item})
+        else:
+            records.append({"output": name, "value": value})
+    return records
 
 
 def common_path_pattern(paths):
@@ -4017,15 +4131,20 @@ def synthesize_node_draft_contract(sop, draft_id, data=None):
             {key: value for key, value in record.items() if key != "file"}
             for record in node_run_output_manifest_records(sop, node_run_id)
         ]
+    records = [record for record in records if is_business_output_name(manifest_item_output_name(record))]
+    if not records:
+        records = manifest_records_from_actual_outputs(probe.get("actual_outputs") if isinstance(probe.get("actual_outputs"), dict) else {})
     outputs = synthesize_output_contract_from_manifest_records(node_run_id, records)
     if not outputs:
+        business_status = probe.get("business_output_status") if isinstance(probe.get("business_output_status"), dict) else {}
         result = {
             "status": "failed",
             "draft_id": draft_id,
             "node_id": node_id,
             "probe_id": probe.get("probe_id") or "",
             "node_run_id": node_run_id,
-            "detail": "Probe Run did not produce a usable output manifest",
+            "detail": "Probe Run did not produce usable business outputs for contract synthesis",
+            "business_output_status": business_status,
             "outputs": {},
         }
         write_json(node_draft_dir(sop, draft_id) / "contract-synthesis.json", result)
@@ -12138,6 +12257,129 @@ def node_run_manifest_actual_outputs(sop, node_run_id):
     return outputs
 
 
+def output_name_aliases(name):
+    raw = str(name or "").strip()
+    parts = [part for part in re.split(r"[_\-\s]+", raw) if part]
+    aliases = [raw]
+    if parts:
+        aliases.append(parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:]))
+        aliases.append("".join(part[:1].upper() + part[1:] for part in parts))
+        aliases.append("".join(parts))
+    return ordered_unique([alias for alias in aliases if alias])
+
+
+def normalized_key(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def json_candidates_from_text(text):
+    text = str(text or "").strip()
+    candidates = [text] if text else []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            candidates.append(stripped)
+    return ordered_unique(candidates)
+
+
+def find_json_value_by_alias(data, aliases):
+    wanted = {normalized_key(alias) for alias in aliases if alias}
+    stack = [data]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if normalized_key(key) in wanted and value not in (None, "", []):
+                    return value
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend([item for item in current if isinstance(item, (dict, list))])
+    return None
+
+
+def text_value_for_output(name, spec, text):
+    aliases = output_name_aliases(name)
+    for candidate in json_candidates_from_text(text):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        value = find_json_value_by_alias(parsed, aliases)
+        if value not in (None, "", []):
+            return value
+    for alias in aliases:
+        pattern = re.compile(rf"(?im)\b{re.escape(alias)}\b\s*[:=]\s*([^\s,;]+)")
+        match = pattern.search(text or "")
+        if match:
+            return match.group(1).strip().strip('"\'')
+    value_type = str((spec or {}).get("value_type") or (spec or {}).get("type") or "").lower()
+    if "url" in value_type or str(name or "").lower().endswith("_url"):
+        urls = re.findall(r"https?://[^\s\"'<>)]+" , text or "")
+        if urls:
+            return urls[-1]
+    return None
+
+
+def node_run_text_evidence(sop, node_run_id):
+    paths = [
+        node_run_agent_path(sop, node_run_id, "response.txt"),
+        node_run_workspace(sop, node_run_id) / "executor.log",
+    ]
+    chunks = []
+    for path in paths:
+        try:
+            if path.is_file():
+                chunks.append(path.read_text(encoding="utf-8", errors="replace")[-20000:])
+        except OSError:
+            continue
+    return "\n".join(chunks)
+
+
+def write_inferred_manifest_items(sop, node_run_id, inferred, declared_outputs):
+    if not inferred:
+        return
+    manifest_path = node_run_manifest_path(sop, node_run_id, "output")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = read_json(manifest_path) or {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+    items = node_run_output_manifest_items(manifest)
+    existing = {manifest_item_output_name(item) for item in items if isinstance(item, dict)}
+    for name, value in inferred.items():
+        if name in existing:
+            continue
+        spec = declared_outputs.get(name) if isinstance(declared_outputs.get(name), dict) else {}
+        items.append({
+            "output": name,
+            "value": value,
+            "value_type": spec.get("value_type") or ("url" if str(value).startswith(("http://", "https://")) else "text"),
+            "kind": "scalar",
+            "source": "node-run-text-evidence",
+        })
+    manifest["items"] = items
+    manifest.setdefault("version", 1)
+    write_json(manifest_path, manifest)
+
+
+def infer_scalar_outputs_from_text(sop, node_run_id, declared_outputs, actual_outputs):
+    text = node_run_text_evidence(sop, node_run_id)
+    if not text:
+        return {}
+    inferred = {}
+    for name, spec in (declared_outputs or {}).items():
+        if not is_business_output_name(name) or output_value_present((actual_outputs or {}).get(name)):
+            continue
+        spec = spec if isinstance(spec, dict) else {}
+        kind = str(spec.get("kind") or spec.get("type") or "").lower()
+        if kind in {"file", "files", "directory"}:
+            continue
+        value = text_value_for_output(name, spec, text)
+        if output_value_present(value):
+            inferred[name] = value
+    return inferred
+
+
 def node_run_input_info(sop, node_run_id, node_id):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     manifest_path = node_run_manifest_path(sop, node_run_id, "input")
@@ -12254,6 +12496,11 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
             )
         actual_outputs[name] = [record["path"] for record in records]
         artifacts.extend(records)
+    inferred_outputs = infer_scalar_outputs_from_text(sop, node_run_id, declared_outputs, actual_outputs)
+    if inferred_outputs:
+        actual_outputs.update(inferred_outputs)
+        write_inferred_manifest_items(sop, node_run_id, inferred_outputs, declared_outputs)
+        manifest_records = node_run_output_manifest_records(sop, node_run_id)
     manifest_artifacts = node_run_output_manifest_artifacts(sop, node_run_id, node_id)
     existing_artifact_paths = {artifact.get("path") for artifact in artifacts if isinstance(artifact, dict)}
     artifacts.extend([artifact for artifact in manifest_artifacts if artifact.get("path") not in existing_artifact_paths])
@@ -12267,6 +12514,7 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
             continue
         missing.append(name)
     core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
+    business_status = business_output_status_for(sop, node_id, actual_outputs, declared_outputs, artifacts)
     return {
         "declared_outputs": declared_outputs,
         "actual_outputs": actual_outputs,
@@ -12284,7 +12532,9 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
             "status": "passed" if not missing else "failed",
             "missing_outputs": missing,
             "unexpected_outputs": [],
+            "business_output_status": business_status,
         },
+        "business_output_status": business_status,
         "capabilities": capabilities if isinstance(capabilities, dict) else {},
         "node_state": node_state,
     }
@@ -12401,9 +12651,14 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
 
     output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
     execution_ok = returncode == 0 and output_info["validation"].get("status") == "passed"
+    business_status = output_info.get("business_output_status") if isinstance(output_info.get("business_output_status"), dict) else {}
     status = "done" if execution_ok else "failed"
     summary = (
-        "Real node execution finished and declared outputs were found."
+        "Real node execution finished and declared business outputs were found."
+        if execution_ok and business_status.get("status") == "passed"
+        else "Real node execution finished, but no business output was captured."
+        if execution_ok and business_status.get("status") in {"missing_business_outputs", "no_declared_business_outputs"}
+        else "Real node execution finished and declared outputs were found."
         if execution_ok
         else "Required node inputs could not be resolved from the selected relay outputs." if input_resolution_error
         else "Real node execution failed." if returncode != 0
@@ -12421,6 +12676,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "returncode": returncode,
         "timed_out": timed_out,
         "validation": output_info["validation"],
+        "business_output_status": business_status,
         "input_manifest": output_info["input_manifest"],
         "output_manifest": output_info["output_manifest"],
         "started_at": started.isoformat(),
@@ -12457,6 +12713,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "output_directory": output_info["output_directory"],
         "output_manifest": output_info["output_manifest"],
         "validation": output_info["validation"],
+        "business_output_status": business_status,
         "capabilities": output_info["capabilities"],
         "agent_request": mask_data({k: v for k, v in agent_request.items() if k != "rendered_request"} | {
             "rendered_request": agent_request.get("rendered_request", ""),
@@ -12488,6 +12745,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             "execution_evidence": output_info["execution_evidence"],
             "output_categories": output_info["output_categories"],
             "validation": output_info["validation"],
+            "business_output_status": business_status,
         },
     }
 
@@ -12565,11 +12823,13 @@ def apply_real_node_execution_to_steps(steps, execution):
     )
     validation = execution.get("validation") or {}
     validation_status = validation.get("status")
+    business_status = execution.get("business_output_status") if isinstance(execution.get("business_output_status"), dict) else validation.get("business_output_status") if isinstance(validation, dict) else {}
+    business_ok = isinstance(business_status, dict) and business_status.get("status") == "passed"
     update_node_run_step(
         steps,
         "validate-outputs",
-        "done" if validation_status == "passed" else "skipped" if input_resolution_error else "failed" if status == "failed" else "warning",
-        "Declared outputs were found." if validation_status == "passed" else "Skipped because input resolution failed." if input_resolution_error else "Declared outputs are missing.",
+        "done" if validation_status == "passed" and (business_ok or not business_status) else "warning" if validation_status == "passed" else "skipped" if input_resolution_error else "failed" if status == "failed" else "warning",
+        "Declared business outputs were found." if validation_status == "passed" and business_ok else "Execution finished, but no business output was captured." if validation_status == "passed" and business_status else "Skipped because input resolution failed." if input_resolution_error else "Declared outputs are missing.",
         {**validation, **({"input_resolution_error": input_resolution_error} if input_resolution_error else {})},
     )
     capabilities = execution.get("capabilities") if isinstance(execution.get("capabilities"), dict) else {}
@@ -12648,6 +12908,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "output_directory": (real_execution or {}).get("output_directory") or "",
         "output_manifest": (real_execution or {}).get("output_manifest") or "",
         "validation": (real_execution or {}).get("validation") or {},
+        "business_output_status": (real_execution or {}).get("business_output_status") or (((real_execution or {}).get("validation") or {}).get("business_output_status") if isinstance((real_execution or {}).get("validation"), dict) else {}),
         "capabilities": (real_execution or {}).get("capabilities") or {},
         "agent_request": (real_execution or {}).get("agent_request") or {},
         "business_artifacts": (real_execution or {}).get("business_artifacts") or [],
@@ -13019,7 +13280,11 @@ def reconcile_completed_node_run_result(sop, result):
     output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
     actual_outputs = output_info.get("actual_outputs") or {}
     if not actual_outputs:
-        actual_outputs = node_run_manifest_actual_outputs(sop, node_run_id)
+        actual_outputs = {
+            name: value
+            for name, value in node_run_manifest_actual_outputs(sop, node_run_id).items()
+            if is_business_output_name(name)
+        }
     if not actual_outputs:
         return result
     validation = output_info.get("validation") if isinstance(output_info.get("validation"), dict) else {}
@@ -13062,6 +13327,7 @@ def reconcile_completed_node_run_result(sop, result):
         "output_directory": output_info.get("output_directory") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir),
         "output_manifest": output_info.get("output_manifest") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), manifest_path),
         "validation": validation or {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+        "business_output_status": output_info.get("business_output_status") or ((validation or {}).get("business_output_status") if isinstance(validation, dict) else {}),
         "capabilities": output_info.get("capabilities") or {},
         "agent_request": agent_request,
         "detail": {
@@ -13089,6 +13355,7 @@ def reconcile_completed_node_run_result(sop, result):
         "output_directory": real_execution["output_directory"],
         "output_manifest": real_execution["output_manifest"],
         "validation": real_execution["validation"],
+        "business_output_status": real_execution.get("business_output_status") or {},
         "capabilities": real_execution["capabilities"],
         "detail": {
             **(result.get("detail") if isinstance(result.get("detail"), dict) else {}),
