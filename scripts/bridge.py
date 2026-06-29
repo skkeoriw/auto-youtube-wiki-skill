@@ -3363,8 +3363,8 @@ def create_node_draft(sop, spec):
             "skill_install_command": ((draft.get("skill") or {}).get("install_command") if isinstance(draft.get("skill"), dict) else ""),
             "source": "node-builder",
         })
-        write_json(draft_dir / "node-builder-evaluation.json", spec.get("node_builder_evaluation") if isinstance(spec.get("node_builder_evaluation"), dict) else {})
-        write_json(draft_dir / "trace.json", spec.get("trace") if isinstance(spec.get("trace"), dict) else {})
+        write_json(draft_dir / "node-builder-evaluation.json", compact_node_builder_payload(spec.get("node_builder_evaluation")) if isinstance(spec.get("node_builder_evaluation"), dict) else {})
+        write_json(draft_dir / "trace.json", compact_node_builder_payload(spec.get("trace")) if isinstance(spec.get("trace"), dict) else {})
         (draft_dir / "node.yaml").write_text(yaml.safe_dump(draft, allow_unicode=True, sort_keys=False), encoding="utf-8")
         validation = {**validation_base, "status": "passed", "node_builder": bool(spec.get("node_builder_evaluation"))}
         write_json(draft_dir / "validation.json", validation)
@@ -3520,6 +3520,7 @@ def evaluate_node_builder(sop, data):
                 evaluation = json.loads(completed.stdout or "{}")
             except Exception:
                 evaluation = {"status": "blocked", "summary": "Node Builder Agent did not return JSON.", "node_draft": {}, "risks": [{"code": "invalid_output", "message": (completed.stderr or completed.stdout or "")[-1000:]}]}
+        evaluation = compact_node_builder_payload(evaluation) if isinstance(evaluation, dict) else {}
         return 200 if completed.returncode == 0 else 500, {
             "ok": completed.returncode == 0,
             "mode": "node-builder-agent-evaluation",
@@ -3545,8 +3546,45 @@ def node_builder_evaluation_path(sop, evaluation_id):
 def write_node_builder_evaluation(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
+    payload = compact_node_builder_payload(payload) if isinstance(payload, dict) else payload
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def compact_node_builder_payload(value, string_limit=1800, depth=0):
+    if depth > 8:
+        return {"truncated": True, "reason": "max_depth"}
+    if isinstance(value, list):
+        return [compact_node_builder_payload(item, string_limit=string_limit, depth=depth + 1) for item in value[:80]]
+    if not isinstance(value, dict):
+        if isinstance(value, str) and len(value) > string_limit:
+            return value[:string_limit].rstrip() + "\n...[truncated for Node Builder]"
+        return value
+    compacted = {}
+    for key, item in value.items():
+        key_text = str(key)
+        lowered = key_text.lower()
+        if lowered in {"workflow_revision", "workflowrevision"}:
+            continue
+        if lowered in {"content", "raw_response", "llm_content", "repair_content", "reasoning_content"}:
+            if isinstance(item, str):
+                compacted[f"{key_text}_preview"] = item[: min(900, string_limit)].rstrip()
+                compacted[f"{key_text}_chars"] = len(item)
+            continue
+        if lowered in {"messages"} and isinstance(item, list):
+            rows = []
+            for message in item[:12]:
+                if isinstance(message, dict):
+                    content = str(message.get("content") or message.get("content_preview") or "")
+                    rows.append({
+                        "role": message.get("role"),
+                        "content_preview": content[:900].rstrip(),
+                        "content_chars": message.get("content_chars") or len(content),
+                    })
+            compacted[key_text] = rows
+            continue
+        compacted[key_text] = compact_node_builder_payload(item, string_limit=string_limit, depth=depth + 1)
+    return compacted
 
 
 def read_node_builder_evaluation(sop, evaluation_id):
