@@ -12893,6 +12893,18 @@ def reconcile_completed_node_run_result(sop, result):
         or datetime.now(timezone.utc).isoformat()
     )
     started_at = str(result.get("started_at") or receipt.get("started_at") or "")
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    request_path = node_run_agent_path(sop, node_run_id, "request.md")
+    executor_path = node_run_agent_path(sop, node_run_id, "executor.json")
+    agent_request = result.get("agent_request") if isinstance(result.get("agent_request"), dict) else {}
+    if request_path.exists():
+        agent_request = {
+            **agent_request,
+            "request_path": safe_relative_file(wiki, request_path),
+        }
+    executor = read_json(executor_path) or {}
+    if isinstance(executor, dict) and executor:
+        agent_request = {**agent_request, **{k: v for k, v in executor.items() if k != "rendered_request"}}
     real_execution = {
         "status": "done",
         "summary": "Real node execution finished and output manifest was found.",
@@ -12912,7 +12924,7 @@ def reconcile_completed_node_run_result(sop, result):
         "output_manifest": output_info.get("output_manifest") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), manifest_path),
         "validation": validation or {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
         "capabilities": output_info.get("capabilities") or {},
-        "agent_request": result.get("agent_request") or {},
+        "agent_request": agent_request,
         "detail": {
             "receipt": mask_data(receipt) if isinstance(receipt, dict) else {},
             "response_path": safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), response_path) if response_path.exists() else "",
