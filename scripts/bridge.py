@@ -125,6 +125,9 @@ RUNTIME_CAPABILITY_ENV = {
     "EDGE_HANDOFF_LLM_BASE_URL": ["edge_handoff_llm_base_url"],
     "EDGE_HANDOFF_LLM_API_KEY": ["edge_handoff_llm_api_key", "edge_handoff_llm_token"],
     "EDGE_HANDOFF_LLM_MODEL": ["edge_handoff_llm_model"],
+    "NODE_BUILDER_LLM_BASE_URL": ["node_builder_llm_base_url"],
+    "NODE_BUILDER_LLM_API_KEY": ["node_builder_llm_api_key", "node_builder_llm_token"],
+    "NODE_BUILDER_LLM_MODEL": ["node_builder_llm_model"],
     "HERMES_MODEL_PROVIDER": ["hermes_model_provider"],
     "HERMES_MODEL": ["hermes_model", "hermes_default_model"],
     "HERMES_MODEL_BASE_URL": ["hermes_model_base_url", "hermes_base_url", "openai_base_url"],
@@ -2210,10 +2213,64 @@ def node_runtime_detail(sop, pipeline_id, node_id):
     return ensure_node_explanation(detail)
 
 
-def node_static_config(sop, node_id):
-    """Return static node configuration from sop.yaml, independent of any run."""
+def runtime_node_catalog_dir():
+    return Path(os.environ.get("SOP_RUNTIME_NODE_CATALOG_DIR", str(Path.home() / ".sop" / "node-catalog"))).expanduser()
+
+
+def runtime_node_catalog_item(node_id):
+    node_id = str(node_id or "").strip()
+    if not node_id:
+        return None
+    path = runtime_node_catalog_dir() / node_id / "node.yaml"
+    if not path.exists():
+        return None
+    node = read_yaml(path) or {}
+    if not isinstance(node, dict):
+        return None
+    return {
+        **node,
+        "id": node.get("id") or node_id,
+        "node_id": node.get("id") or node_id,
+        "source": "runtime-catalog",
+        "runtime_catalog_path": str(path),
+    }
+
+
+def runtime_node_catalog_items():
+    root = runtime_node_catalog_dir()
+    rows = {}
+    if not root.exists():
+        return rows
+    for path in sorted(root.glob("*/node.yaml")):
+        node = read_yaml(path) or {}
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or path.parent.name).strip()
+        if not node_id:
+            continue
+        rows[node_id] = {
+            **node,
+            "id": node_id,
+            "node_id": node_id,
+            "source": "runtime-catalog",
+            "runtime_catalog_path": str(path),
+        }
+    return rows
+
+
+def node_config_for(sop, node_id):
     nodes = sop.get("nodes") or {}
-    config = nodes.get(node_id)
+    if node_id in nodes:
+        return nodes.get(node_id), "sop"
+    runtime_node = runtime_node_catalog_item(node_id)
+    if runtime_node is not None:
+        return runtime_node, "runtime-catalog"
+    return None, ""
+
+
+def node_static_config(sop, node_id):
+    """Return static node configuration from sop.yaml or Runtime node catalog."""
+    config, source = node_config_for(sop, node_id)
     if config is None:
         return None
 
@@ -2224,7 +2281,8 @@ def node_static_config(sop, node_id):
     skills_dir = plugin_dir / "skills"
 
     configured_executor = config.get("executor") if isinstance(config.get("executor"), dict) else {}
-    skill_name = configured_executor.get("skill") or config.get("skill") or config.get("webhook_route") or f"sop-{node_id}"
+    skill_block = config.get("skill") if isinstance(config.get("skill"), dict) else {}
+    skill_name = configured_executor.get("skill") or skill_block.get("id") or config.get("skill") or config.get("webhook_route") or f"sop-{node_id}"
     skill_dirs = []
     for candidate in (skills_dir / str(skill_name), skills_dir / f"sop-{node_id}"):
         if candidate not in skill_dirs:
@@ -2241,7 +2299,7 @@ def node_static_config(sop, node_id):
             except OSError:
                 pass
             break
-    manifest = read_yaml(skill_dir / "node.yaml") if (skill_dir / "node.yaml").exists() else {}
+    manifest = config if source == "runtime-catalog" else read_yaml(skill_dir / "node.yaml") if (skill_dir / "node.yaml").exists() else {}
     manifest_executor = manifest.get("executor") if isinstance(manifest.get("executor"), dict) else {}
     entry = str(configured_executor.get("entry") or manifest_executor.get("entry") or "").strip()
     script_candidates = []
@@ -2260,8 +2318,16 @@ def node_static_config(sop, node_id):
         ])
     skill_script = next((str(p.relative_to(plugin_dir.parent)) for p in script_candidates if p.exists()), None)
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+    manifest_entry = manifest.get("entry") if isinstance(manifest.get("entry"), dict) else {}
     manifest_entry_inputs = manifest.get("entry_inputs") if isinstance(manifest.get("entry_inputs"), dict) else {}
-    manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    if not manifest_entry_inputs and isinstance(manifest_entry.get("inputs"), dict):
+        manifest_entry_inputs = manifest_entry.get("inputs") or {}
+    raw_manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    manifest_outputs = (
+        raw_manifest_outputs.get("expected")
+        if isinstance(raw_manifest_outputs.get("expected"), dict)
+        else raw_manifest_outputs
+    )
     manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
     node_inputs = merge_contracts(
         manifest_entry_inputs or manifest_inputs,
@@ -2280,7 +2346,7 @@ def node_static_config(sop, node_id):
             **manifest_executor,
             **configured_executor,
             "type": configured_executor.get("type") or manifest_executor.get("type") or "skill",
-            "skill": configured_executor.get("skill") or config.get("skill") or manifest_executor.get("skill", ""),
+            "skill": configured_executor.get("skill") or skill_block.get("id") or config.get("skill") or manifest_executor.get("skill", ""),
             "webhook_route": config.get("webhook_route", ""),
         },
         "inputs": node_inputs,
@@ -2297,6 +2363,8 @@ def node_static_config(sop, node_id):
         "manifest": manifest,
         "ui": config.get("ui") if isinstance(config.get("ui"), dict) else manifest.get("ui") if isinstance(manifest.get("ui"), dict) else {},
         "retryable": config.get("retryable", True),
+        "source": source,
+        "runtime_catalog_path": config.get("runtime_catalog_path", ""),
     }
 
 
@@ -2438,7 +2506,7 @@ def validate_node_definition(node_id, config, static):
 
 
 def node_registry_item(sop, node_id, endpoint=""):
-    config = (sop.get("nodes") or {}).get(node_id)
+    config, config_source = node_config_for(sop, node_id)
     if config is None:
         return None
     static = node_static_config(sop, node_id)
@@ -2468,12 +2536,14 @@ def node_registry_item(sop, node_id, endpoint=""):
         **static,
         "description": static.get("purpose") or manifest.get("description", ""),
         "purpose": static.get("purpose", ""),
+        "source": static.get("source") or config_source,
+        "runtime_catalog_path": static.get("runtime_catalog_path", ""),
         "branch": static.get("branch", ""),
         "retryable": static.get("retryable", True),
         "case": classify_node(node_id, config, static),
         "skill": {
             "id": (static.get("executor") or {}).get("skill", ""),
-            "source": "repository",
+            "source": ((manifest.get("skill") or {}).get("source") if isinstance(manifest.get("skill"), dict) else "") or ("runtime-catalog" if config_source == "runtime-catalog" else "repository"),
             "install_command": (manifest.get("skill") or {}).get("install_command", "") if isinstance(manifest.get("skill"), dict) else "",
             "readme_path": static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else "",
             "summary": static.get("skill_readme", ""),
@@ -2815,7 +2885,8 @@ def node_module_detail(sop, node_id, module_id, endpoint="", pipeline_id=None):
 
 def node_registry(sop, endpoint=""):
     nodes = []
-    for node_id in (sop.get("nodes") or {}):
+    node_ids = ordered_unique([*(sop.get("nodes") or {}).keys(), *runtime_node_catalog_items().keys()])
+    for node_id in node_ids:
         item = node_registry_item(sop, node_id, endpoint)
         if item is not None:
             nodes.append(item)
@@ -3235,7 +3306,54 @@ def create_node_definition_edit_draft(sop, spec):
 def create_node_draft(sop, spec):
     if str(spec.get("draft_type") or "create_node") == "edit_node_definition":
         return create_node_definition_edit_draft(sop, spec)
-    existing_nodes = set((sop.get("nodes") or {}).keys()) if isinstance(sop.get("nodes"), dict) else set()
+    node_draft = spec.get("node_draft") if isinstance(spec.get("node_draft"), dict) else None
+    if node_draft:
+        node_id = str(node_draft.get("id") or node_draft.get("node_id") or "").strip()
+        existing_nodes = set((sop.get("nodes") or {}).keys()) | set(runtime_node_catalog_items().keys())
+        errors = []
+        if not node_id:
+            errors.append({"field": "node_draft.id", "code": "required", "message": "node_draft.id is required"})
+        elif node_id in existing_nodes:
+            errors.append({"field": "node_draft.id", "code": "node_exists", "message": f"node_id {node_id} already exists"})
+        if str(node_draft.get("schema") or "") != "node-definition/v1":
+            errors.append({"field": "node_draft.schema", "code": "invalid_schema", "message": "node_draft.schema must be node-definition/v1"})
+        executor = node_draft.get("executor") if isinstance(node_draft.get("executor"), dict) else {}
+        skill = node_draft.get("skill") if isinstance(node_draft.get("skill"), dict) else {}
+        if not (executor.get("skill") or skill.get("id")):
+            errors.append({"field": "node_draft.skill", "code": "required", "message": "node_draft skill id is required"})
+        validation_base = {
+            "schema_id": NODE_DRAFT_SCHEMA_VERSION,
+            "status": "passed" if not errors else "failed",
+            "errors": errors,
+            "missing_fields": [error["field"] for error in errors if error["code"] == "required"],
+            "production_dag_changed": False,
+        }
+        if errors:
+            return {"draft_id": "", "draft_path": "", "node": {}, "validation": validation_base}
+        wiki = Path(sop["wiki_local_path"])
+        draft = copy.deepcopy(node_draft)
+        draft["id"] = node_id
+        draft_id = f"{node_id}-{int(time.time())}"
+        draft_dir = wiki / "raw" / "node-drafts" / draft_id
+        draft_dir.mkdir(parents=True, exist_ok=True)
+        write_json(draft_dir / "request.json", spec.get("request") if isinstance(spec.get("request"), dict) else {
+            "skill_install_command": ((draft.get("skill") or {}).get("install_command") if isinstance(draft.get("skill"), dict) else ""),
+            "source": "node-builder",
+        })
+        write_json(draft_dir / "node-builder-evaluation.json", spec.get("node_builder_evaluation") if isinstance(spec.get("node_builder_evaluation"), dict) else {})
+        write_json(draft_dir / "trace.json", spec.get("trace") if isinstance(spec.get("trace"), dict) else {})
+        (draft_dir / "node.yaml").write_text(yaml.safe_dump(draft, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        validation = {**validation_base, "status": "passed", "node_builder": bool(spec.get("node_builder_evaluation"))}
+        write_json(draft_dir / "validation.json", validation)
+        return {
+            "draft_id": draft_id,
+            "draft_type": "create_node",
+            "draft_path": str(draft_dir),
+            "node": draft,
+            "node_builder_evaluation": spec.get("node_builder_evaluation") if isinstance(spec.get("node_builder_evaluation"), dict) else {},
+            "validation": validation,
+        }
+    existing_nodes = set((sop.get("nodes") or {}).keys()) | set(runtime_node_catalog_items().keys()) if isinstance(sop.get("nodes"), dict) else set(runtime_node_catalog_items().keys())
     input_validation = validate_node_draft_input(spec, existing_nodes)
     if input_validation["errors"]:
         return {
@@ -3262,6 +3380,273 @@ def create_node_draft(sop, spec):
     }
     (draft_dir / "validation.json").write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"draft_id": draft_id, "draft_path": str(draft_dir), "node": draft, "validation": validation}
+
+
+def node_builder_script():
+    configured = os.environ.get("NODE_BUILDER_SCRIPT", "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        plugin_root() / "youtube-wiki/skills/sop-node-builder/scripts/node_builder.py",
+        Path.home() / "agent-brain-plugins/youtube-wiki/skills/sop-node-builder/scripts/node_builder.py",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate
+    return None
+
+
+def node_builder_env(sop, data):
+    context = node_run_config_context(data, sop)
+    base_url = node_run_config_lookup(context, "NODE_BUILDER_LLM_BASE_URL", [
+        *RUNTIME_CAPABILITY_ENV.get("NODE_BUILDER_LLM_BASE_URL", []),
+        "WIKI_LLM_BASE_URL",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_BASE_URL", []),
+        "HERMES_MODEL_BASE_URL",
+        *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL_BASE_URL", []),
+        "EDGE_HANDOFF_LLM_BASE_URL",
+        *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_BASE_URL", []),
+    ])
+    api_key = node_run_config_lookup(context, "NODE_BUILDER_LLM_API_KEY", [
+        *RUNTIME_CAPABILITY_ENV.get("NODE_BUILDER_LLM_API_KEY", []),
+        "WIKI_LLM_API_KEY",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_API_KEY", []),
+        "HERMES_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        *RUNTIME_CAPABILITY_ENV.get("HERMES_OPENAI_API_KEY", []),
+        *RUNTIME_CAPABILITY_ENV.get("OPENAI_API_KEY", []),
+        "EDGE_HANDOFF_LLM_API_KEY",
+        *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_API_KEY", []),
+    ])
+    model = node_run_config_lookup(context, "NODE_BUILDER_LLM_MODEL", [
+        *RUNTIME_CAPABILITY_ENV.get("NODE_BUILDER_LLM_MODEL", []),
+        "WIKI_LLM_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_LLM_MODEL", []),
+        "HERMES_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("HERMES_MODEL", []),
+        "WIKI_DEEPSEEK_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("WIKI_DEEPSEEK_MODEL", []),
+        "EDGE_HANDOFF_LLM_MODEL",
+        *RUNTIME_CAPABILITY_ENV.get("EDGE_HANDOFF_LLM_MODEL", []),
+    ])
+    if is_blank_value(model.get("value")):
+        model = {"key": "NODE_BUILDER_LLM_MODEL", "value": os.environ.get("NODE_BUILDER_LLM_FALLBACK_MODEL", "deepseek-v4-pro"), "source": "default"}
+    env = os.environ.copy()
+    if not is_blank_value(base_url.get("value")):
+        env["NODE_BUILDER_LLM_BASE_URL"] = str(base_url.get("value")).rstrip("/")
+    if not is_blank_value(api_key.get("value")):
+        env["NODE_BUILDER_LLM_API_KEY"] = str(api_key.get("value"))
+    if not is_blank_value(model.get("value")):
+        env["NODE_BUILDER_LLM_MODEL"] = str(model.get("value"))
+    env.setdefault("NODE_BUILDER_LLM_TIMEOUT", "75" if data.get("async_job") else "24")
+    env.setdefault("NODE_BUILDER_LLM_MAX_TOKENS", "4096")
+    clamp_int_env(env, "NODE_BUILDER_LLM_MAX_TOKENS", 1024, 8192)
+    return env, {
+        "base_url": env_config_item(base_url.get("key") or "NODE_BUILDER_LLM_BASE_URL", "Node Builder LLM Base URL", required=True, value=str(base_url.get("value") or "").rstrip("/"), source=base_url.get("source") or "missing:NODE_BUILDER_LLM_BASE_URL"),
+        "api_key": env_config_item(api_key.get("key") or "NODE_BUILDER_LLM_API_KEY", "Node Builder LLM API Key", required=True, value=api_key.get("value"), source=api_key.get("source") or "missing:NODE_BUILDER_LLM_API_KEY"),
+        "model": env_config_item(model.get("key") or "NODE_BUILDER_LLM_MODEL", "Node Builder LLM Model", required=True, value=model.get("value"), source=model.get("source") or "missing:NODE_BUILDER_LLM_MODEL"),
+        "settings_backend": context.get("settings_backend") or runtime_settings_backend(),
+        "precedence": ["node-run-overrides", "instance-settings", "runtime-settings", "global-settings", "bridge-env", "runtime-env-file"],
+    }
+
+
+def evaluate_node_builder(sop, data):
+    data = data if isinstance(data, dict) else {}
+    script = node_builder_script()
+    if not script:
+        return 503, {"ok": False, "status": "blocked", "detail": "sop-node-builder script is not installed on this Runtime"}
+    request_payload = {
+        "runtime_id": runtime_info().get("runtime_id") or os.environ.get("SOP_RUNTIME_ID") or "",
+        "instance_id": sop.get("instance_id") or sop.get("id") or "",
+        "skill_install_command": data.get("skill_install_command") or "",
+        "user_instruction": data.get("user_instruction") or data.get("instruction") or "",
+        "fetch_metadata": data.get("fetch_metadata", True),
+    }
+    env, config = node_builder_env(sop, data)
+    with tempfile.TemporaryDirectory(prefix="node-builder-") as temp_dir:
+        request_path = Path(temp_dir) / "request.json"
+        output_path = Path(temp_dir) / "evaluation.json"
+        write_json(request_path, request_payload)
+        command = ["python3", str(script), "--request-json", str(request_path), "--output-json", str(output_path), "--require-ai"]
+        if data.get("allow_deterministic") or data.get("allow_fallback"):
+            command.append("--allow-deterministic")
+        timeout = int(env.get("NODE_BUILDER_EVALUATOR_TIMEOUT", env.get("NODE_BUILDER_LLM_TIMEOUT", "75")) or "75")
+        try:
+            completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, env=env)
+        except subprocess.TimeoutExpired as exc:
+            return 504, {
+                "ok": False,
+                "mode": "node-builder-agent-evaluation",
+                "request": request_payload,
+                "config": config,
+                "evaluation": {
+                    "status": "blocked",
+                    "summary": f"Node Builder Agent timed out after {timeout}s.",
+                    "node_draft": {},
+                    "missing_fields": [],
+                    "risks": [{"code": "node_builder_timeout", "message": "The LLM evaluation exceeded runtime timeout budget."}],
+                    "assumptions": [],
+                    "test_plan": ["Use async mode or a faster model."],
+                    "agent": {"provider": "openai-compatible", "model": (config.get("model") or {}).get("value", ""), "used_ai": False},
+                },
+                "stderr": str(exc)[-4000:],
+            }
+        evaluation = read_json(output_path) if output_path.is_file() else {}
+        if not evaluation:
+            try:
+                evaluation = json.loads(completed.stdout or "{}")
+            except Exception:
+                evaluation = {"status": "blocked", "summary": "Node Builder Agent did not return JSON.", "node_draft": {}, "risks": [{"code": "invalid_output", "message": (completed.stderr or completed.stdout or "")[-1000:]}]}
+        return 200 if completed.returncode == 0 else 500, {
+            "ok": completed.returncode == 0,
+            "mode": "node-builder-agent-evaluation",
+            "request": request_payload,
+            "config": config,
+            "evaluation": evaluation,
+            "trace": evaluation.get("trace") if isinstance(evaluation, dict) else {},
+            "stderr": (completed.stderr or "")[-4000:],
+        }
+
+
+def node_draft_dir(sop, draft_id):
+    safe_id = slugify(draft_id)
+    return Path(sop["wiki_local_path"]) / "raw" / "node-drafts" / safe_id
+
+
+def read_node_draft(sop, draft_id):
+    draft_dir = node_draft_dir(sop, draft_id)
+    if not draft_dir.exists():
+        return None
+    return {
+        "draft_id": draft_dir.name,
+        "draft_type": (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "create_node"),
+        "draft_path": str(draft_dir),
+        "node": read_yaml(draft_dir / "node.yaml"),
+        "request": read_json(draft_dir / "request.json") or {},
+        "node_builder_evaluation": read_json(draft_dir / "node-builder-evaluation.json") or {},
+        "change_request": read_json(draft_dir / "change_request.json") or {},
+        "validation": read_json(draft_dir / "validation.json") or {},
+        "draft_test": read_json(draft_dir / "draft-test.json") or {},
+        "runtime_publish": read_json(draft_dir / "runtime-publish.json") or {},
+        "persistence_plan": read_json(draft_dir / "official-patch.json") or {},
+        "trace": read_json(draft_dir / "trace.json") or {},
+    }
+
+
+def test_node_draft(sop, draft_id, data=None):
+    data = data if isinstance(data, dict) else {}
+    draft = read_node_draft(sop, draft_id)
+    if not draft:
+        return {"status": "failed", "detail": "Node draft not found", "steps": []}
+    node = draft.get("node") if isinstance(draft.get("node"), dict) else {}
+    skill = node.get("skill") if isinstance(node.get("skill"), dict) else {}
+    executor = node.get("executor") if isinstance(node.get("executor"), dict) else {}
+    handoff = node.get("handoff") if isinstance(node.get("handoff"), dict) else {}
+    outputs = node.get("outputs") if isinstance(node.get("outputs"), dict) else {}
+    steps = []
+    def add(step_id, title, ok, detail=""):
+        steps.append({"id": step_id, "title": title, "status": "done" if ok else "failed", "detail": detail})
+    add("validate-node-yaml", "Validate node-definition/v1", node.get("schema") == "node-definition/v1", "schema must be node-definition/v1")
+    add("inspect-install-command", "Inspect skill install command", bool(str(skill.get("install_command") or "").strip()), "install command is required before real install")
+    add("hermes-skill-check", "Check Hermes skill target", bool(executor.get("skill") or skill.get("id")), "executor.skill or skill.id is required")
+    accepts = handoff.get("accepts") if isinstance(handoff.get("accepts"), dict) else {}
+    add("handoff-contract-check", "Check handoff contract", "instruction" in accepts and "upstream_outputs_dir" in accepts, "must accept instruction and upstream_outputs_dir")
+    add("manifest-contract-check", "Check outputs manifest contract", bool(outputs.get("manifest") or ((handoff.get("produces") or {}).get("manifest") if isinstance(handoff.get("produces"), dict) else "")), "manifest path is required")
+    status = "passed" if all(step["status"] == "done" for step in steps) else "failed"
+    result = {
+        "status": status,
+        "draft_id": draft_id,
+        "node_id": node.get("id") or "",
+        "mode": "draft-test",
+        "executes_install": False,
+        "executes_real_node": False,
+        "steps": steps,
+        "tested_at": datetime.now(timezone.utc).isoformat(),
+        "next_step": "publish-runtime" if status == "passed" else "fix draft and rerun Node Builder Agent",
+    }
+    write_json(node_draft_dir(sop, draft_id) / "draft-test.json", result)
+    return result
+
+
+def publish_node_draft_to_runtime(sop, draft_id, data=None):
+    draft = read_node_draft(sop, draft_id)
+    if not draft:
+        return {"status": "failed", "detail": "Node draft not found"}
+    node = draft.get("node") if isinstance(draft.get("node"), dict) else {}
+    node_id = str(node.get("id") or node.get("node_id") or "").strip()
+    if not node_id:
+        return {"status": "failed", "detail": "node.id is required"}
+    if node_id in (sop.get("nodes") or {}):
+        return {"status": "failed", "detail": f"node_id {node_id} already exists in sop.yaml"}
+    target_dir = runtime_node_catalog_dir() / node_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    node_to_write = copy.deepcopy(node)
+    node_to_write["id"] = node_id
+    node_to_write["source"] = "runtime-catalog"
+    (target_dir / "node.yaml").write_text(yaml.safe_dump(node_to_write, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _SOP_READ_CACHE.clear()
+    visible = node_registry_item(sop, node_id) is not None
+    result = {
+        "status": "published" if visible else "warning",
+        "node_id": node_id,
+        "runtime_catalog_path": str(target_dir / "node.yaml"),
+        "visible_in_nodes_api": visible,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        "message": "Node is published to the current Runtime catalog. Source repo is unchanged.",
+    }
+    write_json(node_draft_dir(sop, draft_id) / "runtime-publish.json", result)
+    return result
+
+
+def node_draft_persistence_plan(sop, draft_id, data=None):
+    draft = read_node_draft(sop, draft_id)
+    if not draft:
+        return {"status": "failed", "detail": "Node draft not found"}
+    node = draft.get("node") if isinstance(draft.get("node"), dict) else {}
+    node_id = str(node.get("id") or "").strip()
+    skill = node.get("skill") if isinstance(node.get("skill"), dict) else {}
+    skill_id = str(skill.get("id") or node_id).strip()
+    if not node_id or not skill_id:
+        return {"status": "failed", "detail": "node.id and skill.id are required"}
+    skill_dir = f"youtube-wiki/skills/{skill_id}"
+    node_yaml = yaml.safe_dump(node, allow_unicode=True, sort_keys=False)
+    skill_md = "\n".join([
+        "---",
+        f"name: {skill_id}",
+        f"description: Runtime-published SOP node for {node.get('title') or node_id}.",
+        "---",
+        "",
+        f"# {node.get('title') or node_id}",
+        "",
+        "This node was generated by the Runtime Node Builder Agent.",
+        "The source skill install command is stored in `node.yaml`.",
+        "",
+    ])
+    patch = "\n".join([
+        f"--- /dev/null",
+        f"+++ b/{skill_dir}/node.yaml",
+        *[f"+{line}" for line in node_yaml.splitlines()],
+        f"--- /dev/null",
+        f"+++ b/{skill_dir}/SKILL.md",
+        *[f"+{line}" for line in skill_md.splitlines()],
+        "",
+    ])
+    result = {
+        "status": "generated",
+        "draft_id": draft_id,
+        "node_id": node_id,
+        "target_repo": "agent-brain-plugins",
+        "files": [f"{skill_dir}/node.yaml", f"{skill_dir}/SKILL.md"],
+        "patch": patch,
+        "instructions": [
+            "在开发机 agent-brain-plugins 中应用该 patch。",
+            "运行 Python/Shell 校验和相关单元测试。",
+            "git commit && git push。",
+            "Runtime 机器 git pull 后重启 bridge 或 re-init。",
+        ],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(node_draft_dir(sop, draft_id) / "official-patch.json", result)
+    return result
 
 
 def workflow_definition_project_targets(sop, workflow_id):
@@ -6284,6 +6669,7 @@ def default_agent_executor_template():
         "- node_run_id: {{node_run_id}}",
         "",
         "Input contract:",
+        "- entry_inputs: {{entry_inputs}}",
         "- input_manifest_path: {{input_manifest_path}}",
         "- input_directory: {{input_directory}}",
         "- source_url: {{source_url}}",
@@ -6305,6 +6691,8 @@ def default_agent_executor_template():
         "```bash",
         "{{stage_command}}",
         "```",
+        "If the execution command is empty, execute the selected skill directly from this request: read entry_inputs, input_directory, input_manifest and the approved handoff guide, then write outputs to output_directory and output_manifest_path.",
+        "",
         "",
         "Execution rules:",
         "- Use the selected skill only: {{skill_name}}.",
@@ -6329,6 +6717,7 @@ def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stag
     output_manifest = node_run_manifest_path(sop, node_run_id, "output")
     input_manifest = node_run_manifest_path(sop, node_run_id, "input")
     node_run_context = (context or {}).get("node_run") if isinstance((context or {}).get("node_run"), dict) else {}
+    execution_request_data = node_run_context.get("execution_request_data") if isinstance(node_run_context.get("execution_request_data"), dict) else {}
     guide = node_run_context.get("node_execution_guide") if isinstance(node_run_context.get("node_execution_guide"), dict) else {}
     guide_prompt = str(guide.get("prompt") or "").strip()
     if not guide_prompt:
@@ -6340,6 +6729,7 @@ def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stag
         "node_id": node_id,
         "node_run_id": node_run_id,
         "skill_name": skill_name,
+        "entry_inputs": json.dumps(execution_request_data.get("entry_inputs") or {}, ensure_ascii=False, indent=2),
         "input_manifest_path": safe_relative_file(wiki, input_manifest) or str(input_manifest),
         "input_directory": safe_relative_file(wiki, node_run_input_sources_dir(sop, node_run_id)) or str(node_run_input_sources_dir(sop, node_run_id)),
         "output_manifest_path": safe_relative_file(wiki, output_manifest) or str(output_manifest),
@@ -8291,7 +8681,7 @@ def node_test_side_effects(node_id, config, static):
 
 def build_node_test_plan(sop, node_id, body=None):
     body = body if isinstance(body, dict) else {}
-    config = (sop.get("nodes") or {}).get(node_id)
+    config, _config_source = node_config_for(sop, node_id)
     if not isinstance(config, dict):
         return None
     static = node_static_config(sop, node_id) or {}
@@ -9312,7 +9702,7 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
     body = body if isinstance(body, dict) else {}
     if not workflow_id_matches(sop, workflow_id):
         return None
-    config = (sop.get("nodes") or {}).get(node_id)
+    config, config_source = node_config_for(sop, node_id)
     if not isinstance(config, dict):
         return None
     static = node_static_config(sop, node_id) or {}
@@ -9342,6 +9732,7 @@ def build_node_run_plan(sop, workflow_id, node_id, body=None):
         "workflow_id": workflow_id or binding.get("workflow_id") or sop.get("sop_type") or sop.get("id", ""),
         "workflow_name": binding.get("workflow_name") or sop.get("workflow_title") or "",
         "node_id": node_id,
+        "node_source": config_source,
         "node_title": static.get("title") or node_id,
         "mode": mode,
         "input_source": input_source,
@@ -9749,7 +10140,17 @@ def real_node_stage_script(node_id, sop=None):
 
 
 def node_real_execution_supported(node_id, sop=None):
-    return real_node_stage_script(node_id, sop) is not None
+    if real_node_stage_script(node_id, sop) is not None:
+        return True
+    if isinstance(sop, dict):
+        static = node_static_config(sop, node_id) or {}
+        executor = static.get("executor") if isinstance(static.get("executor"), dict) else {}
+        executor_type = str(executor.get("type") or "").strip().lower()
+        skill_name = str(executor.get("skill") or "").strip()
+        agent = str(executor.get("agent") or "").strip().lower()
+        if skill_name and (executor_type in {"agent-skill", "skill"} or agent == "hermes"):
+            return True
+    return False
 
 
 def node_stage_command(script, wiki, run_id, pipeline_id):
@@ -11112,7 +11513,8 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
 
     wiki = Path(sop["wiki_local_path"]).expanduser()
     script = real_node_stage_script(node_id, sop)
-    if not script or not script.exists():
+    executor_kind = node_run_executor_kind(sop, node_id, plan)
+    if executor_kind == "legacy-shell" and (not script or not script.exists()):
         return {
             "status": "failed",
             "summary": "Stage wrapper script was not found.",
@@ -11133,7 +11535,6 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
     stderr = ""
     returncode = 1
     timed_out = False
-    executor_kind = node_run_executor_kind(sop, node_id, plan)
     command_for_detail = []
     input_resolution_error = {}
     try:
@@ -11679,7 +12080,8 @@ def read_jsonl(path):
 
 
 def create_node_run(sop, workflow_id, node_id, body):
-    if not workflow_id_matches(sop, workflow_id) or not isinstance((sop.get("nodes") or {}).get(node_id), dict):
+    config, _config_source = node_config_for(sop, node_id)
+    if not workflow_id_matches(sop, workflow_id) or not isinstance(config, dict):
         return 404, {"status": "error", "message": f"Node {node_id!r} or workflow {workflow_id!r} not found"}
     token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     digest = hashlib.sha1(json.dumps(body if isinstance(body, dict) else {}, sort_keys=True).encode("utf-8")).hexdigest()[:6]
@@ -12659,15 +13061,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if drafts_dir.exists():
                         for draft_dir in sorted(drafts_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
                             if draft_dir.is_dir():
-                                drafts.append({
-                                    "draft_id": draft_dir.name,
-                                    "draft_type": (read_json(draft_dir / "change_request.json") or {}).get("draft_type", "create_node"),
-                                    "draft_path": str(draft_dir),
-                                    "node": read_yaml(draft_dir / "node.yaml"),
-                                    "change_request": read_json(draft_dir / "change_request.json") or {},
-                                    "validation": read_json(draft_dir / "validation.json") or {},
-                                })
+                                draft = read_node_draft(sop, draft_dir.name)
+                                if draft:
+                                    drafts.append(draft)
                     return json_response(self, 200, {"sop_id": sop.get("id", ""), "drafts": drafts})
+                # GET /api/sop/{instance}/node-drafts/{draft_id} — draft detail
+                if len(path) == 5 and path[3] == "node-drafts":
+                    draft = read_node_draft(sop, path[4])
+                    return json_response(self, 200 if draft else 404, draft or {"detail": "Node draft not found"})
                 # GET /api/sop/{instance}/workflow-drafts/schema — workflow edge draft schema
                 if len(path) == 5 and path[3] == "workflow-drafts" and path[4] == "schema":
                     return json_response(self, 200, {
@@ -12894,6 +13295,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return json_response(self, 400, {"detail": str(exc)})
             return json_response(self, 200, result)
 
+        # POST /api/sop/{instance}/node-builder/evaluate  → Runtime Node Builder Agent evaluation.
+        if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "node-builder" and path[4] == "evaluate":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = evaluate_node_builder(sop, data)
+            return json_response(self, http_code, result)
+
         # POST /api/sop/{instance}/edge-handoff/evaluate  → Runtime Edge Handoff Agent evaluation.
         if len(path) == 5 and path[:2] == ["api", "sop"] and path[3] == "edge-handoff" and path[4] == "evaluate":
             sop = find_sop(path[2])
@@ -13078,6 +13487,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             draft = create_node_draft(sop, data)
             status = 422 if (draft.get("validation") or {}).get("status") == "failed" else 201
             return json_response(self, status, draft)
+
+        # POST /api/sop/{instance}/node-drafts/{draft_id}/test-draft
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "node-drafts" and path[5] == "test-draft":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = test_node_draft(sop, path[4], data)
+            status = 200 if result.get("status") == "passed" else 422
+            return json_response(self, status, result)
+
+        # POST /api/sop/{instance}/node-drafts/{draft_id}/publish-runtime
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "node-drafts" and path[5] == "publish-runtime":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = publish_node_draft_to_runtime(sop, path[4], data)
+            status = 200 if result.get("status") in {"published", "warning"} else 422
+            return json_response(self, status, result)
+
+        # POST /api/sop/{instance}/node-drafts/{draft_id}/persistence-plan
+        if len(path) == 6 and path[:2] == ["api", "sop"] and path[3] == "node-drafts" and path[5] == "persistence-plan":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            result = node_draft_persistence_plan(sop, path[4], data)
+            status = 200 if result.get("status") == "generated" else 422
+            return json_response(self, status, result)
 
         # POST /api/sop/{instance}/workflows/{workflow_id}/edges/drafts
         if (len(path) == 7 and path[:2] == ["api", "sop"]
