@@ -3523,6 +3523,115 @@ def evaluate_node_builder(sop, data):
         }
 
 
+def node_builder_evaluation_dir(sop):
+    path = Path(sop["wiki_local_path"]) / "raw" / "node-drafts" / "builder-evaluations"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def node_builder_evaluation_path(sop, evaluation_id):
+    safe_id = slugify(evaluation_id)
+    return node_builder_evaluation_dir(sop) / f"{safe_id}.json"
+
+
+def write_node_builder_evaluation(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_node_builder_evaluation(sop, evaluation_id):
+    path = node_builder_evaluation_path(sop, evaluation_id)
+    if not path.is_file():
+        return None
+    data = read_json(path) or {}
+    data.setdefault("evaluation_id", slugify(evaluation_id))
+    return data
+
+
+def run_node_builder_evaluation_job(sop, data, evaluation_id, job_path):
+    started_at = datetime.now(timezone.utc).isoformat()
+    write_node_builder_evaluation(job_path, {
+        "ok": False,
+        "status": "running",
+        "mode": "node-builder-agent-evaluation-job",
+        "evaluation_id": evaluation_id,
+        "sop_id": sop.get("id", ""),
+        "instance_id": sop.get("instance_id") or sop.get("id") or "",
+        "started_at": started_at,
+    })
+    job_data = dict(data)
+    job_data["async_job"] = True
+    try:
+        http_status, result = evaluate_node_builder(sop, job_data)
+        evaluation = result.get("evaluation") if isinstance(result, dict) else {}
+        status = "done" if http_status < 500 and bool(result.get("ok")) else "failed"
+        write_node_builder_evaluation(job_path, {
+            "ok": bool(result.get("ok")),
+            "status": status,
+            "http_status": http_status,
+            "mode": "node-builder-agent-evaluation-job",
+            "evaluation_id": evaluation_id,
+            "sop_id": sop.get("id", ""),
+            "instance_id": sop.get("instance_id") or sop.get("id") or "",
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "result": result if isinstance(result, dict) else {},
+            "request": result.get("request") if isinstance(result, dict) else {},
+            "config": result.get("config") if isinstance(result, dict) else {},
+            "evaluation": evaluation if isinstance(evaluation, dict) else {},
+            "trace": result.get("trace") if isinstance(result, dict) else {},
+            "stderr": result.get("stderr") if isinstance(result, dict) else "",
+        })
+    except Exception as exc:
+        write_node_builder_evaluation(job_path, {
+            "ok": False,
+            "status": "failed",
+            "mode": "node-builder-agent-evaluation-job",
+            "evaluation_id": evaluation_id,
+            "sop_id": sop.get("id", ""),
+            "instance_id": sop.get("instance_id") or sop.get("id") or "",
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc),
+            "evaluation": {
+                "status": "blocked",
+                "summary": "Node Builder Agent async evaluation failed.",
+                "risks": [{"code": "node_builder_async_failed", "message": str(exc)}],
+                "agent": {"used_ai": False},
+            },
+        })
+
+
+def start_node_builder_evaluation_job(sop, data):
+    command = str(data.get("skill_install_command") or "skill").strip()
+    command_hash = hashlib.sha1(command.encode("utf-8", "ignore")).hexdigest()[:8]
+    evaluation_id = f"node-builder-{command_hash}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{hashlib.sha1(os.urandom(16)).hexdigest()[:6]}"
+    job_path = node_builder_evaluation_path(sop, evaluation_id)
+    initial = {
+        "ok": False,
+        "status": "queued",
+        "mode": "node-builder-agent-evaluation-job",
+        "evaluation_id": evaluation_id,
+        "sop_id": sop.get("id", ""),
+        "instance_id": sop.get("instance_id") or sop.get("id") or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_node_builder_evaluation(job_path, initial)
+    thread = threading.Thread(
+        target=run_node_builder_evaluation_job,
+        args=(dict(sop), dict(data), evaluation_id, job_path),
+        daemon=True,
+    )
+    thread.start()
+    instance_id = str(sop.get("id") or sop.get("instance_id") or "")
+    return {
+        **initial,
+        "poll_url": f"/api/sop/{quote(instance_id)}/node-builder/evaluations/{quote(evaluation_id)}",
+    }
+
+
 def node_draft_dir(sop, draft_id):
     safe_id = slugify(draft_id)
     return Path(sop["wiki_local_path"]) / "raw" / "node-drafts" / safe_id
@@ -13107,6 +13216,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 if draft:
                                     drafts.append(draft)
                     return json_response(self, 200, {"sop_id": sop.get("id", ""), "drafts": drafts})
+                # GET /api/sop/{instance}/node-builder/evaluations/{evaluation_id}
+                if len(path) == 6 and path[3] == "node-builder" and path[4] == "evaluations":
+                    job = read_node_builder_evaluation(sop, path[5])
+                    return json_response(self, 200 if job else 404, job or {"detail": "Node Builder evaluation not found"})
                 # GET /api/sop/{instance}/node-drafts/{draft_id} — draft detail
                 if len(path) == 5 and path[3] == "node-drafts":
                     draft = read_node_draft(sop, path[4])
@@ -13342,6 +13455,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sop = find_sop(path[2])
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
+            if bool(data.get("async") or data.get("async_job")):
+                return json_response(self, 202, start_node_builder_evaluation_job(sop, data))
             http_code, result = evaluate_node_builder(sop, data)
             return json_response(self, http_code, result)
 
