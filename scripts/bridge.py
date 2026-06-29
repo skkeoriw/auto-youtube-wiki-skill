@@ -2300,6 +2300,18 @@ def node_static_config(sop, node_id):
                 pass
             break
     manifest = config if source == "runtime-catalog" else read_yaml(skill_dir / "node.yaml") if (skill_dir / "node.yaml").exists() else {}
+    if skill_readme is None and source == "runtime-catalog":
+        skill_block_for_readme = manifest.get("skill") if isinstance(manifest.get("skill"), dict) else {}
+        digest = skill_block_for_readme.get("source_digest") if isinstance(skill_block_for_readme.get("source_digest"), dict) else {}
+        for file_item in digest.get("files") or []:
+            if not isinstance(file_item, dict):
+                continue
+            if str(file_item.get("path") or "").endswith(("SKILL.md", "README.md")):
+                try:
+                    skill_readme = str(file_item.get("content") or "")[:1600]
+                except Exception:
+                    skill_readme = ""
+                break
     manifest_executor = manifest.get("executor") if isinstance(manifest.get("executor"), dict) else {}
     entry = str(configured_executor.get("entry") or manifest_executor.get("entry") or "").strip()
     script_candidates = []
@@ -2361,6 +2373,8 @@ def node_static_config(sop, node_id):
         "skill_script": skill_script,
         "skill_readme": skill_readme,
         "manifest": manifest,
+        "source_digest": (manifest.get("skill") or {}).get("source_digest") if isinstance(manifest.get("skill"), dict) else {},
+        "coverage_report": manifest.get("coverage_report") if isinstance(manifest.get("coverage_report"), dict) else {},
         "ui": config.get("ui") if isinstance(config.get("ui"), dict) else manifest.get("ui") if isinstance(manifest.get("ui"), dict) else {},
         "retryable": config.get("retryable", True),
         "source": source,
@@ -2545,6 +2559,7 @@ def node_registry_item(sop, node_id, endpoint=""):
             "id": (static.get("executor") or {}).get("skill", ""),
             "source": ((manifest.get("skill") or {}).get("source") if isinstance(manifest.get("skill"), dict) else "") or ("runtime-catalog" if config_source == "runtime-catalog" else "repository"),
             "install_command": (manifest.get("skill") or {}).get("install_command", "") if isinstance(manifest.get("skill"), dict) else "",
+            "source_digest": static.get("source_digest") or {},
             "readme_path": static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else "",
             "summary": static.get("skill_readme", ""),
         },
@@ -2562,6 +2577,7 @@ def node_registry_item(sop, node_id, endpoint=""):
         "actions": node_actions(instance_id, node_id, node_classification_for(node_id)),
         "cli": node_cli_examples(endpoint or "{endpoint}", instance_id, node_id),
         "ui": static.get("ui") or {},
+        "coverage_report": static.get("coverage_report") or {},
         "modules": node_modules(sop, node_id, endpoint),
         "editable": True,
         "publish_enabled": False,
@@ -6972,7 +6988,11 @@ def format_output_template(template, pipeline_id):
     return template.replace("{pipeline_id}", pipeline_id).replace("{run_id}", run_id)
 
 
-def generated_fixture_value(input_name, source):
+def generated_fixture_value(input_name, source, spec=None):
+    spec = spec if isinstance(spec, dict) else {}
+    example = spec.get("example")
+    if not is_blank_value(example):
+        return example
     name = str(input_name or "").lower()
     source_text = str(source or "").lower()
     if name in {"source_url", "url"} or source_text.endswith(".source_url"):
@@ -8614,7 +8634,7 @@ def resolve_node_input(sop, input_name, spec, source_mode, base_run_id="", manua
                 item.update({"resolved": True, "value": value, "provenance": provenance})
                 return item
     if source_mode in {"generated-fixture", "deepseek-mock"}:
-        value = generated_fixture_value(input_name, source)
+        value = generated_fixture_value(input_name, source, spec if isinstance(spec, dict) else {})
         if value is not None:
             item.update({
                 "resolved": True,
@@ -10549,7 +10569,7 @@ def validate_materialized_node_inputs(sop, node_id, items, source_mode):
             items_by_input.setdefault(target, []).append(item)
     for input_name in ordered_unique([*contracts.keys(), *items_by_input.keys()]):
         spec = contracts.get(input_name) or {"kind": "file", "required": False}
-        kind = str(spec.get("kind") or spec.get("type") or "auto").strip().lower()
+        kind = str(spec.get("input_kind") or spec.get("kind") or spec.get("type") or "auto").strip().lower()
         candidates = items_by_input.get(input_name) or []
         if not candidates:
             if input_name in required_names:
@@ -10559,7 +10579,29 @@ def validate_materialized_node_inputs(sop, node_id, items, source_mode):
                     "source_mode": source_mode,
                 })
             continue
-        if kind in {"scalar", "string", "text", "auto"} and node_input_resolvers(spec):
+        if kind in {"scalar", "string", "text", "url", "number"} and not node_input_resolvers(spec):
+            value = ""
+            if candidates:
+                first = candidates[0]
+                preview = first.get("value_preview")
+                if isinstance(preview, str) and preview.strip():
+                    value = preview.strip()
+                    first["resolved_value"] = value
+                    resolved_values[input_name] = value
+                    resolutions.append({
+                        "input": input_name,
+                        "source_outputs": [item.get("source_output") or item.get("output") for item in candidates],
+                        "materialized_paths": [item.get("materialized_path") for item in candidates if item.get("materialized_path")],
+                        "value_preview": value[:1000],
+                    })
+                    continue
+            if input_name in required_names:
+                errors.append({
+                    "input": input_name,
+                    "reason": "required scalar/text input was not materialized",
+                    "source_outputs": [item.get("source_output") or item.get("output") for item in candidates],
+                })
+        elif kind in {"scalar", "string", "text", "url", "number", "auto"} and node_input_resolvers(spec):
             value = ""
             resolver_id = ""
             reason = ""
