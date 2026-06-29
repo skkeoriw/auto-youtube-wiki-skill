@@ -1837,6 +1837,34 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(business["expected_outputs"], ["public_image_url"])
         self.assertEqual(business["present_outputs"], ["public_image_url"])
 
+    def test_node_draft_probe_failure_does_not_mark_business_outputs_passed(self):
+        result = {
+            "status": "failed",
+            "node_run_id": "node-run-runtime-image-node-probe",
+            "workflow_revision": {
+                "nodes": {
+                    "runtime-image-node": {
+                        "outputs": {
+                            "expected": {
+                                "public_image_url": {"value_type": "url", "relayable": True},
+                                "task_id": {"value_type": "text", "relayable": True},
+                            },
+                        }
+                    }
+                }
+            },
+            "actual_outputs": {
+                "status": "failed",
+                "task_id": "task-123",
+                "error": "downloadImage stage failed",
+            },
+        }
+        status, business = bridge.node_draft_probe_status_from_result(self.sop, "runtime-image-node", result)
+        self.assertEqual(status, "failed")
+        self.assertEqual(business["status"], "failed_execution")
+        self.assertIn("task_id", business["present_outputs"])
+        self.assertEqual(business["business_outputs"]["status"], "failed")
+
     def test_node_run_detail_hydrates_business_output_status_from_workflow_revision(self):
         node_run_id = "node-run-runtime-image-node-probe"
         result = {
@@ -1916,7 +1944,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(hydrated["status"], "failed")
         self.assertFalse(hydrated["pending"])
         self.assertEqual(hydrated["validation"]["status"], "failed")
-        self.assertEqual(hydrated["validation"]["business_output_status"]["status"], "missing_business_outputs")
+        self.assertEqual(hydrated["validation"]["business_output_status"]["status"], "failed_execution")
         self.assertIn("download dialog timed out", hydrated["detail"]["real_execution"]["summary"])
 
     def test_trigger_node_test_for_node_without_engine_contract_returns_404(self):

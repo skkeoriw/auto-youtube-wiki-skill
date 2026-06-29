@@ -3842,7 +3842,18 @@ def business_output_status_for(sop, node_id, actual_outputs, declared_outputs=No
     present_names = [name for name in expected_names if output_value_present((actual_outputs or {}).get(name))]
     missing_required = [name for name in required_names if name not in present_names]
     artifact_count = len([item for item in (artifacts or []) if isinstance(item, dict) and is_business_output_name(item.get("output") or item.get("name") or item.get("id"))])
-    if missing_required:
+    result = result if isinstance(result, dict) else {}
+    execution_status = str(
+        result.get("status")
+        or result.get("execution_status")
+        or (actual_outputs or {}).get("status")
+        or business_outputs.get("status")
+        or ""
+    ).lower()
+    execution_failed = execution_status in {"failed", "error", "cancelled", "canceled", "timeout", "timed_out"}
+    if execution_failed:
+        status = "failed_execution"
+    elif missing_required:
         status = "missing_required_outputs"
     elif expected_names and not present_names and not business_outputs and artifact_count == 0:
         status = "missing_business_outputs"
