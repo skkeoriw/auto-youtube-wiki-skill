@@ -1775,14 +1775,83 @@ class ArtifactResolutionTest(unittest.TestCase):
             })
         self.assertEqual(probe["status"], "passed")
         self.assertEqual(probe["manifest_records"][0]["output"], "generated_image")
-        synthesis = bridge.synthesize_node_draft_contract(self.sop, draft["draft_id"], {
-            "probe_id": probe["probe_id"],
-        })
+        def fake_evaluate_node_builder(sop, data):
+            self.assertEqual(data["evaluation_mode"], "contract_review")
+            self.assertEqual(data["probe"]["probe_id"], probe["probe_id"])
+            self.assertIn("generated_image", data["observed_outputs"])
+            summary = bridge.contract_summary_from_outputs(data["observed_outputs"])
+            return 200, {
+                "evaluation": {
+                    "status": "reviewed",
+                    "summary": "reviewed from probe evidence",
+                    "node_model": data["node_draft"],
+                    "contract_summary": summary,
+                    "agent_review": {
+                        "summary": "reviewed from probe evidence",
+                        "warnings": [],
+                        "risks": [],
+                        "recommendations": [],
+                        "agent": {"provider": "test", "used_ai": False},
+                    },
+                    "evidence": data["probe"],
+                }
+            }
+
+        with patch.object(bridge, "evaluate_node_builder", side_effect=fake_evaluate_node_builder):
+            synthesis = bridge.synthesize_node_draft_contract(self.sop, draft["draft_id"], {
+                "probe_id": probe["probe_id"],
+            })
         self.assertEqual(synthesis["status"], "synthesized")
         self.assertIn("generated_image", synthesis["outputs"])
         self.assertIn("public_image_url", synthesis["outputs"]["generated_image"]["fields"])
+        self.assertIn("contract_summary", synthesis)
+        self.assertIn("agent_review", synthesis)
+        self.assertEqual(synthesis["contract_summary"]["artifact_outputs"], ["generated_image"])
+        self.assertEqual(synthesis["contract_summary"]["recommended_edge_outputs"], ["generated_image"])
+        self.assertTrue(synthesis["node_builder_contract_review"])
         refreshed = bridge.read_node_draft(self.sop, draft["draft_id"])
         self.assertIn("generated_image", refreshed["node"]["outputs"])
+        self.assertEqual(refreshed["node"]["contract_summary"]["artifact_outputs"], ["generated_image"])
+
+    def test_evaluate_node_builder_preserves_contract_review_payload(self):
+        captured = {}
+
+        class Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(command, text, capture_output, timeout, env):
+            request_path = Path(command[command.index("--request-json") + 1])
+            output_path = Path(command[command.index("--output-json") + 1])
+            captured.update(bridge.read_json(request_path))
+            bridge.write_json(output_path, {
+                "status": "reviewed",
+                "summary": "ok",
+                "node_model": captured.get("node_draft") or {},
+                "contract_summary": {"primary_outputs": ["public_image_url"]},
+                "agent_review": {"summary": "ok"},
+                "missing_fields": [],
+                "evidence": captured.get("probe") or {},
+            })
+            return Completed()
+
+        with patch.object(bridge, "node_builder_script", return_value=Path("/tmp/node-builder.py")), \
+             patch("subprocess.run", side_effect=fake_run):
+            http_code, result = bridge.evaluate_node_builder(self.sop, {
+                "evaluation_mode": "contract_review",
+                "node_draft": {"id": "image-node", "outputs": {}},
+                "observed_outputs": {"public_image_url": {"value_type": "url"}},
+                "probe": {"probe_id": "probe-1"},
+                "allow_fallback": True,
+            })
+
+        self.assertEqual(http_code, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["evaluation_mode"], "contract_review")
+        self.assertEqual(captured["node_draft"]["id"], "image-node")
+        self.assertIn("public_image_url", captured["observed_outputs"])
+        self.assertEqual(captured["probe"]["probe_id"], "probe-1")
 
     def test_node_draft_probe_runs_sort_by_probe_created_at_not_file_mtime(self):
         draft = bridge.create_node_draft(self.sop, {

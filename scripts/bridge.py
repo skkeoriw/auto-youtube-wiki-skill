@@ -3477,13 +3477,14 @@ def evaluate_node_builder(sop, data):
     script = node_builder_script()
     if not script:
         return 503, {"ok": False, "status": "blocked", "detail": "sop-node-builder script is not installed on this Runtime"}
-    request_payload = {
+    request_payload = dict(data)
+    request_payload.update({
         "runtime_id": runtime_info().get("runtime_id") or os.environ.get("SOP_RUNTIME_ID") or "",
         "instance_id": sop.get("instance_id") or sop.get("id") or "",
         "skill_install_command": data.get("skill_install_command") or "",
         "user_instruction": data.get("user_instruction") or data.get("instruction") or "",
         "fetch_metadata": data.get("fetch_metadata", True),
-    }
+    })
     env, config = node_builder_env(sop, data)
     with tempfile.TemporaryDirectory(prefix="node-builder-") as temp_dir:
         request_path = Path(temp_dir) / "request.json"
@@ -4141,6 +4142,80 @@ def synthesize_output_contract_from_manifest_records(node_run_id, records):
     return outputs
 
 
+def contract_output_value_type(spec):
+    spec = spec if isinstance(spec, dict) else {}
+    return str(spec.get("value_type") or spec.get("type") or spec.get("kind") or "text").strip().lower()
+
+
+def contract_summary_from_outputs(outputs):
+    outputs = outputs if isinstance(outputs, dict) else {}
+    names = list(outputs.keys())
+    aliases = {}
+    if "public_image_url" in outputs and "image_url" in outputs:
+        aliases["image_url"] = "public_image_url"
+    if "generated_images" in outputs and "images" in outputs:
+        aliases["images"] = "generated_images"
+
+    primary = []
+    artifact = []
+    auxiliary = []
+    diagnostic = []
+    for preferred in ("public_image_url", "output_url", "image_url", "url"):
+        if preferred in outputs and preferred not in aliases:
+            primary.append(preferred)
+            break
+
+    for name in names:
+        if name in aliases:
+            continue
+        spec = outputs.get(name) if isinstance(outputs.get(name), dict) else {}
+        lower = name.lower()
+        value_type = contract_output_value_type(spec)
+        fields = spec.get("fields") if isinstance(spec.get("fields"), dict) else {}
+        is_artifact_output = value_type == "image" or "image" in lower or "artifact" in lower or "public_image_url" in fields
+        if is_artifact_output:
+            if name not in primary:
+                artifact.append(name)
+        elif lower.endswith("_json") or value_type == "json":
+            diagnostic.append(name)
+        elif lower in {"task_id", "status", "result", "message", "summary"} or lower.endswith("_id"):
+            auxiliary.append(name)
+        elif value_type == "url" and name not in primary:
+            if not primary:
+                primary.append(name)
+            else:
+                auxiliary.append(name)
+        elif name not in primary:
+            auxiliary.append(name)
+
+    recommended = ordered_unique([*primary, *artifact])
+    return {
+        "primary_outputs": primary,
+        "artifact_outputs": artifact,
+        "auxiliary_outputs": auxiliary,
+        "diagnostic_outputs": diagnostic,
+        "aliases": aliases,
+        "recommended_edge_outputs": recommended,
+    }
+
+
+def fallback_contract_agent_review(contract_summary, error=""):
+    recommended = contract_summary.get("recommended_edge_outputs") if isinstance(contract_summary, dict) else []
+    warnings = []
+    if error:
+        warnings.append({"code": "node_builder_contract_review_fallback", "message": error})
+    return {
+        "summary": "Contract Synthesis used deterministic Probe evidence classification.",
+        "warnings": warnings,
+        "risks": [],
+        "recommendations": [
+            f"Default downstream Edge outputs: {', '.join(recommended)}." if recommended else "Run Probe before publishing.",
+            "Keep JSON status payloads as diagnostics unless an Edge explicitly needs them.",
+        ],
+        "agent": {"provider": "deterministic-contract-review", "used_ai": False},
+    }
+
+
 def manifest_records_from_actual_outputs(actual_outputs):
     records = []
     for name, value in (actual_outputs or {}).items():
@@ -4208,6 +4283,49 @@ def synthesize_node_draft_contract(sop, draft_id, data=None):
         write_json(node_draft_dir(sop, draft_id) / "contract-synthesis.json", result)
         return result
     node["outputs"] = outputs
+    deterministic_summary = contract_summary_from_outputs(outputs)
+    evidence = {
+        "probe_id": probe.get("probe_id") or "",
+        "node_run_id": node_run_id,
+        "manifest_record_count": len(records),
+        "source": "node-draft-probe",
+    }
+    agent_review_result = {}
+    contract_summary = deterministic_summary
+    node_model = copy.deepcopy(node)
+    agent_review = fallback_contract_agent_review(contract_summary)
+    http_code, review_payload = evaluate_node_builder(sop, {
+        "evaluation_mode": "contract_review",
+        "draft_id": draft_id,
+        "node_id": node_id,
+        "node_draft": node,
+        "observed_outputs": outputs,
+        "probe": evidence,
+        "user_instruction": data.get("user_instruction") or data.get("instruction") or "",
+        "allow_fallback": True,
+    })
+    if http_code == 200 and isinstance(review_payload, dict):
+        agent_review_result = review_payload
+        evaluation = review_payload.get("evaluation") if isinstance(review_payload.get("evaluation"), dict) else {}
+        if isinstance(evaluation.get("contract_summary"), dict) and evaluation.get("contract_summary"):
+            contract_summary = evaluation["contract_summary"]
+        if isinstance(evaluation.get("node_model"), dict) and evaluation.get("node_model"):
+            node_model = evaluation["node_model"]
+            node_model.setdefault("outputs", outputs)
+        if isinstance(evaluation.get("agent_review"), dict) and evaluation.get("agent_review"):
+            agent_review = evaluation["agent_review"]
+        evidence = {
+            **evidence,
+            **(evaluation.get("evidence") if isinstance(evaluation.get("evidence"), dict) else {}),
+        }
+    else:
+        detail = str((review_payload or {}).get("detail") or (review_payload or {}).get("summary") or "Node Builder Contract Review unavailable") if isinstance(review_payload, dict) else "Node Builder Contract Review unavailable"
+        agent_review = fallback_contract_agent_review(contract_summary, detail)
+
+    node = node_model
+    node["outputs"] = node.get("outputs") if isinstance(node.get("outputs"), dict) and node.get("outputs") else outputs
+    node["contract_summary"] = contract_summary
+    node["agent_review"] = agent_review
     node.setdefault("analysis", {})
     if isinstance(node["analysis"], dict):
         node["analysis"]["contract_synthesis"] = {
@@ -4215,6 +4333,7 @@ def synthesize_node_draft_contract(sop, draft_id, data=None):
             "probe_id": probe.get("probe_id") or "",
             "node_run_id": node_run_id,
             "manifest_record_count": len(records),
+            "node_builder_contract_review": bool(agent_review_result),
             "synthesized_at": datetime.now(timezone.utc).isoformat(),
         }
     draft_dir = node_draft_dir(sop, draft_id)
@@ -4224,6 +4343,7 @@ def synthesize_node_draft_contract(sop, draft_id, data=None):
         "status": "passed",
         "contract_synthesis": "passed",
         "output_count": len(outputs),
+        "node_builder_contract_review": bool(agent_review_result),
         "production_dag_changed": False,
     })
     write_json(draft_dir / "validation.json", validation)
@@ -4234,8 +4354,13 @@ def synthesize_node_draft_contract(sop, draft_id, data=None):
         "probe_id": probe.get("probe_id") or "",
         "node_run_id": node_run_id,
         "outputs": outputs,
+        "node_model": node,
+        "contract_summary": contract_summary,
+        "agent_review": agent_review,
+        "evidence": evidence,
         "node": node,
         "validation": validation,
+        "node_builder_contract_review": agent_review_result,
         "synthesized_at": datetime.now(timezone.utc).isoformat(),
     }
     write_json(draft_dir / "contract-synthesis.json", result)
