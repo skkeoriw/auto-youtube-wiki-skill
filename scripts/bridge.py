@@ -2351,6 +2351,17 @@ def node_static_config(sop, node_id):
         config.get("inputs", {}),
         "input",
     )
+    manifest_skill = manifest.get("skill") if isinstance(manifest.get("skill"), dict) else {}
+    static_skill = config.get("skill") if isinstance(config.get("skill"), dict) else {}
+    skill_id = configured_executor.get("skill") or static_skill.get("id") or manifest_skill.get("id") or config.get("skill") or manifest_executor.get("skill", "")
+    skill_install_command = (
+        static_skill.get("install_command")
+        or manifest_skill.get("install_command")
+        or configured_executor.get("install_command")
+        or manifest_executor.get("install_command")
+        or config.get("skill_install_command")
+        or ""
+    )
 
     return {
         "node_id": node_id,
@@ -2363,8 +2374,18 @@ def node_static_config(sop, node_id):
             **manifest_executor,
             **configured_executor,
             "type": configured_executor.get("type") or manifest_executor.get("type") or "skill",
-            "skill": configured_executor.get("skill") or skill_block.get("id") or config.get("skill") or manifest_executor.get("skill", ""),
+            "skill": skill_id,
             "webhook_route": config.get("webhook_route", ""),
+        },
+        "skill": {
+            **manifest_skill,
+            **static_skill,
+            "id": skill_id,
+            "source": static_skill.get("source") or manifest_skill.get("source") or ("runtime-catalog" if source == "runtime-catalog" else "repository"),
+            "install_command": skill_install_command,
+            "source_digest": static_skill.get("source_digest") or manifest_skill.get("source_digest") or {},
+            "readme_path": static_skill.get("readme_path") or manifest_skill.get("readme_path") or (str(skill_dir / "SKILL.md") if (skill_dir / "SKILL.md").exists() else ""),
+            "summary": static_skill.get("summary") or manifest_skill.get("summary") or skill_readme or "",
         },
         "inputs": node_inputs,
         "workflow_inputs": merge_contracts(manifest_inputs, config.get("inputs", {}), "input"),
@@ -2537,6 +2558,7 @@ def node_registry_item(sop, node_id, endpoint=""):
         return None
     instance_id = sop.get("id") or sop.get("name") or ""
     manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
+    static_skill = static.get("skill") if isinstance(static.get("skill"), dict) else {}
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
     manifest_entry_inputs = manifest.get("entry_inputs") if isinstance(manifest.get("entry_inputs"), dict) else {}
     manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
@@ -2565,12 +2587,13 @@ def node_registry_item(sop, node_id, endpoint=""):
         "retryable": static.get("retryable", True),
         "case": classify_node(node_id, config, static),
         "skill": {
-            "id": (static.get("executor") or {}).get("skill", ""),
-            "source": ((manifest.get("skill") or {}).get("source") if isinstance(manifest.get("skill"), dict) else "") or ("runtime-catalog" if config_source == "runtime-catalog" else "repository"),
-            "install_command": (manifest.get("skill") or {}).get("install_command", "") if isinstance(manifest.get("skill"), dict) else "",
-            "source_digest": static.get("source_digest") or {},
-            "readme_path": static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else "",
-            "summary": static.get("skill_readme", ""),
+            **static_skill,
+            "id": static_skill.get("id") or (static.get("executor") or {}).get("skill", ""),
+            "source": static_skill.get("source") or ("runtime-catalog" if config_source == "runtime-catalog" else "repository"),
+            "install_command": static_skill.get("install_command") or "",
+            "source_digest": static_skill.get("source_digest") or static.get("source_digest") or {},
+            "readme_path": static_skill.get("readme_path") or (static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else ""),
+            "summary": static_skill.get("summary") or static.get("skill_readme", ""),
         },
         "entry_inputs": normalize_contract(manifest_entry_inputs or manifest_inputs or static.get("entry_inputs", {}) or static.get("inputs", {}), "input"),
         "handoff": manifest.get("handoff") if isinstance(manifest.get("handoff"), dict) else static.get("handoff") or {},
@@ -2866,7 +2889,17 @@ def node_module_detail(sop, node_id, module_id, endpoint="", pipeline_id=None):
     elif module_id == "executor":
         detail = {"executor": item.get("executor"), "case": item.get("case"), "actions": item.get("actions"), "cli": item.get("cli")}
     elif module_id == "skill":
-        detail = {"skill": item.get("skill"), "skill_script": item.get("skill_script"), "skill_readme": item.get("skill_readme")}
+        skill = item.get("skill") if isinstance(item.get("skill"), dict) else {}
+        detail = {
+            "skill": skill,
+            "skill_id": skill.get("id") or (item.get("executor") or {}).get("skill") or "",
+            "install_command": skill.get("install_command") or "",
+            "source": skill.get("source") or "",
+            "readme_path": skill.get("readme_path") or "",
+            "source_digest": skill.get("source_digest") or {},
+            "skill_script": item.get("skill_script"),
+            "skill_readme": item.get("skill_readme") or skill.get("summary") or "",
+        }
     elif module_id == "inputs":
         detail = {"declared_inputs": item.get("inputs"), "optional_inputs": item.get("optional_inputs"), "resolved_inputs": run_detail.get("resolved_inputs", {})}
     elif module_id == "outputs":
