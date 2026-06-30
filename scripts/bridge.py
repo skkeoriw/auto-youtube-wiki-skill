@@ -86,6 +86,9 @@ CREATE_INSTANCE_NODES = [
     "parse-create-instance-request",
     "prepare-instance-workspace",
     "upsert-instance-registry",
+    "test-instance-agent-runtime",
+    "test-instance-github",
+    "test-instance-telegram",
     "verify-instance-visible",
 ]
 
@@ -8116,6 +8119,19 @@ def agent_runtime_command_args(runtime_name, skill_name, request_text):
     return []
 
 
+def prepend_command_dir_to_env(env, command_args):
+    if not command_args:
+        return env
+    first = str(command_args[0] or "")
+    if not first or first in {"bash", "sh", "env"}:
+        return env
+    command_path = Path(first).expanduser()
+    if command_path.exists() and command_path.parent.exists():
+        env = {**env}
+        env["PATH"] = f"{command_path.parent}:{env.get('PATH', '')}"
+    return env
+
+
 def wait_for_real_node_completion(sop, node_run_id, node_id, timeout_seconds, started_at):
     wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
     deadline = time.monotonic() + max(5, timeout_seconds)
@@ -13360,6 +13376,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
                 if executor_kind == "openclaw":
                     raise RuntimeError("OpenClaw node-run command is not configured. Set OPENCLAW_NODE_RUN_COMMAND_TEMPLATE for this Runtime.")
                 raise RuntimeError(f"{executor_kind} CLI is not installed or is not on PATH for this Runtime")
+            env = prepend_command_dir_to_env(env, agent_args)
             command_for_detail = agent_args[:]
             command_for_detail[-1] = "<request.md>"
             completed = subprocess.run(
