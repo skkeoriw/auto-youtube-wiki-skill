@@ -2335,10 +2335,8 @@ def node_static_config(sop, node_id):
         ])
     skill_script = next((str(p.relative_to(plugin_dir.parent)) for p in script_candidates if p.exists()), None)
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
-    manifest_entry = manifest.get("entry") if isinstance(manifest.get("entry"), dict) else {}
-    manifest_entry_inputs = manifest.get("entry_inputs") if isinstance(manifest.get("entry_inputs"), dict) else {}
-    if not manifest_entry_inputs and isinstance(manifest_entry.get("inputs"), dict):
-        manifest_entry_inputs = manifest_entry.get("inputs") or {}
+    manifest_entry_inputs = node_entry_inputs_from_config(manifest)
+    config_entry_inputs = node_entry_inputs_from_config(config)
     raw_manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
     manifest_outputs = (
         raw_manifest_outputs.get("expected")
@@ -2348,7 +2346,7 @@ def node_static_config(sop, node_id):
     manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
     node_inputs = merge_contracts(
         manifest_entry_inputs or manifest_inputs,
-        config.get("inputs", {}),
+        config_entry_inputs,
         "input",
     )
     manifest_skill = manifest.get("skill") if isinstance(manifest.get("skill"), dict) else {}
@@ -2389,7 +2387,7 @@ def node_static_config(sop, node_id):
         },
         "inputs": node_inputs,
         "workflow_inputs": merge_contracts(manifest_inputs, config.get("inputs", {}), "input"),
-        "entry_inputs": merge_contracts(manifest_entry_inputs or manifest_inputs, {}, "input"),
+        "entry_inputs": merge_contracts(config_entry_inputs or manifest_entry_inputs or manifest_inputs, {}, "input"),
         "handoff": manifest.get("handoff") if isinstance(manifest.get("handoff"), dict) else {},
         "outputs": merge_contracts(manifest_outputs, config.get("outputs", {}), "output"),
         "optional_inputs": merge_contracts(manifest_optional_inputs, config.get("optional_inputs", {}), "input"),
@@ -2508,6 +2506,19 @@ def normalize_contract(value, direction):
     return result
 
 
+def node_entry_inputs_from_config(config):
+    """Return entry/manual-test inputs from both node-definition/v1 and legacy layouts."""
+    config = config if isinstance(config, dict) else {}
+    entry = config.get("entry") if isinstance(config.get("entry"), dict) else {}
+    if isinstance(entry.get("inputs"), dict):
+        return entry.get("inputs") or {}
+    if isinstance(config.get("entry_inputs"), dict):
+        return config.get("entry_inputs") or {}
+    if isinstance(config.get("inputs"), dict):
+        return config.get("inputs") or {}
+    return {}
+
+
 def merge_contracts(definition_value, binding_value, direction):
     definition = normalize_contract(definition_value, direction)
     binding = normalize_contract(binding_value, direction)
@@ -2560,7 +2571,7 @@ def node_registry_item(sop, node_id, endpoint=""):
     manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
     static_skill = static.get("skill") if isinstance(static.get("skill"), dict) else {}
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
-    manifest_entry_inputs = manifest.get("entry_inputs") if isinstance(manifest.get("entry_inputs"), dict) else {}
+    manifest_entry_inputs = node_entry_inputs_from_config(manifest)
     manifest_optional_inputs = manifest.get("optional_inputs") if isinstance(manifest.get("optional_inputs"), dict) else {}
     manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
     manifest_caps = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
@@ -2595,10 +2606,10 @@ def node_registry_item(sop, node_id, endpoint=""):
             "readme_path": static_skill.get("readme_path") or (static.get("skill_script", "").replace("/scripts/", "/SKILL.md") if static.get("skill_script") else ""),
             "summary": static_skill.get("summary") or static.get("skill_readme", ""),
         },
-        "entry_inputs": normalize_contract(manifest_entry_inputs or manifest_inputs or static.get("entry_inputs", {}) or static.get("inputs", {}), "input"),
+        "entry_inputs": normalize_contract(static.get("entry_inputs", {}) or manifest_entry_inputs or manifest_inputs or static.get("inputs", {}), "input"),
         "handoff": manifest.get("handoff") if isinstance(manifest.get("handoff"), dict) else static.get("handoff") or {},
         "workflow_inputs": normalize_contract(static.get("workflow_inputs") or {}, "input"),
-        "inputs": normalize_contract(manifest_entry_inputs or manifest_inputs or static.get("inputs", {}), "input"),
+        "inputs": normalize_contract(static.get("inputs", {}) or manifest_entry_inputs or manifest_inputs, "input"),
         "optional_inputs": normalize_contract(manifest_optional_inputs or static.get("optional_inputs", {}), "input"),
         "outputs": normalize_contract(manifest_outputs or static.get("outputs", {}), "output"),
         "capabilities": {
@@ -4014,7 +4025,7 @@ def node_draft_temp_sop(sop, node):
 
 
 def node_draft_default_probe_inputs(node):
-    entry_inputs = normalize_contract((node or {}).get("entry_inputs") or (node or {}).get("inputs") or {}, "input")
+    entry_inputs = normalize_contract(node_entry_inputs_from_config(node), "input")
     inputs = {}
     for name, spec in entry_inputs.items():
         spec = spec if isinstance(spec, dict) else {}

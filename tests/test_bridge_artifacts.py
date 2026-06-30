@@ -213,6 +213,44 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(detail["actual_outputs"]["source_url"], "https://example.com/video")
         self.assertEqual(detail["validation"]["status"], "passed")
 
+    def test_node_definition_v1_entry_inputs_are_materialized_from_manual_inputs(self):
+        node_id = "youtube-metadata-fetch"
+        source_url = "https://www.youtube.com/watch?v=96jN2OCOfLs&t=90s"
+        self.sop["nodes"][node_id] = {
+            "schema": "node-definition/v1",
+            "id": node_id,
+            "title": "Youtube Metadata Fetch",
+            "skill": {"id": "youtube-metadata-fetch"},
+            "executor": {"type": "agent-skill", "skill": "youtube-metadata-fetch"},
+            "entry": {
+                "inputs": {
+                    "source_url": {
+                        "required": True,
+                        "input_kind": "url",
+                        "value_type": "url",
+                        "label": "Source Url",
+                    }
+                }
+            },
+            "outputs": {
+                "expected": {
+                    "metadata_json": {"value_type": "json", "relayable": True},
+                }
+            },
+        }
+
+        plan = bridge.build_node_test_plan(self.sop, node_id, {
+            "input_source": "manual",
+            "manual_inputs": {"source_url": source_url},
+        })
+
+        self.assertEqual(plan["resolved_inputs"][0]["value"], source_url)
+        info = bridge.materialize_node_run_inputs(self.sop, "node-run-entry-inputs", node_id, plan, {})
+        input_file = self.wiki / "raw/node-runs/node-run-entry-inputs/inputs/sources/0001.txt"
+        self.assertEqual(input_file.read_text(encoding="utf-8"), source_url)
+        self.assertEqual(info["source_url"], source_url)
+        self.assertEqual(info["input_validation"]["resolved_values"]["source_url"], source_url)
+
     def test_real_node_outputs_accept_manifest_scalar_output(self):
         run_id = "node-run-youtube-fetch-test"
         output_dir = self.wiki / "raw/node-runs" / run_id / "outputs/files"
