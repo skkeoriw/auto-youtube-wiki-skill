@@ -13398,6 +13398,14 @@ def apply_real_node_execution_to_steps(steps, execution):
             git.get("reason") or git.get("error") or "GitHub persistence capability finished.",
             git,
         )
+    else:
+        update_node_run_step(
+            steps,
+            "persist-to-github",
+            "skipped",
+            "GitHub persistence is not attached for this Node Run.",
+            {},
+        )
     telegram = capabilities.get("telegram") if isinstance(capabilities.get("telegram"), dict) else {}
     if telegram:
         telegram_failed = telegram.get("status") == "failed"
@@ -13408,6 +13416,14 @@ def apply_real_node_execution_to_steps(steps, execution):
             "done" if telegram.get("status") == "done" else "failed" if telegram_failed and telegram_required else "warning" if telegram_failed else "skipped" if telegram.get("status") == "disabled" else "warning",
             telegram.get("error") or telegram.get("reason") or "Telegram notification capability finished.",
             telegram,
+        )
+    else:
+        update_node_run_step(
+            steps,
+            "send-telegram-notification",
+            "skipped",
+            "Telegram notification is not attached for this Node Run.",
+            {},
         )
 
 def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, inner_steps, events,
