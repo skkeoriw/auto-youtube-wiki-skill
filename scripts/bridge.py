@@ -12309,6 +12309,22 @@ def hydrate_node_run_result_views(sop, result):
     declared_outputs = declared_outputs_from_node_run_result(sop, node_id, result)
     actual_outputs = result.get("actual_outputs") if isinstance(result.get("actual_outputs"), dict) else {}
     artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+    canonical = result.get("node_run_result") if isinstance(result.get("node_run_result"), dict) else {}
+    if not canonical:
+        canonical = node_run_canonical_result(sop, node_run_id, node_id, declared_outputs, result)
+    canonical_outputs = canonical.get("actual_outputs") if isinstance(canonical.get("actual_outputs"), dict) else {}
+    if canonical_outputs:
+        merged_outputs = dict(actual_outputs)
+        for name, value in canonical_outputs.items():
+            if output_value_present(value) or name not in merged_outputs:
+                merged_outputs[name] = value
+        actual_outputs = merged_outputs
+        result["actual_outputs"] = actual_outputs
+    if isinstance(canonical.get("artifacts"), list):
+        existing = {item.get("path") for item in artifacts if isinstance(item, dict)}
+        artifacts = artifacts + [item for item in canonical.get("artifacts") if isinstance(item, dict) and item.get("path") not in existing]
+        result["artifacts"] = artifacts
+    result["node_run_result"] = canonical
     core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
     business_status = business_output_status_for(sop, node_id, actual_outputs, declared_outputs, artifacts, result=result)
     result["core_outputs"] = core_outputs
@@ -12467,6 +12483,311 @@ def node_run_manifest_actual_outputs(sop, node_run_id):
         else:
             outputs[name] = value
     return outputs
+
+
+def canonical_output_name(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", raw)
+    raw = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw)
+    raw = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_").lower()
+    return raw
+
+
+def output_record_value(record):
+    record = record if isinstance(record, dict) else {}
+    for key in ("value", "resolved_value", "value_preview", "text", "url", "public_url", "publicUrl", "source_url", "sourceUrl"):
+        if key in record and record.get(key) not in (None, "", []):
+            return record.get(key)
+    return None
+
+
+def looks_like_url(value):
+    return isinstance(value, str) and value.strip().startswith(("http://", "https://"))
+
+
+def looks_like_image_path(value):
+    if not isinstance(value, str):
+        return False
+    suffix = Path(value.split("?", 1)[0]).suffix.lower()
+    return suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}
+
+
+def manifest_output_file_items(manifest):
+    manifest = manifest if isinstance(manifest, dict) else {}
+    rows = []
+    for key in ("output_files", "outputFiles", "files", "artifacts"):
+        value = manifest.get(key)
+        if isinstance(value, list):
+            rows.extend([item for item in value if isinstance(item, dict)])
+    return rows
+
+
+def output_file_item_path(item):
+    item = item if isinstance(item, dict) else {}
+    for key in ("path", "file", "file_path", "filePath", "local_path", "localPath", "name"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def output_file_public_url(item):
+    item = item if isinstance(item, dict) else {}
+    for key in ("source_url", "sourceUrl", "public_url", "publicUrl", "url", "href"):
+        value = item.get(key)
+        if looks_like_url(value):
+            return str(value).strip()
+    return ""
+
+
+def output_file_is_image(item, path="", public_url=""):
+    item = item if isinstance(item, dict) else {}
+    content_type = str(item.get("content_type") or item.get("contentType") or item.get("mime_type") or item.get("mimeType") or "").lower()
+    value_type = str(item.get("value_type") or item.get("valueType") or item.get("type") or "").lower()
+    return (
+        content_type.startswith("image/")
+        or value_type == "image"
+        or looks_like_image_path(path)
+        or looks_like_image_path(public_url)
+    )
+
+
+def add_canonical_named_output(named_outputs, priorities, name, value, source, priority, **metadata):
+    canonical = canonical_output_name(name)
+    if not canonical or value in (None, "", []):
+        return
+    current_priority = priorities.get(canonical, -1)
+    if current_priority > priority:
+        return
+    if current_priority == priority and output_value_present(named_outputs.get(canonical, {}).get("value")):
+        return
+    record = {
+        "name": canonical,
+        "source_name": str(name or ""),
+        "source": source,
+        "value": value,
+    }
+    record.update({key: val for key, val in metadata.items() if val not in (None, "", [])})
+    named_outputs[canonical] = record
+    priorities[canonical] = priority
+
+
+def canonical_success_evidence(manifest, named_outputs, artifacts, receipt=None, result=None):
+    manifest = manifest if isinstance(manifest, dict) else {}
+    receipt = receipt if isinstance(receipt, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    signals = []
+    failures = []
+
+    def add_status_signal(label, value):
+        status = str(value or "").strip().lower()
+        if not status:
+            return
+        if status in {"done", "success", "succeeded", "passed", "ok", "complete", "completed"}:
+            signals.append({"source": label, "status": status})
+        elif status in {"failed", "error", "cancelled", "canceled", "timeout", "timed_out"}:
+            failures.append({"source": label, "status": status})
+
+    add_status_signal("manifest.status", manifest.get("status"))
+    add_status_signal("manifest.result", manifest.get("result"))
+    summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+    add_status_signal("manifest.summary.status", summary.get("status"))
+    add_status_signal("manifest.summary.result", summary.get("result"))
+    outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    add_status_signal("manifest.outputs.status", outputs.get("status"))
+    add_status_signal("receipt.status", receipt.get("status"))
+    add_status_signal("result.status", result.get("status"))
+
+    for name, output in (named_outputs or {}).items():
+        value = output.get("value") if isinstance(output, dict) else None
+        if looks_like_url(value) and ("url" in name or output.get("value_type") == "url"):
+            signals.append({"source": output.get("source") or name, "output": name, "kind": "url"})
+        if output_file_is_image({}, str(value or ""), str(value or "")):
+            signals.append({"source": output.get("source") or name, "output": name, "kind": "image"})
+    if artifacts:
+        signals.append({"source": "output_artifacts", "count": len(artifacts)})
+    if receipt_successful(receipt):
+        signals.append({"source": "receipt", "status": "success"})
+
+    hard_failures = [item for item in failures if str(item.get("source") or "").startswith("manifest.")]
+    has_success_status = any(item.get("status") in {"done", "success", "succeeded", "passed", "ok", "complete", "completed"} for item in signals)
+    has_business_signal = any(item.get("kind") in {"url", "image"} or item.get("source") == "output_artifacts" for item in signals)
+    return {
+        "passed": (has_success_status or has_business_signal) and not hard_failures,
+        "signals": signals,
+        "failures": failures,
+    }
+
+
+def node_run_canonical_result(sop, node_run_id, node_id, declared_outputs=None, result=None):
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    output_dir = node_run_existing_output_dir(sop, node_run_id)
+    manifest_path = output_dir / "manifest.json"
+    manifest = read_json(manifest_path) or {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+    declared_outputs = declared_outputs if isinstance(declared_outputs, dict) else {}
+    named_outputs = {}
+    priorities = {}
+    artifacts = []
+
+    outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    for name, value in outputs.items():
+        value_type = "url" if looks_like_url(value) else "json" if isinstance(value, (dict, list)) else "text"
+        add_canonical_named_output(
+            named_outputs,
+            priorities,
+            name,
+            value,
+            f"manifest.outputs.{name}",
+            100,
+            value_type=value_type,
+            kind="scalar" if not isinstance(value, (dict, list)) else "structured",
+        )
+
+    summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+    for name, value in summary.items():
+        add_canonical_named_output(
+            named_outputs,
+            priorities,
+            name,
+            value,
+            f"manifest.summary.{name}",
+            70,
+            value_type="url" if looks_like_url(value) else "json" if isinstance(value, (dict, list)) else "text",
+        )
+
+    for record in node_run_output_manifest_records(sop, node_run_id):
+        output_name = manifest_item_output_name(record)
+        if not output_name:
+            continue
+        source = str(record.get("source") or "manifest.items").strip()
+        priority = 20 if source == "node-run-text-evidence" else 80
+        value = output_record_value(record)
+        if value is None and record.get("path"):
+            value = record.get("path")
+        add_canonical_named_output(
+            named_outputs,
+            priorities,
+            output_name,
+            value,
+            source,
+            priority,
+            path=record.get("path") or "",
+            value_type=record.get("value_type") or ("url" if looks_like_url(value) else ""),
+        )
+
+    for item in manifest_output_file_items(manifest):
+        item_path = output_file_item_path(item)
+        public_url = output_file_public_url(item)
+        rel = ""
+        path = None
+        if item_path:
+            path_obj = Path(item_path)
+            if not path_obj.is_absolute() and ".." not in path_obj.parts:
+                rel = item_path if item_path.startswith("raw/") else safe_relative_file(wiki, output_dir / item_path)
+                path = safe_artifact_path(wiki, rel)
+        output_name = manifest_item_output_name(item)
+        is_image = output_file_is_image(item, item_path, public_url)
+        if not output_name:
+            output_name = "generated_images" if is_image else "files"
+        if path and path.is_file():
+            record = artifact_record(sop, node_id, output_name, path, "node-run-output-manifest")
+            if record:
+                record["metadata"] = {
+                    **(record.get("metadata") or {}),
+                    "manifest_item": mask_data(item),
+                    "public_url": public_url,
+                }
+                artifacts.append(record)
+        primary_value = public_url or rel or item_path
+        add_canonical_named_output(
+            named_outputs,
+            priorities,
+            output_name,
+            primary_value,
+            "manifest.output_files",
+            90,
+            path=rel,
+            public_url=public_url,
+            value_type="image" if is_image else ("url" if public_url else "file"),
+        )
+        if is_image:
+            if public_url:
+                add_canonical_named_output(named_outputs, priorities, "public_image_url", public_url, "manifest.output_files.source_url", 95, value_type="url", path=rel)
+                add_canonical_named_output(named_outputs, priorities, "image_url", public_url, "manifest.output_files.source_url", 95, value_type="url", path=rel)
+                add_canonical_named_output(named_outputs, priorities, "generated_images", public_url, "manifest.output_files.source_url", 95, value_type="image", path=rel)
+            if rel:
+                add_canonical_named_output(named_outputs, priorities, "images", rel, "manifest.output_files.path", 90, value_type="image", path=rel)
+
+    if output_dir.exists():
+        for path in sorted(output_dir.rglob("*")):
+            if not path.is_file() or path.name == "manifest.json":
+                continue
+            rel = safe_relative_file(wiki, path)
+            if not rel:
+                continue
+            output_name = "images" if output_file_is_image({}, rel, "") else "files"
+            record = artifact_record(sop, node_id, output_name, path, "node-run-output-dir")
+            if record:
+                artifacts.append(record)
+            add_canonical_named_output(
+                named_outputs,
+                priorities,
+                output_name,
+                rel,
+                "output_directory",
+                50,
+                value_type="image" if output_name == "images" else "file",
+                path=rel,
+            )
+
+    actual_outputs = {}
+    for name, spec in declared_outputs.items():
+        canonical = canonical_output_name(name)
+        record = named_outputs.get(canonical)
+        if not record and canonical == "public_image_url":
+            record = named_outputs.get("public_url") or named_outputs.get("image_url")
+        if not record and canonical == "image_url":
+            record = named_outputs.get("public_image_url") or named_outputs.get("public_url")
+        if not record and canonical == "generated_images":
+            record = named_outputs.get("generated_images") or named_outputs.get("public_image_url") or named_outputs.get("images")
+        if not record and canonical == "images":
+            record = named_outputs.get("images") or named_outputs.get("generated_images")
+        actual_outputs[name] = record.get("value") if isinstance(record, dict) else []
+
+    receipt = read_json(node_run_agent_path(sop, node_run_id, "receipt.json")) or {}
+    success_evidence = canonical_success_evidence(manifest, named_outputs, artifacts, receipt, result)
+    unique_artifacts = []
+    seen_artifacts = set()
+    for artifact in artifacts:
+        key = artifact.get("path") or artifact.get("id")
+        if not key or key in seen_artifacts:
+            continue
+        seen_artifacts.add(key)
+        unique_artifacts.append(artifact)
+
+    return {
+        "schema": "node-run-result/v1",
+        "node_run_id": node_run_id,
+        "node_id": node_id,
+        "status": "succeeded" if success_evidence.get("passed") else "unknown",
+        "success_evidence": success_evidence,
+        "output_space": {
+            "outputs_dir": safe_relative_file(wiki, output_dir),
+            "manifest_path": safe_relative_file(wiki, manifest_path) if manifest_path.exists() else "",
+        },
+        "named_outputs": named_outputs,
+        "actual_outputs": actual_outputs,
+        "artifacts": unique_artifacts,
+        "diagnostics": {
+            "manifest_has_outputs": isinstance(manifest.get("outputs"), dict),
+            "manifest_item_count": len(node_run_output_manifest_items(manifest)),
+            "manifest_output_file_count": len(manifest_output_file_items(manifest)),
+            "declared_output_count": len(declared_outputs),
+        },
+    }
 
 
 def output_name_aliases(name):
@@ -12656,14 +12977,14 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
     )
     static = node_static_config(sop, node_id) or {}
     declared_outputs = normalized_contract(static.get("outputs") or node_state.get("declared_outputs") or {}, "output")
-    manifest = static.get("manifest") if isinstance(static.get("manifest"), dict) else {}
-    raw_manifest_outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
-    expected_output_contract = isinstance(raw_manifest_outputs.get("expected"), dict)
     actual_outputs = {}
     artifacts = []
 
     recorded_outputs = node_state.get("actual_outputs") if isinstance(node_state.get("actual_outputs"), dict) else {}
     manifest_records = node_run_output_manifest_records(sop, node_run_id)
+    node_run_result = node_run_canonical_result(sop, node_run_id, node_id, declared_outputs)
+    canonical_actual_outputs = node_run_result.get("actual_outputs") if isinstance(node_run_result.get("actual_outputs"), dict) else {}
+    canonical_artifacts = node_run_result.get("artifacts") if isinstance(node_run_result.get("artifacts"), list) else []
     for name, spec in declared_outputs.items():
         recorded_value = recorded_outputs.get(name)
         paths = recorded_value
@@ -12682,12 +13003,23 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
             artifacts.extend(records)
             continue
 
+        canonical_value = canonical_actual_outputs.get(name)
+        canonical_record = (node_run_result.get("named_outputs") or {}).get(canonical_output_name(name)) if isinstance(node_run_result.get("named_outputs"), dict) else {}
         manifest_value = node_run_manifest_output_value(manifest_records, name, spec)
         if manifest_value is not None and manifest_value != "" and manifest_value != []:
+            canonical_source = str((canonical_record or {}).get("source") or "")
+            structured_canonical = canonical_source.startswith(("manifest.outputs.", "manifest.output_files", "manifest.summary."))
+            if output_value_present(canonical_value) and structured_canonical:
+                actual_outputs[name] = canonical_value
+                continue
             actual_outputs[name] = manifest_value
             for record in node_run_output_manifest_artifacts(sop, node_run_id, node_id):
                 if record.get("output") == name:
                     artifacts.append(record)
+            continue
+
+        if output_value_present(canonical_value):
+            actual_outputs[name] = canonical_value
             continue
 
         if isinstance(recorded_value, str) and str(spec.get("type") or "").lower() in {"string", "text"}:
@@ -12715,18 +13047,24 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
         manifest_records = node_run_output_manifest_records(sop, node_run_id)
     manifest_artifacts = node_run_output_manifest_artifacts(sop, node_run_id, node_id)
     existing_artifact_paths = {artifact.get("path") for artifact in artifacts if isinstance(artifact, dict)}
+    artifacts.extend([artifact for artifact in canonical_artifacts if artifact.get("path") not in existing_artifact_paths])
+    existing_artifact_paths = {artifact.get("path") for artifact in artifacts if isinstance(artifact, dict)}
     artifacts.extend([artifact for artifact in manifest_artifacts if artifact.get("path") not in existing_artifact_paths])
 
     missing = []
-    for name, value in actual_outputs.items():
-        if value not in (None, "", []):
+    for name, spec in declared_outputs.items():
+        value = actual_outputs.get(name)
+        if output_value_present(value):
             continue
-        spec = declared_outputs.get(name) if isinstance(declared_outputs.get(name), dict) else {}
-        if expected_output_contract and spec.get("required") is not True:
+        spec = spec if isinstance(spec, dict) else {}
+        if spec.get("required") is not True:
             continue
         missing.append(name)
+    node_run_result["actual_outputs"] = actual_outputs
+    node_run_result["artifacts"] = artifacts
     core_outputs = node_run_core_output_rows(sop, node_run_id, node_id, declared_outputs, actual_outputs, artifacts)
     business_status = business_output_status_for(sop, node_id, actual_outputs, declared_outputs, artifacts)
+    success_evidence = node_run_result.get("success_evidence") if isinstance(node_run_result.get("success_evidence"), dict) else {}
     return {
         "declared_outputs": declared_outputs,
         "actual_outputs": actual_outputs,
@@ -12745,8 +13083,10 @@ def collect_real_node_outputs(sop, node_run_id, node_id, run_id):
             "missing_outputs": missing,
             "unexpected_outputs": [],
             "business_output_status": business_status,
+            "success_evidence": success_evidence,
         },
         "business_output_status": business_status,
+        "node_run_result": node_run_result,
         "capabilities": capabilities if isinstance(capabilities, dict) else {},
         "node_state": node_state,
     }
@@ -12920,6 +13260,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         "relay_package": output_info["relay_package"],
         "execution_evidence": output_info["execution_evidence"],
         "output_categories": output_info["output_categories"],
+        "node_run_result": output_info.get("node_run_result") or {},
         "input_directory": output_info["input_directory"],
         "input_manifest": output_info["input_manifest"],
         "output_directory": output_info["output_directory"],
@@ -12956,6 +13297,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             "relay_package": output_info["relay_package"],
             "execution_evidence": output_info["execution_evidence"],
             "output_categories": output_info["output_categories"],
+            "node_run_result": output_info.get("node_run_result") or {},
             "validation": output_info["validation"],
             "business_output_status": business_status,
         },
@@ -13115,6 +13457,7 @@ def build_node_run_result_payload(sop, node_run_id, node_id, body, plan, steps, 
         "relay_package": (real_execution or {}).get("relay_package") or {},
         "execution_evidence": (real_execution or {}).get("execution_evidence") or {},
         "output_categories": (real_execution or {}).get("output_categories") or {},
+        "node_run_result": (real_execution or {}).get("node_run_result") or {},
         "input_directory": (real_execution or {}).get("input_directory") or "",
         "input_manifest": (real_execution or {}).get("input_manifest") or "",
         "output_directory": (real_execution or {}).get("output_directory") or "",
@@ -13504,8 +13847,13 @@ def reconcile_completed_node_run_result(sop, result):
     manifest = read_json(manifest_path) or {}
     evidence_status = str(receipt.get("status") or manifest.get("status") or "").lower()
     evidence_failed = evidence_status in {"failed", "error", "cancelled", "canceled", "timeout", "timed_out"}
-    if current_status == "failed" and (not manifest_path.exists() or (receipt and not receipt_successful(receipt))):
+    declared_outputs = declared_outputs_from_node_run_result(sop, node_id, result)
+    canonical_probe = node_run_canonical_result(sop, node_run_id, node_id, declared_outputs, result) if manifest_path.exists() else {}
+    canonical_success = bool(((canonical_probe.get("success_evidence") or {}) if isinstance(canonical_probe, dict) else {}).get("passed"))
+    if current_status == "failed" and (not manifest_path.exists() or (receipt and not receipt_successful(receipt) and not canonical_success)):
         return result
+    if canonical_success:
+        evidence_failed = False
 
     output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
     actual_outputs = output_info.get("actual_outputs") or {}
@@ -13576,6 +13924,7 @@ def reconcile_completed_node_run_result(sop, result):
         "relay_package": output_info.get("relay_package") or {},
         "execution_evidence": output_info.get("execution_evidence") or {},
         "output_categories": output_info.get("output_categories") or {},
+        "node_run_result": output_info.get("node_run_result") or {},
         "input_directory": output_info.get("input_directory") or "",
         "input_manifest": output_info.get("input_manifest") or "",
         "output_directory": output_info.get("output_directory") or safe_relative_file(Path(sop["wiki_local_path"]).expanduser().resolve(), output_dir),
@@ -13609,6 +13958,7 @@ def reconcile_completed_node_run_result(sop, result):
         "relay_package": real_execution["relay_package"],
         "execution_evidence": real_execution["execution_evidence"],
         "output_categories": real_execution["output_categories"],
+        "node_run_result": real_execution["node_run_result"],
         "output_directory": real_execution["output_directory"],
         "output_manifest": real_execution["output_manifest"],
         "validation": real_execution["validation"],

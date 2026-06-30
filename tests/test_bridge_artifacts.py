@@ -265,6 +265,72 @@ class ArtifactResolutionTest(unittest.TestCase):
             ],
         )
 
+    def test_real_node_outputs_normalize_structured_manifest_and_output_files(self):
+        run_id = "node-run-image-service-test"
+        node_id = "chatgpt-remote-image-service-test"
+        image_url = "https://resource.vyibc.com/example-image.png"
+        task_id = "example-task-id"
+        output_dir = self.wiki / "raw/node-runs" / run_id / "outputs"
+        output_dir.mkdir(parents=True)
+        (output_dir / "generated_image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        (output_dir / "manifest.json").write_text(json.dumps({
+            "version": 1,
+            "kind": "output",
+            "node_run_id": run_id,
+            "node_id": node_id,
+            "outputs": {
+                "status": "succeeded",
+                "taskId": task_id,
+                "publicImageUrl": image_url,
+            },
+            "output_files": [
+                {
+                    "path": "generated_image.png",
+                    "content_type": "image/png",
+                    "source_url": image_url,
+                }
+            ],
+            "items": [
+                {
+                    "output": "public_image_url",
+                    "value": "https://chatgpt.com/c/not-the-image",
+                    "source": "node-run-text-evidence",
+                }
+            ],
+        }), encoding="utf-8")
+        self.sop["nodes"][node_id] = {
+            "title": "Image Service",
+            "outputs": {
+                "result": {"kind": "scalar", "type": "string", "value_type": "text", "relayable": True},
+                "task_id": {"kind": "scalar", "type": "string", "value_type": "text", "relayable": True},
+                "status": {"kind": "scalar", "type": "string", "value_type": "text", "relayable": True},
+                "public_image_url": {"kind": "scalar", "type": "string", "value_type": "url", "relayable": True},
+                "image_url": {"kind": "scalar", "type": "string", "value_type": "url", "relayable": True},
+                "generated_images": {"kind": "scalar", "type": "string", "value_type": "image", "relayable": True},
+                "images": {"kind": "scalar", "type": "string", "value_type": "image", "relayable": True},
+                "submit_json": {"kind": "scalar", "type": "string", "value_type": "json", "relayable": True},
+                "status_json": {"kind": "scalar", "type": "string", "value_type": "json", "relayable": True},
+            },
+        }
+
+        detail = bridge.collect_real_node_outputs(self.sop, run_id, node_id, run_id)
+
+        self.assertEqual(detail["validation"]["status"], "passed")
+        self.assertEqual(detail["validation"]["missing_outputs"], [])
+        self.assertEqual(detail["actual_outputs"]["task_id"], task_id)
+        self.assertEqual(detail["actual_outputs"]["status"], "succeeded")
+        self.assertEqual(detail["actual_outputs"]["public_image_url"], image_url)
+        self.assertEqual(detail["actual_outputs"]["image_url"], image_url)
+        self.assertEqual(detail["actual_outputs"]["generated_images"], image_url)
+        self.assertEqual(detail["actual_outputs"]["images"], f"raw/node-runs/{run_id}/outputs/generated_image.png")
+        self.assertEqual(detail["node_run_result"]["schema"], "node-run-result/v1")
+        self.assertTrue(detail["node_run_result"]["success_evidence"]["passed"])
+        self.assertNotEqual(detail["actual_outputs"]["public_image_url"], "https://chatgpt.com/c/not-the-image")
+        self.assertEqual(
+            [artifact["path"] for artifact in detail["business_artifacts"]],
+            [f"raw/node-runs/{run_id}/outputs/generated_image.png"],
+        )
+
     def _add_deep_research_contract(self):
         self.sop["nodes"]["youtube-deep-research"] = {
             "title": "YouTube Deep Research",
