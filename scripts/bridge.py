@@ -5956,24 +5956,24 @@ def command_exists(command):
 
 def agent_runtime_binary_candidates(runtime_name):
     home = Path.home()
-    candidates = [
-        home / ".local" / "bin" / runtime_name,
-        Path("/usr/local/bin") / runtime_name,
-        Path("/usr/bin") / runtime_name,
-    ]
+    candidates = [home / ".local" / "bin" / runtime_name]
     nvm_root = home / ".nvm" / "versions" / "node"
     if nvm_root.exists():
         candidates.extend(sorted(nvm_root.glob(f"*/bin/{runtime_name}"), reverse=True))
+    candidates.extend([
+        Path("/usr/local/bin") / runtime_name,
+        Path("/usr/bin") / runtime_name,
+    ])
     return candidates
 
 
 def discover_agent_runtime_command(runtime_name):
-    discovered = shutil.which(runtime_name)
-    if discovered:
-        return discovered
     for candidate in agent_runtime_binary_candidates(runtime_name):
         if candidate.exists() and candidate.is_file():
             return str(candidate)
+    discovered = shutil.which(runtime_name)
+    if discovered:
+        return discovered
     return ""
 
 
