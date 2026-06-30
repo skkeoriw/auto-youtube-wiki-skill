@@ -3460,7 +3460,14 @@ def node_builder_env(sop, data):
         env["NODE_BUILDER_LLM_API_KEY"] = str(api_key.get("value"))
     if not is_blank_value(model.get("value")):
         env["NODE_BUILDER_LLM_MODEL"] = str(model.get("value"))
-    env.setdefault("NODE_BUILDER_LLM_TIMEOUT", "75" if data.get("async_job") else "24")
+    if data.get("evaluation_mode") == "contract_review" and (data.get("allow_deterministic") or data.get("allow_fallback")):
+        env["NODE_BUILDER_LLM_TIMEOUT"] = str(
+            data.get("llm_timeout_seconds")
+            or os.environ.get("NODE_BUILDER_CONTRACT_REVIEW_LLM_TIMEOUT")
+            or "10"
+        )
+    else:
+        env.setdefault("NODE_BUILDER_LLM_TIMEOUT", "75" if data.get("async_job") else "24")
     env.setdefault("NODE_BUILDER_LLM_MAX_TOKENS", "4096")
     clamp_int_env(env, "NODE_BUILDER_LLM_MAX_TOKENS", 1024, 8192)
     return env, {

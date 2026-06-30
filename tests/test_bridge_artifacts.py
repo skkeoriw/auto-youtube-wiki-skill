@@ -1853,6 +1853,14 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertIn("public_image_url", captured["observed_outputs"])
         self.assertEqual(captured["probe"]["probe_id"], "probe-1")
 
+    def test_contract_review_uses_short_sync_llm_timeout_when_fallback_allowed(self):
+        with patch.dict(os.environ, {"NODE_BUILDER_CONTRACT_REVIEW_LLM_TIMEOUT": "7"}, clear=False):
+            env, _config = bridge.node_builder_env(self.sop, {
+                "evaluation_mode": "contract_review",
+                "allow_fallback": True,
+            })
+        self.assertEqual(env["NODE_BUILDER_LLM_TIMEOUT"], "7")
+
     def test_node_draft_probe_runs_sort_by_probe_created_at_not_file_mtime(self):
         draft = bridge.create_node_draft(self.sop, {
             "node_draft": {
