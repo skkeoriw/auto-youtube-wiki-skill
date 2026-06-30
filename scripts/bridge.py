@@ -1445,6 +1445,13 @@ def find_control_plane_machine_by_host(host):
     return {}
 
 
+def normalize_private_key_text(value):
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
 def machine_credentials_from_request(merged):
     action = str(merged.get("management_action") or merged.get("action") or "").strip()
     if action not in {"create-runtime", "delete-runtime"}:
@@ -1467,7 +1474,7 @@ def machine_credentials_from_request(merged):
 
     ssh_command = str(machine.get("ssh_command") or machine.get("sshCommand") or merged.get("ssh_command") or "").strip()
     auth_type = str(machine.get("auth_type") or machine.get("authType") or "private_key").strip()
-    private_key = str(machine.get("private_key") or machine.get("privateKey") or "")
+    private_key = normalize_private_key_text(machine.get("private_key") or machine.get("privateKey") or "")
     password = str(machine.get("password") or "")
     resolved = {
         "machine_id": str(machine.get("id") or explicit_machine_id or "").strip(),

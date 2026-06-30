@@ -703,7 +703,7 @@ class ArtifactResolutionTest(unittest.TestCase):
         self.assertEqual(merged["machine_id"], "machine-34")
         self.assertEqual(merged["ssh_command"], "ssh -i ~/.ssh/id_ed25519 runner@34.134.172.74")
         self.assertEqual(merged["target_host"], "34.134.172.74")
-        self.assertEqual(merged["private_key_b64"], "bWFjaGluZS1wcml2YXRlLWtleQ==")
+        self.assertEqual(merged["private_key_b64"], "bWFjaGluZS1wcml2YXRlLWtleQo=")
         self.assertNotEqual(merged.get("private_key"), "stale-management-private-key")
         self.assertNotIn("private_key", merged.get("_management_config_injected", []))
         self.assertIn("private_key_b64", merged.get("_management_config_injected", []))
