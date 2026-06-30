@@ -5928,6 +5928,87 @@ def read_registry():
     return data
 
 
+AGENT_RUNTIME_CHOICES = ("hermes", "openclaw", "codex")
+DEFAULT_ACTIVE_AGENT_RUNTIME = "hermes"
+
+
+def normalize_agent_runtime(value, default=DEFAULT_ACTIVE_AGENT_RUNTIME):
+    text = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "hermes-agent": "hermes",
+        "open-claw": "openclaw",
+        "openclaw-agent": "openclaw",
+        "codex-cli": "codex",
+        "openai-codex": "codex",
+    }
+    text = aliases.get(text, text)
+    return text if text in AGENT_RUNTIME_CHOICES else default
+
+
+def agent_runtime_command(runtime_name):
+    env_key = f"{runtime_name.upper()}_CLI"
+    configured = str(os.environ.get(env_key) or "").strip()
+    if configured:
+        first = shlex.split(configured)[0] if configured else ""
+        if first and (shutil.which(first) or Path(first).expanduser().exists()):
+            return configured
+    if runtime_name == "hermes":
+        configured_hermes = str(os.environ.get("HERMES_CLI") or "").strip()
+        if configured_hermes:
+            first = shlex.split(configured_hermes)[0] if configured_hermes else ""
+            if first and (shutil.which(first) or Path(first).expanduser().exists()):
+                return configured_hermes
+    discovered = shutil.which(runtime_name)
+    if discovered:
+        return discovered
+    if runtime_name == "hermes":
+        local_bin = Path.home() / ".local" / "bin" / "hermes"
+        if local_bin.exists():
+            return str(local_bin)
+    return ""
+
+
+def agent_runtime_skill_dirs(runtime_name):
+    home = Path.home()
+    if runtime_name == "hermes":
+        return [home / ".hermes" / "skills" / "devops", home / ".hermes" / "skills"]
+    if runtime_name == "codex":
+        return [home / ".codex" / "skills"]
+    if runtime_name == "openclaw":
+        return [home / ".openclaw" / "workspace" / "skills", home / ".openclaw" / "skills"]
+    return [home / f".{runtime_name}" / "skills"]
+
+
+def agent_runtime_skill_dir_status(runtime_name):
+    first_missing = ""
+    for directory in agent_runtime_skill_dirs(runtime_name):
+        if not first_missing:
+            first_missing = str(directory)
+        if directory.exists():
+            writable = os.access(str(directory), os.W_OK)
+            return {"status": "writable" if writable else "readonly", "path": str(directory), "writable": writable}
+    return {"status": "missing", "path": first_missing, "writable": False}
+
+
+def agent_runtime_summary(runtime_name):
+    runtime_name = normalize_agent_runtime(runtime_name)
+    command = agent_runtime_command(runtime_name)
+    skill_dir = agent_runtime_skill_dir_status(runtime_name)
+    return {
+        "id": runtime_name,
+        "enabled": bool(command),
+        "command": command,
+        "command_status": "present" if command else "missing",
+        "skill_dir": skill_dir,
+        "auth_mode": "manual" if runtime_name == "codex" else "managed" if runtime_name == "hermes" else "managed_or_external",
+        "auth_status": "not_checked",
+    }
+
+
+def runtime_agent_runtimes_summary():
+    return {runtime_name: agent_runtime_summary(runtime_name) for runtime_name in AGENT_RUNTIME_CHOICES}
+
+
 def scanned_sops():
     sops = []
     for sop_file in sorted(wiki_base().glob("*/sop.yaml")):
@@ -5999,6 +6080,11 @@ def sop_from_instance(runtime, instance):
                 previous = node_id
     instance_id = instance.get("instance_id") or wiki_path.name
     instance_title = instance.get("display_name") or instance.get("title") or instance_id
+    active_agent_runtime = normalize_agent_runtime(
+        instance.get("active_agent_runtime")
+        or instance.get("agent_runtime")
+        or sop.get("active_agent_runtime")
+    )
     return {
         "id": instance_id,
         "instance_id": instance_id,
@@ -6008,6 +6094,8 @@ def sop_from_instance(runtime, instance):
         "name": sop.get("name", instance_id),
         "title": instance_title,
         "workflow_title": sop.get("title", sop.get("name", "")),
+        "active_agent_runtime": active_agent_runtime,
+        "agent_runtime": active_agent_runtime,
         "version": sop.get("version", ""),
         "repo": instance.get("repo") or sop.get("repo", ""),
         "wiki_dir": wiki_path.name,
@@ -6154,6 +6242,7 @@ def runtime_info():
         "spi_base_url": spi_base_url,
         "status": "online",
         "supported_sop_types": sorted({sop.get("sop_type", "") for sop in sops if sop.get("sop_type")}),
+        "agent_runtimes": runtime_agent_runtimes_summary(),
         "instance_count": len(sops),
         "registry_path": str(REGISTRY_PATH),
         "created_at": registry.get("created_at", ""),
@@ -6714,6 +6803,7 @@ def instance_summary(sop, include_latest=True):
         run_index_path = str(store.db_path)
         run_index_status = "ready" if store.db_path.exists() else "missing"
     workspace = Path(sop["wiki_local_path"])
+    active_agent_runtime = normalize_agent_runtime(sop.get("active_agent_runtime") or sop.get("agent_runtime"))
     return {
         "id": sop_id,
         "instance_id": instance_id,
@@ -6723,6 +6813,9 @@ def instance_summary(sop, include_latest=True):
         "description": sop.get("description", ""),
         "sop_type": sop.get("sop_type", ""),
         "workspace_kind": sop.get("workspace_kind", ""),
+        "active_agent_runtime": active_agent_runtime,
+        "agent_runtime": active_agent_runtime,
+        "agent_runtime_status": agent_runtime_summary(active_agent_runtime),
         "enabled": bool(sop.get("enabled", True)),
         "repo": sop.get("repo", ""),
         "repo_branch": sop.get("repo_branch", "main"),
@@ -6785,10 +6878,12 @@ def latest_execution_for_instance(sop):
 def instance_capabilities(sop):
     workspace = Path(sop["wiki_local_path"])
     store = run_index_store(sop)
+    active_agent_runtime = normalize_agent_runtime(sop.get("active_agent_runtime") or sop.get("agent_runtime"))
     return {
         "workspace": "ok" if workspace.exists() else "missing",
         "sop_yaml": "ok" if Path(sop.get("sop_file", "")).exists() else "unbound",
         "run_index": "ok" if store and store.db_path.exists() else "missing",
+        "agent_runtime": agent_runtime_summary(active_agent_runtime),
         "git": "configured" if sop.get("repo") else "missing",
         "telegram": "configured" if os.environ.get("YOUTUBE_WIKI_TG_TOKEN") else "unknown",
         "notebooklm": "configured" if os.environ.get("NOTEBOOKLM_BRIDGE_URL") else "unknown",
@@ -7683,7 +7778,7 @@ def node_run_skill_name(sop, node_id, plan=None):
 
 def node_run_executor_kind(sop, node_id, plan=None):
     override = str(os.environ.get("NODE_RUN_AGENT_EXECUTOR") or "").strip().lower()
-    if override in {"hermes", "legacy-shell"}:
+    if override in {"hermes", "openclaw", "codex", "legacy-shell"}:
         return override
     plan = plan if isinstance(plan, dict) else {}
     node_cfg = (sop.get("nodes") or {}).get(node_id) if isinstance(sop.get("nodes"), dict) else {}
@@ -7697,11 +7792,16 @@ def node_run_executor_kind(sop, node_id, plan=None):
         executor.update(source or {})
     executor_type = str(executor.get("type") or "").strip().lower()
     agent = str(executor.get("agent") or "").strip().lower()
+    raw_runtime = str(executor.get("runtime") or executor.get("agent_runtime") or "").strip().lower()
     if executor_type in {"direct-skill", "legacy-shell", "shell"}:
         return "legacy-shell"
-    if executor_type in {"agent-skill", "skill"} or agent == "hermes":
-        return "hermes"
-    return "hermes"
+    if raw_runtime and raw_runtime != "inherit":
+        return normalize_agent_runtime(raw_runtime)
+    if agent in AGENT_RUNTIME_CHOICES:
+        return normalize_agent_runtime(agent)
+    if executor_type in {"agent-runtime", "agent-skill", "skill"}:
+        return normalize_agent_runtime(sop.get("active_agent_runtime") or sop.get("agent_runtime"))
+    return normalize_agent_runtime(sop.get("active_agent_runtime") or sop.get("agent_runtime"))
 
 
 def node_run_command_preview(command):
@@ -7811,7 +7911,8 @@ def render_node_run_agent_request(sop, node_run_id, node_id, plan, context, stag
         "instance_id": values["instance_id"],
         "workflow_id": values["workflow_id"],
         "template_source": "env:NODE_RUN_AGENT_REQUEST_TEMPLATE" if os.environ.get("NODE_RUN_AGENT_REQUEST_TEMPLATE", "").strip() else "default",
-        "template_version": "hermes-agent-executor.v1",
+        "template_version": "agent-runtime-executor.v1",
+        "selected_agent_runtime": executor_kind,
         "request_path": safe_relative_file(wiki, request_path),
         "response_path": safe_relative_file(wiki, response_path),
         "receipt_path": safe_relative_file(wiki, receipt_path),
@@ -7957,6 +8058,37 @@ def hermes_agent_command_args(skill_name, request_text):
         return []
     base = shlex.split(command) if any(ch.isspace() for ch in command) else [command]
     return base + ["-s", skill_name, "-z", request_text]
+
+
+def codex_agent_command_args(_skill_name, request_text):
+    command = agent_runtime_command("codex")
+    if not command:
+        return []
+    base = shlex.split(command) if any(ch.isspace() for ch in command) else [command]
+    return base + ["exec", "--skip-git-repo-check", request_text]
+
+
+def openclaw_agent_command_args(skill_name, request_text):
+    template = str(os.environ.get("OPENCLAW_NODE_RUN_COMMAND_TEMPLATE") or "").strip()
+    if not template:
+        return []
+    rendered = (
+        template
+        .replace("{{skill}}", shlex.quote(str(skill_name or "")))
+        .replace("{{request}}", shlex.quote(str(request_text or "")))
+    )
+    return ["bash", "-lc", rendered]
+
+
+def agent_runtime_command_args(runtime_name, skill_name, request_text):
+    runtime_name = normalize_agent_runtime(runtime_name)
+    if runtime_name == "hermes":
+        return hermes_agent_command_args(skill_name, request_text)
+    if runtime_name == "codex":
+        return codex_agent_command_args(skill_name, request_text)
+    if runtime_name == "openclaw":
+        return openclaw_agent_command_args(skill_name, request_text)
+    return []
 
 
 def wait_for_real_node_completion(sop, node_run_id, node_id, timeout_seconds, started_at):
@@ -13198,13 +13330,15 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             )
         else:
             request_text = agent_request.get("rendered_request") or node_run_agent_path(sop, node_run_id, "request.md").read_text(encoding="utf-8")
-            hermes_args = hermes_agent_command_args(skill_name, request_text)
-            if not hermes_args:
-                raise RuntimeError("Hermes CLI is not installed or is not on PATH for this Runtime")
-            command_for_detail = hermes_args[:]
+            agent_args = agent_runtime_command_args(executor_kind, skill_name, request_text)
+            if not agent_args:
+                if executor_kind == "openclaw":
+                    raise RuntimeError("OpenClaw node-run command is not configured. Set OPENCLAW_NODE_RUN_COMMAND_TEMPLATE for this Runtime.")
+                raise RuntimeError(f"{executor_kind} CLI is not installed or is not on PATH for this Runtime")
+            command_for_detail = agent_args[:]
             command_for_detail[-1] = "<request.md>"
             completed = subprocess.run(
-                hermes_args,
+                agent_args,
                 cwd=str(wiki),
                 env=env,
                 capture_output=True,
@@ -13221,7 +13355,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
             )
         except OSError:
             pass
-        if executor_kind == "hermes" and returncode == 0:
+        if executor_kind in AGENT_RUNTIME_CHOICES and returncode == 0:
             wait_for_real_node_completion(sop, node_run_id, node_id, min(timeout, 300), started)
     except subprocess.TimeoutExpired as exc:
         timed_out = True
@@ -13263,6 +13397,7 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
     receipt = {
         "version": 1,
         "executor": executor_kind,
+        "selected_agent_runtime": executor_kind if executor_kind != "legacy-shell" else "",
         "requested_skill": agent_request.get("requested_skill") or node_run_skill_name(sop, node_id, plan),
         "executed_skill": agent_request.get("requested_skill") or node_run_skill_name(sop, node_id, plan),
         "node_id": node_id,
