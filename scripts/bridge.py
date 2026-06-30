@@ -2221,6 +2221,7 @@ def node_runtime_detail(sop, pipeline_id, node_id):
                     "report_detail": detail.get("report_detail"),
                     "report_reason": detail.get("report_reason"),
                     "report_manual_fix_hint": detail.get("report_manual_fix_hint"),
+                    "manual_fix_hint": indexed.get("manual_fix_hint") or detail.get("manual_fix_hint") or detail.get("report_manual_fix_hint") or "",
                     "index_resolution": "indexed",
                 })
         except Exception:
@@ -7451,6 +7452,7 @@ def run_summary(sop, run):
             "progress": int(state.get("progress") or (100 if state.get("status") in {"done", "skipped"} else 0)),
             "artifact_count": len(state.get("artifacts") or []),
             "error": state.get("error") or "",
+            "manual_fix_hint": state.get("manual_fix_hint") or "",
         }
     duration_s = sum(int(state.get("duration_s") or 0) for state in node_details)
     if not duration_s:
