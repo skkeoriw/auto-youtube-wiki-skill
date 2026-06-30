@@ -5945,26 +5945,51 @@ def normalize_agent_runtime(value, default=DEFAULT_ACTIVE_AGENT_RUNTIME):
     return text if text in AGENT_RUNTIME_CHOICES else default
 
 
+def command_exists(command):
+    if not command:
+        return False
+    return bool(shutil.which(command) or Path(command).expanduser().exists())
+
+
+def agent_runtime_binary_candidates(runtime_name):
+    home = Path.home()
+    candidates = [
+        home / ".local" / "bin" / runtime_name,
+        Path("/usr/local/bin") / runtime_name,
+        Path("/usr/bin") / runtime_name,
+    ]
+    nvm_root = home / ".nvm" / "versions" / "node"
+    if nvm_root.exists():
+        candidates.extend(sorted(nvm_root.glob(f"*/bin/{runtime_name}"), reverse=True))
+    return candidates
+
+
+def discover_agent_runtime_command(runtime_name):
+    discovered = shutil.which(runtime_name)
+    if discovered:
+        return discovered
+    for candidate in agent_runtime_binary_candidates(runtime_name):
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return ""
+
+
 def agent_runtime_command(runtime_name):
     env_key = f"{runtime_name.upper()}_CLI"
     configured = str(os.environ.get(env_key) or "").strip()
     if configured:
         first = shlex.split(configured)[0] if configured else ""
-        if first and (shutil.which(first) or Path(first).expanduser().exists()):
+        if command_exists(first):
             return configured
     if runtime_name == "hermes":
         configured_hermes = str(os.environ.get("HERMES_CLI") or "").strip()
         if configured_hermes:
             first = shlex.split(configured_hermes)[0] if configured_hermes else ""
-            if first and (shutil.which(first) or Path(first).expanduser().exists()):
+            if command_exists(first):
                 return configured_hermes
-    discovered = shutil.which(runtime_name)
+    discovered = discover_agent_runtime_command(runtime_name)
     if discovered:
         return discovered
-    if runtime_name == "hermes":
-        local_bin = Path.home() / ".local" / "bin" / "hermes"
-        if local_bin.exists():
-            return str(local_bin)
     return ""
 
 
