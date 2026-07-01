@@ -4651,6 +4651,19 @@ def publish_node_draft_to_runtime(sop, draft_id, data=None):
         "contract_synthesis_status": synthesis.get("status") or "",
         "published_at": datetime.now(timezone.utc).isoformat(),
     }
+    latest_probe_result = latest_probe.get("result") if isinstance(latest_probe.get("result"), dict) else {}
+    node_to_write["examples"] = {
+        "source": "node-builder-probe",
+        "draft_id": draft_id,
+        "probe_id": latest_probe.get("probe_id") or synthesis.get("probe_id") or "",
+        "node_run_id": latest_probe.get("node_run_id") or synthesis.get("node_run_id") or "",
+        "manual_inputs": latest_probe.get("manual_inputs") if isinstance(latest_probe.get("manual_inputs"), dict) else {},
+        "status": latest_probe.get("status") or "",
+        "output_manifest": latest_probe.get("output_manifest") or latest_probe_result.get("output_manifest") or "",
+        "actual_outputs": latest_probe.get("actual_outputs") if isinstance(latest_probe.get("actual_outputs"), dict) else {},
+        "business_outputs": latest_probe.get("business_outputs") if isinstance(latest_probe.get("business_outputs"), dict) else {},
+        "business_output_status": latest_probe.get("business_output_status") if isinstance(latest_probe.get("business_output_status"), dict) else {},
+    }
     (target_dir / "node.yaml").write_text(yaml.safe_dump(node_to_write, allow_unicode=True, sort_keys=False), encoding="utf-8")
     _SOP_READ_CACHE.clear()
     visible = node_registry_item(sop, node_id) is not None
@@ -14412,6 +14425,18 @@ def a2a_data_part(data, filename="data.json"):
     }
 
 
+def a2a_url_part(url, media_type="", filename=""):
+    url = str(url or "")
+    return {
+        "content": {"$case": "url", "value": url},
+        "url": url,
+        "mediaType": media_type or "",
+        "media_type": media_type or "",
+        "filename": filename or "",
+        "metadata": {},
+    }
+
+
 def a2a_message(role, text, task_id="", context_id=""):
     digest = hashlib.sha1(f"{task_id}:{context_id}:{role}:{text}".encode("utf-8")).hexdigest()[:10]
     return {
@@ -14500,6 +14525,16 @@ def a2a_extract_message(payload):
     if not message and isinstance(payload.get("params"), dict):
         message = payload["params"].get("message") if isinstance(payload["params"].get("message"), dict) else {}
     return message
+
+
+def a2a_payload_metadata(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    message = a2a_extract_message(payload)
+    merged = {}
+    for candidate in (payload.get("metadata"), message.get("metadata")):
+        if isinstance(candidate, dict):
+            merged.update(candidate)
+    return merged
 
 
 def a2a_part_text(part):
@@ -14724,7 +14759,7 @@ def run_a2a_instance_task(sop, request):
 
 def a2a_node_manual_inputs(sop, node_id, payload):
     payload = payload if isinstance(payload, dict) else {}
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    metadata = a2a_payload_metadata(payload)
     for candidate in (payload.get("manual_inputs"), metadata.get("manual_inputs")):
         if isinstance(candidate, dict) and candidate:
             return candidate
@@ -14741,6 +14776,66 @@ def a2a_node_manual_inputs(sop, node_id, payload):
     if "instruction" in entry_inputs:
         return {"instruction": text}
     return {"prompt": text}
+
+
+def a2a_node_explicit_manual_inputs(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    metadata = a2a_payload_metadata(payload)
+    for candidate in (payload.get("manual_inputs"), metadata.get("manual_inputs")):
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
+def a2a_node_relay_metadata(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    metadata = a2a_payload_metadata(payload)
+    source_node_run_id = sanitize_node_run_id(
+        payload.get("source_node_run_id")
+        or payload.get("sourceNodeRunId")
+        or payload.get("from_node_run_id")
+        or metadata.get("source_node_run_id")
+        or metadata.get("sourceNodeRunId")
+        or metadata.get("from_node_run_id")
+        or ""
+    )
+    relay_mode = (
+        payload.get("relay_mode")
+        or payload.get("relayMode")
+        or metadata.get("relay_mode")
+        or metadata.get("relayMode")
+        or ""
+    )
+    selected_outputs = (
+        payload.get("selected_outputs")
+        or payload.get("selectedOutputs")
+        or metadata.get("selected_outputs")
+        or metadata.get("selectedOutputs")
+        or []
+    )
+    relay_mappings = (
+        payload.get("relay_mappings")
+        or payload.get("relayMappings")
+        or metadata.get("relay_mappings")
+        or metadata.get("relayMappings")
+        or []
+    )
+    relay_instruction = str(
+        payload.get("relay_instruction")
+        or payload.get("relayInstruction")
+        or metadata.get("relay_instruction")
+        or metadata.get("relayInstruction")
+        or metadata.get("handoff_instruction")
+        or ""
+    ).strip()
+    return {
+        "source_node_run_id": source_node_run_id,
+        "relay_mode": relay_mode,
+        "selected_outputs": selected_outputs,
+        "relay_mappings": relay_mappings,
+        "relay_instruction": relay_instruction,
+        "metadata": metadata,
+    }
 
 
 def write_a2a_smoke_node_run(sop, node_id, payload):
@@ -14922,18 +15017,26 @@ def run_a2a_node_task(sop, node_id, request):
             f"Node {node_id!r} not found.",
             metadata={"node_id": node_id},
         )
-    manual_inputs = a2a_node_manual_inputs(sop, node_id, payload)
+    relay = a2a_node_relay_metadata(payload)
+    source_node_run_id = relay.get("source_node_run_id") or ""
+    manual_inputs = a2a_node_explicit_manual_inputs(payload) if source_node_run_id else a2a_node_manual_inputs(sop, node_id, payload)
     configuration = payload.get("configuration") if isinstance(payload.get("configuration"), dict) else {}
     return_immediately = bool(configuration.get("returnImmediately") or configuration.get("return_immediately"))
     body = {
         "mode": "real-node",
-        "input_source": "manual",
+        "input_source": "existing-node-run" if source_node_run_id else "manual",
         "manual_inputs": manual_inputs,
+        "source_node_run_id": source_node_run_id,
+        "relay_mode": relay.get("relay_mode") or "",
+        "selected_outputs": relay.get("selected_outputs") or [],
+        "relay_mappings": relay.get("relay_mappings") or [],
+        "relay_instruction": relay.get("relay_instruction") or "",
         "sync": not return_immediately,
         "a2a": {
             "protocol_version": A2A_PROTOCOL_VERSION,
             "message": a2a_extract_message(payload),
-            "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+            "metadata": relay.get("metadata") or {},
+            "relay": {key: value for key, value in relay.items() if key != "metadata"},
         },
     }
     http_code, result = create_node_run(sop, workflow_id_for_sop(sop), node_id, body)
@@ -14952,6 +15055,202 @@ def handle_a2a_node_rpc(sop, node_id, request):
         return 400, a2a_rpc_response(request, error={"code": -32601, "message": f"Unsupported A2A method: {a2a_method(request)}"})
     http_code, task = run_a2a_node_task(sop, node_id, request)
     return (200 if http_code < 500 else http_code), a2a_rpc_response(request, task)
+
+
+def a2a_node_run_item_part(wiki, item):
+    item = item if isinstance(item, dict) else {}
+    source_rel = str(item.get("source_path") or item.get("path") or "").strip()
+    filename = Path(source_rel).name if source_rel else str(item.get("output") or "artifact")
+    media_type = str(item.get("media_type") or item.get("mime_type") or "").strip()
+    value = item.get("value") or item.get("resolved_value") or item.get("source_url") or item.get("url")
+    if isinstance(value, str) and value.startswith(("http://", "https://")):
+        return a2a_url_part(value, media_type, filename)
+    source_file = safe_artifact_path(wiki, source_rel) if source_rel else None
+    if source_file and source_file.is_file() and source_file.stat().st_size <= 12000:
+        suffix = source_file.suffix.lower()
+        if suffix in {".md", ".txt", ".json", ".csv", ".yaml", ".yml"}:
+            media_type = media_type or {
+                ".md": "text/markdown",
+                ".txt": "text/plain",
+                ".json": "application/json",
+                ".csv": "text/csv",
+                ".yaml": "text/yaml",
+                ".yml": "text/yaml",
+            }.get(suffix, "text/plain")
+            try:
+                return a2a_text_part(source_file.read_text(encoding="utf-8"), media_type, filename)
+            except Exception:
+                pass
+    return a2a_data_part({
+        "kind": "node-run-output-ref",
+        "output": item.get("output") or item.get("source_output") or "",
+        "source_path": source_rel,
+        "value_type": item.get("value_type") or item.get("valueType") or "",
+        "source_node": item.get("source_node") or "",
+        "source_run_id": item.get("source_run_id") or "",
+    }, filename or "node-run-output-ref.json")
+
+
+def edge_by_id(sop, edge_id):
+    edge_id = str(edge_id or "").strip()
+    if not edge_id:
+        return {}
+    for edge in workflow_edge_rows(sop):
+        if str(edge.get("id") or "").strip() == edge_id:
+            return edge
+    return {}
+
+
+def run_workflow_edge_a2a_handoff(sop, workflow_id, data):
+    data = data if isinstance(data, dict) else {}
+    source_node_run_id = sanitize_node_run_id(
+        data.get("source_node_run_id")
+        or data.get("sourceNodeRunId")
+        or data.get("from_node_run_id")
+        or data.get("node_run_id")
+        or ""
+    )
+    if not source_node_run_id:
+        return 422, {
+            "status": "failed",
+            "reason": "source_node_run_id is required for Edge A2A handoff",
+            "mode": "edge-a2a-handoff",
+        }
+
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    source_items = node_run_source_manifest_items(sop, source_node_run_id)
+    source_node = str(
+        data.get("source_node_id")
+        or data.get("upstream_node_id")
+        or next((item.get("source_node") for item in source_items if item.get("source_node")), "")
+        or ""
+    ).strip()
+    edge = data.get("edge") if isinstance(data.get("edge"), dict) else {}
+    if not edge:
+        edge = edge_by_id(sop, data.get("edge_id") or "")
+    target_node = str(
+        data.get("target_node_id")
+        or data.get("downstream_node_id")
+        or data.get("node_id")
+        or edge.get("to")
+        or edge.get("target")
+        or ""
+    ).strip()
+    if not edge and source_node and target_node:
+        edge = workflow_edge_contract(sop, source_node, target_node)
+    if not target_node and edge:
+        target_node = str(edge.get("to") or edge.get("target") or "").strip()
+    if not target_node:
+        return 422, {
+            "status": "failed",
+            "reason": "target_node_id or edge.to is required for Edge A2A handoff",
+            "mode": "edge-a2a-handoff",
+            "source_node_run_id": source_node_run_id,
+            "source_node": source_node,
+        }
+    if node_registry_item(sop, target_node) is None:
+        return 404, {
+            "status": "failed",
+            "reason": f"Target node {target_node!r} was not found",
+            "mode": "edge-a2a-handoff",
+            "target_node_id": target_node,
+        }
+
+    instruction = workflow_edge_instruction_text(data, edge) or str(data.get("instruction") or "").strip()
+    if not instruction:
+        instruction = f"Consume upstream Node Run {source_node_run_id} outputs and execute {target_node}."
+    relay_mappings = (
+        data.get("relay_mappings")
+        or data.get("relayMappings")
+        or edge_contract_relay_mappings(sop, edge)
+        or []
+    )
+    relay_mode = data.get("relay_mode") or data.get("relayMode") or ("selected_outputs" if relay_mappings else "auto_by_target_inputs")
+    selected_outputs = data.get("selected_outputs") or data.get("selectedOutputs") or [
+        item.get("source_output") for item in relay_mappings if isinstance(item, dict) and item.get("source_output")
+    ]
+    output_dir = node_run_existing_output_dir(sop, source_node_run_id)
+    output_manifest = safe_relative_file(wiki, output_dir / "manifest.json")
+    parts = [
+        a2a_text_part(instruction, "text/plain", "handoff-instruction.txt"),
+        a2a_data_part({
+            "kind": "sop-edge-a2a-handoff/v1",
+            "workflow_id": workflow_id,
+            "source_node_run_id": source_node_run_id,
+            "source_node": source_node,
+            "target_node": target_node,
+            "output_manifest": output_manifest,
+            "edge_contract": public_edge_contract(edge),
+            "relay_mode": relay_mode,
+            "selected_outputs": selected_outputs,
+            "relay_mappings": relay_mappings,
+            "items": source_items,
+        }, "edge-handoff.json"),
+    ]
+    for item in source_items[:12]:
+        parts.append(a2a_node_run_item_part(wiki, item))
+    context_id = str(data.get("context_id") or data.get("contextId") or f"ctx-edge-{hashlib.sha1(source_node_run_id.encode('utf-8')).hexdigest()[:8]}")
+    message_id = f"msg-edge-{hashlib.sha1(json.dumps({'source': source_node_run_id, 'target': target_node}, sort_keys=True).encode('utf-8')).hexdigest()[:10]}"
+    request_id = str(data.get("request_id") or f"sop-edge-a2a-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+    request = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "messageId": message_id,
+                "message_id": message_id,
+                "contextId": context_id,
+                "context_id": context_id,
+                "role": "user",
+                "parts": parts,
+                "metadata": {
+                    "source": "sop-edge-a2a-handoff",
+                    "source_node_run_id": source_node_run_id,
+                    "source_node": source_node,
+                    "target_node": target_node,
+                },
+                "extensions": [],
+                "referenceTaskIds": [],
+            },
+            "configuration": {
+                "acceptedOutputModes": ["text/plain", "text/markdown", "application/json"],
+                "returnImmediately": bool(data.get("return_immediately") or data.get("returnImmediately")),
+            },
+            "metadata": {
+                "source": "sop-edge-a2a-handoff",
+                "workflow_id": workflow_id,
+                "edge_id": edge.get("id") or data.get("edge_id") or "",
+                "source_node_run_id": source_node_run_id,
+                "source_node": source_node,
+                "target_node": target_node,
+                "relay_mode": relay_mode,
+                "selected_outputs": selected_outputs,
+                "relay_mappings": relay_mappings,
+                "relay_instruction": instruction,
+                "edge_contract": public_edge_contract(edge),
+            },
+        },
+    }
+    status, response = handle_a2a_node_rpc(sop, target_node, request)
+    task = response.get("result") if isinstance(response, dict) and isinstance(response.get("result"), dict) else response if isinstance(response, dict) else {}
+    task_status = ((task.get("status") or {}) if isinstance(task, dict) else {}).get("state") if isinstance((task.get("status") or {}) if isinstance(task, dict) else {}, dict) else ""
+    result = {
+        "status": "passed" if status < 400 and task_status in {"completed", "working"} else "failed",
+        "mode": "edge-a2a-handoff",
+        "workflow_id": workflow_id,
+        "edge": public_edge_contract(edge),
+        "source_node": source_node,
+        "target_node": target_node,
+        "source_node_run_id": source_node_run_id,
+        "target_node_run_id": ((task.get("metadata") or {}) if isinstance(task, dict) else {}).get("node_run_id") or "",
+        "a2a_request": mask_data(request),
+        "a2a_response": mask_data(response),
+        "task": mask_data(task),
+        "message_part_count": len(parts),
+        "source_item_count": len(source_items),
+    }
+    return status, result
 
 
 def trigger_node_test(sop, node_id, body):
@@ -16019,6 +16318,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sop:
                 return json_response(self, 404, {"detail": "SOP not found"})
             http_code, result = simulate_workflow_edge_handoff(sop, path[4], data)
+            return json_response(self, http_code, result)
+
+        # POST /api/sop/{instance}/workflows/{workflow_id}/edges/run-a2a
+        if (len(path) == 7 and path[:2] == ["api", "sop"]
+                and path[3] == "workflows" and path[5] == "edges" and path[6] == "run-a2a"):
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "SOP not found"})
+            http_code, result = run_workflow_edge_a2a_handoff(sop, path[4], data)
             return json_response(self, http_code, result)
 
         # POST /api/sop/{instance}/workflows/{workflow_id}/drafts  → save full Workflow Draft
