@@ -15148,7 +15148,7 @@ def run_workflow_edge_a2a_handoff(sop, workflow_id, data):
             "source_node_run_id": source_node_run_id,
             "source_node": source_node,
         }
-    if node_registry_item(sop, target_node) is None:
+    if target_node != A2A_SMOKE_NODE_ID and node_registry_item(sop, target_node) is None:
         return 404, {
             "status": "failed",
             "reason": f"Target node {target_node!r} was not found",
