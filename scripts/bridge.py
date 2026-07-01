@@ -15243,6 +15243,15 @@ def run_workflow_edge_a2a_handoff(sop, workflow_id, data):
     context_id = str(data.get("context_id") or data.get("contextId") or f"ctx-edge-{hashlib.sha1(source_node_run_id.encode('utf-8')).hexdigest()[:8]}")
     message_id = f"msg-edge-{hashlib.sha1(json.dumps({'source': source_node_run_id, 'target': target_node}, sort_keys=True).encode('utf-8')).hexdigest()[:10]}"
     request_id = str(data.get("request_id") or f"sop-edge-a2a-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+    wait_for_completion = bool(
+        data.get("sync")
+        or data.get("wait_for_completion")
+        or data.get("waitForCompletion")
+    )
+    if "return_immediately" in data or "returnImmediately" in data:
+        return_immediately = bool(data.get("return_immediately") or data.get("returnImmediately"))
+    else:
+        return_immediately = not wait_for_completion
     request = {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -15266,7 +15275,7 @@ def run_workflow_edge_a2a_handoff(sop, workflow_id, data):
             },
             "configuration": {
                 "acceptedOutputModes": ["text/plain", "text/markdown", "application/json"],
-                "returnImmediately": bool(data.get("return_immediately") or data.get("returnImmediately")),
+                "returnImmediately": return_immediately,
             },
             "metadata": {
                 "source": "sop-edge-a2a-handoff",
@@ -15300,6 +15309,7 @@ def run_workflow_edge_a2a_handoff(sop, workflow_id, data):
         "task": mask_data(task),
         "message_part_count": len(parts),
         "source_item_count": len(source_items),
+        "return_immediately": return_immediately,
     }
     return status, result
 
