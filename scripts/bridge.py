@@ -8152,7 +8152,7 @@ def codex_agent_command_args(_skill_name, request_text):
     if not command:
         return []
     base = shlex.split(command) if any(ch.isspace() for ch in command) else [command]
-    return base + ["exec", "--skip-git-repo-check", request_text]
+    return base + ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write", request_text]
 
 
 def openclaw_agent_command_args(skill_name, request_text):
