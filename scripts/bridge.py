@@ -3981,6 +3981,11 @@ def business_output_status_for(sop, node_id, actual_outputs, declared_outputs=No
     }
 
 
+def business_output_status_allows_success(business_status):
+    business_status = business_status if isinstance(business_status, dict) else {}
+    return str(business_status.get("status") or "") in {"passed", "no_declared_business_outputs"}
+
+
 def node_draft_probe_status_from_result(sop, node_id, result):
     result = result if isinstance(result, dict) else {}
     run_status = str(result.get("status") or "").lower()
@@ -12615,6 +12620,24 @@ def hydrate_node_run_result_views(sop, result):
                 **result["validation"],
                 "business_output_status": business_status,
             }
+    elif str(result.get("status") or "") == "done" and not business_output_status_allows_success(business_status):
+        result["status"] = "failed"
+        result["reason"] = "Declared business outputs are missing."
+        result["validation"] = {
+            **result["validation"],
+            "status": "failed",
+            "business_output_status": business_status,
+        }
+        for step in steps:
+            if not isinstance(step, dict) or step.get("id") != "validate-outputs":
+                continue
+            step["status"] = "failed"
+            step["summary"] = "Declared business outputs are missing."
+            step["detail"] = {
+                **(step.get("detail") if isinstance(step.get("detail"), dict) else {}),
+                **result["validation"],
+                "business_output_status": business_status,
+            }
     result["relay_package"] = node_run_relay_package(sop, node_run_id, node_id)
     result["execution_evidence"] = node_run_execution_evidence(sop, node_run_id, node_id, artifacts)
     return result
@@ -13476,8 +13499,12 @@ def execute_real_node_run(sop, node_run_id, node_id, plan):
         pass
 
     output_info = collect_real_node_outputs(sop, node_run_id, node_id, node_run_id)
-    execution_ok = returncode == 0 and output_info["validation"].get("status") == "passed"
     business_status = output_info.get("business_output_status") if isinstance(output_info.get("business_output_status"), dict) else {}
+    execution_ok = (
+        returncode == 0
+        and output_info["validation"].get("status") == "passed"
+        and business_output_status_allows_success(business_status)
+    )
     status = "done" if execution_ok else "failed"
     summary = (
         "Real node execution finished and declared business outputs were found."
