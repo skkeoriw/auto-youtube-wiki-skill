@@ -126,6 +126,108 @@ class ArtifactResolutionTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def _start_bridge_server(self):
+        patcher = patch.object(bridge, "find_sop", lambda sop_id: self.sop if sop_id == "test" else None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        host, port = server.server_address
+        return f"http://{host}:{port}"
+
+    def _request_json(self, url, data=None):
+        if data is None:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+        body = json.dumps(data).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def test_a2a_instance_agent_card_is_exposed(self):
+        base_url = self._start_bridge_server()
+
+        card = self._request_json(f"{base_url}/a2a/agents/test/agent-card.json")
+
+        self.assertEqual(card["metadata"]["instance_id"], "test")
+        self.assertEqual(card["metadata"]["gateway"], "runtime-a2a-gateway")
+        self.assertTrue(card["supportedInterfaces"][0]["url"].endswith("/a2a/agents/test/rpc"))
+        self.assertEqual(card["supportedInterfaces"][0]["protocolBinding"], "JSONRPC")
+
+    def test_a2a_instance_rpc_invokes_bound_agent_runtime(self):
+        self.sop["active_agent_runtime"] = "codex"
+        base_url = self._start_bridge_server()
+        calls = []
+
+        class Completed:
+            returncode = 0
+            stdout = "sop-a2a-agent-ok\n"
+            stderr = ""
+
+        def fake_run(args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return Completed()
+
+        with patch.object(bridge, "agent_runtime_command", return_value="/usr/bin/codex"), \
+                patch.object(bridge.subprocess, "run", side_effect=fake_run):
+            response = self._request_json(f"{base_url}/a2a/agents/test/rpc", {
+                "jsonrpc": "2.0",
+                "id": "smoke-1",
+                "method": "message/send",
+                "params": {
+                    "message": {
+                        "role": "user",
+                        "parts": [{"text": "Print exactly sop-a2a-agent-ok."}],
+                    }
+                },
+            })
+
+        task = response["result"]
+        self.assertEqual(task["status"]["state"], "completed")
+        self.assertIn("sop-a2a-agent-ok", json.dumps(task, ensure_ascii=False))
+        self.assertEqual(calls[0]["args"][:3], ["/usr/bin/codex", "exec", "--skip-git-repo-check"])
+        record_path = self.wiki / task["metadata"]["record_path"]
+        self.assertTrue(record_path.exists())
+
+    def test_a2a_smoke_node_agent_card_and_rpc_write_node_run_manifest(self):
+        base_url = self._start_bridge_server()
+
+        card = self._request_json(f"{base_url}/a2a/agents/test/nodes/a2a-smoke-echo/agent-card.json")
+        self.assertEqual(card["metadata"]["node_id"], "a2a-smoke-echo")
+        self.assertTrue(card["supportedInterfaces"][0]["url"].endswith("/a2a/agents/test/nodes/a2a-smoke-echo/rpc"))
+
+        response = self._request_json(f"{base_url}/a2a/agents/test/nodes/a2a-smoke-echo/rpc", {
+            "jsonrpc": "2.0",
+            "id": "node-smoke-1",
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"text": "Print exactly sop-a2a-node-ok."}],
+                }
+            },
+        })
+
+        task = response["result"]
+        self.assertEqual(task["status"]["state"], "completed")
+        self.assertIn("sop-a2a-node-ok", json.dumps(task, ensure_ascii=False))
+        node_run_id = task["metadata"]["node_run_id"]
+        manifest = self.wiki / "raw" / "node-runs" / node_run_id / "outputs" / "manifest.json"
+        result_file = self.wiki / "raw" / "node-runs" / node_run_id / "result.json"
+        self.assertTrue(manifest.exists())
+        self.assertTrue(result_file.exists())
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(manifest_data["outputs"]["status"], "succeeded")
+        self.assertIn("sop-a2a-node-ok", manifest_data["outputs"]["result"])
+
     def test_resolves_context_and_upstream_artifacts(self):
         detail = bridge.node_runtime_detail(self.sop, "pipe-1", "wiki-build")
         self.assertEqual(detail["resolved_inputs"]["reports"], ["frozen-report.md"])

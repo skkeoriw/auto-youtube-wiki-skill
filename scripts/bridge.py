@@ -87,6 +87,8 @@ CREATE_INSTANCE_NODES = [
     "prepare-instance-workspace",
     "upsert-instance-registry",
     "test-instance-agent-runtime",
+    "register-instance-a2a-agent",
+    "test-instance-a2a-agent",
     "test-instance-github",
     "test-instance-telegram",
     "verify-instance-visible",
@@ -284,6 +286,8 @@ RUNTIME_NODE_EXPLAIN = {
     "parse-create-instance-request": ("解析创建 Instance 请求", "标准化 instance_id、repo、sop_type 和目标 Runtime SSH 上下文。", ["读取 create-instance 请求", "继承 Runtime 连接配置", "写入 instance 创建上下文"], ["instance_id/repo 为空时无法创建业务实例。"]),
     "prepare-instance-workspace": ("准备 Instance 工作区", "在目标 Runtime 上创建或收敛该 Instance 的独立工作目录。", ["创建 workspace", "准备 repo/raw/artifacts/runs 目录", "记录路径"], ["workspace 路径冲突时检查 instance_id 和 repo 名称。"]),
     "upsert-instance-registry": ("注册 Instance", "把 Instance 写入 Runtime registry，并保持可重复执行。", ["更新 registry", "确认 enabled 状态", "记录 registry 报告"], ["registry 无法写入时检查目标机器 ~/.sop 权限。"]),
+    "register-instance-a2a-agent": ("注册 Instance A2A Agent", "验证 Runtime A2A Gateway 已为该 Instance 暴露 Agent Card 和 RPC 入口。", ["生成 A2A Agent Card URL", "读取 Agent Card", "确认 JSON-RPC supportedInterface", "记录 card/rpc URL"], ["Agent Card 404 时确认目标 Runtime 已部署新版 bridge.py。"]),
+    "test-instance-a2a-agent": ("测试 Instance A2A Agent", "通过 A2A JSON-RPC SendMessage 调用该 Instance 绑定的 Agent Runtime，确认可返回 Task/Artifact。", ["发送 A2A message/send", "检查 Task status", "记录 task_id 和 artifact", "显式标记 OpenClaw not_verifiable_by_default"], ["Hermes/Codex A2A 失败时检查对应 CLI 登录和模型配置。", "OpenClaw 未配置模板时应显示 not_verifiable_by_default。"]),
     "verify-instance-visible": ("验证 Instance 可见", "确认 Runtime SPI 已能发现新增 Instance。", ["请求 /api/sop", "匹配 instance_id", "记录可见性"], ["Instance 不可见时检查 bridge 是否重载 registry。"]),
     "parse-delete-instance-request": ("解析删除 Instance 请求", "定位要删除的 Instance、workspace、repo 和 force 策略。", ["读取 delete-instance 请求", "继承 Runtime 连接配置", "写入删除上下文"], ["runtime-management 是受保护管理实例，不能当作业务 Instance 删除。"]),
     "safety-check-instance": ("检查 Instance 运行中任务", "删除前检查该 Instance 是否还有 running/pending executions。", ["查询 runs", "识别运行中任务", "根据 force 决策"], ["存在运行中任务时普通删除应停止。"]),
@@ -2630,6 +2634,7 @@ def node_registry_item(sop, node_id, endpoint=""):
         },
         "actions": node_actions(instance_id, node_id, node_classification_for(node_id)),
         "cli": node_cli_examples(endpoint or "{endpoint}", instance_id, node_id),
+        "a2a_agent": a2a_agent_summary(sop, endpoint, node_id),
         "ui": static.get("ui") or {},
         "coverage_report": static.get("coverage_report") or {},
         "modules": node_modules(sop, node_id, endpoint),
@@ -5941,6 +5946,8 @@ def read_registry():
 
 AGENT_RUNTIME_CHOICES = ("hermes", "openclaw", "codex")
 DEFAULT_ACTIVE_AGENT_RUNTIME = "hermes"
+A2A_PROTOCOL_VERSION = "1.0"
+A2A_SMOKE_NODE_ID = "a2a-smoke-echo"
 
 
 def normalize_agent_runtime(value, default=DEFAULT_ACTIVE_AGENT_RUNTIME):
@@ -6852,6 +6859,7 @@ def instance_summary(sop, include_latest=True):
         "active_agent_runtime": active_agent_runtime,
         "agent_runtime": active_agent_runtime,
         "agent_runtime_status": agent_runtime_summary(active_agent_runtime),
+        "a2a_agent": a2a_agent_summary(sop, sop.get("channel_url") or sop.get("spi_base_url") or ""),
         "enabled": bool(sop.get("enabled", True)),
         "repo": sop.get("repo", ""),
         "repo_branch": sop.get("repo_branch", "main"),
@@ -14345,6 +14353,607 @@ def list_node_runs(sop, node_id, limit=20):
     return rows
 
 
+def a2a_route_path(instance_id, node_id="", suffix="rpc"):
+    instance = quote(str(instance_id or ""), safe="")
+    if node_id:
+        return f"/a2a/agents/{instance}/nodes/{quote(str(node_id or ''), safe='')}/{suffix}"
+    return f"/a2a/agents/{instance}/{suffix}"
+
+
+def a2a_join_url(endpoint, path):
+    path = str(path or "")
+    endpoint = str(endpoint or "").rstrip("/")
+    if not endpoint:
+        return path
+    return f"{endpoint}{path if path.startswith('/') else '/' + path}"
+
+
+def a2a_agent_summary(sop, endpoint="", node_id=""):
+    instance_id = sop.get("instance_id") or sop.get("id") or ""
+    active_agent_runtime = normalize_agent_runtime(sop.get("active_agent_runtime") or sop.get("agent_runtime"))
+    card_path = a2a_route_path(instance_id, node_id, "agent-card.json")
+    rpc_path = a2a_route_path(instance_id, node_id, "rpc")
+    return {
+        "protocol": "a2a",
+        "protocol_version": A2A_PROTOCOL_VERSION,
+        "agent_id": f"{instance_id}/nodes/{node_id}" if node_id else instance_id,
+        "scope": "node" if node_id else "instance",
+        "instance_id": instance_id,
+        "node_id": node_id or "",
+        "active_agent_runtime": active_agent_runtime,
+        "agent_card_url": a2a_join_url(endpoint, card_path),
+        "rpc_url": a2a_join_url(endpoint, rpc_path),
+        "agent_card_path": card_path,
+        "rpc_path": rpc_path,
+        "gateway": "runtime-a2a-gateway",
+    }
+
+
+def a2a_text_part(text, media_type="text/plain", filename=""):
+    text = str(text or "")
+    return {
+        "content": {"$case": "text", "value": text},
+        "text": text,
+        "mediaType": media_type,
+        "media_type": media_type,
+        "filename": filename or "",
+        "metadata": {},
+    }
+
+
+def a2a_data_part(data, filename="data.json"):
+    return {
+        "content": {"$case": "data", "value": data},
+        "data": data,
+        "mediaType": "application/json",
+        "media_type": "application/json",
+        "filename": filename or "data.json",
+        "metadata": {},
+    }
+
+
+def a2a_message(role, text, task_id="", context_id=""):
+    digest = hashlib.sha1(f"{task_id}:{context_id}:{role}:{text}".encode("utf-8")).hexdigest()[:10]
+    return {
+        "messageId": f"msg-{digest}",
+        "message_id": f"msg-{digest}",
+        "contextId": context_id,
+        "context_id": context_id,
+        "taskId": task_id,
+        "task_id": task_id,
+        "role": role,
+        "parts": [a2a_text_part(text)],
+        "metadata": {},
+        "extensions": [],
+        "referenceTaskIds": [],
+    }
+
+
+def a2a_artifact(name, parts, description=""):
+    digest = hashlib.sha1(f"{name}:{json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)}".encode("utf-8")).hexdigest()[:10]
+    return {
+        "artifactId": f"artifact-{digest}",
+        "artifact_id": f"artifact-{digest}",
+        "name": name,
+        "description": description,
+        "parts": parts,
+        "metadata": {},
+        "extensions": [],
+    }
+
+
+def a2a_task(task_id, context_id, state, message_text, artifacts=None, metadata=None):
+    return {
+        "id": task_id,
+        "contextId": context_id,
+        "context_id": context_id,
+        "status": {
+            "state": state,
+            "message": a2a_message("agent", message_text, task_id=task_id, context_id=context_id),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+        "artifacts": artifacts or [],
+        "history": [],
+        "metadata": metadata or {},
+    }
+
+
+def a2a_task_id(prefix, payload):
+    token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    digest = hashlib.sha1(json.dumps(payload if isinstance(payload, dict) else {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:8]
+    return sanitize_node_run_id(f"{prefix}-{token}-{digest}")
+
+
+def a2a_payload(data):
+    if isinstance(data, dict) and isinstance(data.get("params"), dict):
+        return data.get("params") or {}
+    return data if isinstance(data, dict) else {}
+
+
+def a2a_method(data):
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("method") or "").strip()
+
+
+def a2a_rpc_supported(data):
+    method = a2a_method(data)
+    if not method:
+        return True
+    return method in {"message/send", "SendMessage", "sendMessage", "send_message", "tasks/send"}
+
+
+def a2a_rpc_response(request, result=None, error=None):
+    if isinstance(request, dict) and (request.get("jsonrpc") or request.get("method") or "id" in request):
+        response = {"jsonrpc": "2.0", "id": request.get("id")}
+        if error is not None:
+            response["error"] = error
+        else:
+            response["result"] = result
+        return response
+    return result if error is None else {"error": error}
+
+
+def a2a_extract_message(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+    if not message and isinstance(payload.get("params"), dict):
+        message = payload["params"].get("message") if isinstance(payload["params"].get("message"), dict) else {}
+    return message
+
+
+def a2a_part_text(part):
+    if not isinstance(part, dict):
+        return ""
+    if part.get("text") not in (None, ""):
+        return str(part.get("text") or "")
+    content = part.get("content") if isinstance(part.get("content"), dict) else {}
+    if content.get("$case") == "text":
+        return str(content.get("value") or "")
+    if part.get("data") not in (None, ""):
+        try:
+            return json.dumps(part.get("data"), ensure_ascii=False)
+        except Exception:
+            return str(part.get("data"))
+    if content.get("$case") == "data":
+        try:
+            return json.dumps(content.get("value"), ensure_ascii=False)
+        except Exception:
+            return str(content.get("value") or "")
+    return ""
+
+
+def a2a_extract_text(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    direct = payload.get("text") or payload.get("prompt") or payload.get("instruction")
+    if direct:
+        return str(direct)
+    message = a2a_extract_message(payload)
+    parts = message.get("parts") if isinstance(message.get("parts"), list) else []
+    texts = [text for text in (a2a_part_text(part) for part in parts) if text]
+    return "\n".join(texts).strip()
+
+
+def a2a_agent_card(sop, endpoint, node_id=""):
+    instance_id = sop.get("instance_id") or sop.get("id") or ""
+    active_agent_runtime = normalize_agent_runtime(sop.get("active_agent_runtime") or sop.get("agent_runtime"))
+    summary = a2a_agent_summary(sop, endpoint, node_id)
+    if node_id:
+        static = node_static_config(sop, node_id) or {}
+        title = static.get("title") or node_id
+        description = static.get("purpose") or static.get("description") or f"Node-backed A2A Agent for {node_id}."
+        skill_id = node_id
+        skill_name = title
+        skill_description = description
+        tags = ["sop", "node", "a2a", active_agent_runtime]
+    else:
+        title = sop.get("title") or instance_id
+        description = f"Instance-bound A2A Agent backed by {active_agent_runtime}."
+        skill_id = f"{instance_id}.agent-runtime"
+        skill_name = f"{title} Agent Runtime"
+        skill_description = description
+        tags = ["sop", "instance", "a2a", active_agent_runtime]
+    return {
+        "name": skill_name,
+        "description": description,
+        "supportedInterfaces": [
+            {
+                "url": summary["rpc_url"],
+                "protocolBinding": "JSONRPC",
+                "tenant": "",
+                "protocolVersion": A2A_PROTOCOL_VERSION,
+            }
+        ],
+        "provider": {
+            "organization": "SOP Runtime",
+            "url": endpoint or sop.get("channel_url") or "",
+        },
+        "version": "1.0.0-sop-runtime-a2a",
+        "documentationUrl": "",
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "extensions": [],
+            "extendedAgentCard": False,
+        },
+        "securitySchemes": {},
+        "securityRequirements": [],
+        "defaultInputModes": ["text/plain", "application/json"],
+        "defaultOutputModes": ["text/plain", "text/markdown", "application/json"],
+        "skills": [
+            {
+                "id": skill_id,
+                "name": skill_name,
+                "description": skill_description,
+                "tags": tags,
+                "examples": ["Print exactly sop-a2a-agent-ok." if not node_id else "Print exactly sop-a2a-node-ok."],
+                "inputModes": ["text/plain", "application/json"],
+                "outputModes": ["text/plain", "application/json"],
+                "securityRequirements": [],
+            }
+        ],
+        "signatures": [],
+        "iconUrl": "",
+        "metadata": {
+            "runtime_id": sop.get("runtime_id", ""),
+            "instance_id": instance_id,
+            "node_id": node_id or "",
+            "active_agent_runtime": active_agent_runtime,
+            "gateway": "runtime-a2a-gateway",
+        },
+    }
+
+
+def a2a_instance_command_args(runtime_name, request_text):
+    runtime_name = normalize_agent_runtime(runtime_name)
+    if runtime_name == "hermes":
+        command = hermes_agent_command()
+        if not command:
+            return []
+        base = shlex.split(command) if any(ch.isspace() for ch in command) else [command]
+        return base + ["--oneshot", request_text]
+    if runtime_name == "codex":
+        command = agent_runtime_command("codex")
+        if not command:
+            return []
+        base = shlex.split(command) if any(ch.isspace() for ch in command) else [command]
+        return base + ["exec", "--skip-git-repo-check", request_text]
+    if runtime_name == "openclaw":
+        template = str(os.environ.get("OPENCLAW_A2A_COMMAND_TEMPLATE") or os.environ.get("OPENCLAW_NODE_RUN_COMMAND_TEMPLATE") or "").strip()
+        if not template:
+            return []
+        rendered = template.replace("{{request}}", shlex.quote(str(request_text or ""))).replace("{{skill}}", "sop-a2a-instance")
+        return ["bash", "-lc", rendered]
+    return []
+
+
+def write_a2a_run_record(sop, task_id, record):
+    wiki = Path(sop["wiki_local_path"]).expanduser()
+    path = wiki / "raw" / "a2a-runs" / f"{sanitize_node_run_id(task_id)}.json"
+    write_json(path, record)
+    return safe_relative_file(wiki.resolve(), path)
+
+
+def run_a2a_instance_task(sop, request):
+    payload = a2a_payload(request)
+    text = a2a_extract_text(payload) or "Print exactly sop-a2a-agent-ok."
+    task_id = a2a_task_id(f"a2a-task-{sop.get('instance_id') or sop.get('id')}", {"text": text, "scope": "instance"})
+    context_id = str((a2a_extract_message(payload) or {}).get("contextId") or (a2a_extract_message(payload) or {}).get("context_id") or f"ctx-{task_id[-8:]}")
+    runtime_name = normalize_agent_runtime(sop.get("active_agent_runtime") or sop.get("agent_runtime"))
+    args = a2a_instance_command_args(runtime_name, text)
+    started = datetime.now(timezone.utc)
+    stdout = ""
+    stderr = ""
+    returncode = None
+    state = "failed"
+    reason = ""
+    auth_status = "not_checked"
+    timeout_seconds = int(os.environ.get("SOP_A2A_AGENT_TIMEOUT", "120") or "120")
+    if not args:
+        auth_status = "not_verifiable_by_default" if runtime_name == "openclaw" else "command_missing"
+        reason = (
+            "OpenClaw A2A adapter is not verifiable by default; configure OPENCLAW_A2A_COMMAND_TEMPLATE to enable runtime calls."
+            if runtime_name == "openclaw"
+            else f"{runtime_name} CLI is missing or not configured."
+        )
+    else:
+        env = prepend_command_dir_to_env({**os.environ, "TERM": "xterm-256color"}, args)
+        try:
+            completed = subprocess.run(
+                args,
+                cwd=str(Path(sop["wiki_local_path"]).expanduser()),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            returncode = completed.returncode
+            stdout = strip_ansi(completed.stdout or "")
+            stderr = strip_ansi(completed.stderr or "")
+            if returncode == 0 and (stdout.strip() or stderr.strip()):
+                state = "completed"
+                auth_status = "ok"
+            else:
+                auth_status = "failed"
+                reason = stderr.strip() or stdout.strip() or f"{runtime_name} returned no response"
+        except subprocess.TimeoutExpired as exc:
+            returncode = 124
+            stdout = strip_ansi(exc.stdout or "")
+            stderr = strip_ansi(exc.stderr or "")
+            auth_status = "timeout"
+            reason = f"{runtime_name} A2A task timed out after {timeout_seconds}s"
+        except Exception as exc:
+            auth_status = "failed"
+            reason = str(exc)
+    finished = datetime.now(timezone.utc)
+    output = (stdout.strip() or stderr.strip() or reason).strip()
+    artifacts = [
+        a2a_artifact("agent-response.txt", [a2a_text_part(output)]),
+        a2a_artifact("agent-runtime-trace.json", [a2a_data_part({
+            "runtime": runtime_name,
+            "command": node_run_command_preview(args),
+            "returncode": returncode,
+            "reason": reason,
+            "started_at": started.isoformat(),
+            "finished_at": finished.isoformat(),
+        }, "agent-runtime-trace.json")]),
+    ]
+    task = a2a_task(task_id, context_id, state, output or reason or state, artifacts, {
+        "runtime_id": sop.get("runtime_id", ""),
+        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+        "active_agent_runtime": runtime_name,
+        "auth_status": auth_status,
+        "returncode": returncode,
+        "reason": reason,
+    })
+    record_path = write_a2a_run_record(sop, task_id, {
+        "schema": "sop-a2a-run/v1",
+        "task": task,
+        "request": mask_data(request),
+        "runtime": runtime_name,
+        "command": node_run_command_preview(args),
+        "stdout": stdout,
+        "stderr": stderr,
+        "returncode": returncode,
+        "started_at": started.isoformat(),
+        "finished_at": finished.isoformat(),
+    })
+    task["metadata"]["record_path"] = record_path
+    return task
+
+
+def a2a_node_manual_inputs(sop, node_id, payload):
+    payload = payload if isinstance(payload, dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    for candidate in (payload.get("manual_inputs"), metadata.get("manual_inputs")):
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    text = a2a_extract_text(payload)
+    static = node_static_config(sop, node_id) or {}
+    entry_inputs = static.get("entry_inputs") if isinstance(static.get("entry_inputs"), dict) else {}
+    if not entry_inputs:
+        return {"prompt": text}
+    if "prompt" in entry_inputs:
+        return {"prompt": text}
+    required = [name for name, spec in entry_inputs.items() if isinstance(spec, dict) and spec.get("required")]
+    if len(required) == 1:
+        return {required[0]: text}
+    if "instruction" in entry_inputs:
+        return {"instruction": text}
+    return {"prompt": text}
+
+
+def write_a2a_smoke_node_run(sop, node_id, payload):
+    payload = payload if isinstance(payload, dict) else {}
+    text = a2a_extract_text(payload) or "Print exactly sop-a2a-node-ok."
+    task_id = a2a_task_id(f"a2a-task-{node_id}", {"text": text, "scope": "node"})
+    context_id = str((a2a_extract_message(payload) or {}).get("contextId") or (a2a_extract_message(payload) or {}).get("context_id") or f"ctx-{task_id[-8:]}")
+    token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    digest = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:6]
+    node_run_id = sanitize_node_run_id(f"node-run-{node_id}-{token}-{digest}")
+    wiki = Path(sop["wiki_local_path"]).expanduser().resolve()
+    workspace = node_run_workspace(sop, node_run_id)
+    input_dir = node_run_input_sources_dir(sop, node_run_id)
+    output_dir = node_run_output_files_dir(sop, node_run_id)
+    started = datetime.now(timezone.utc)
+    result_text = f"sop-a2a-node-ok\n\n{text}".strip()
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (input_dir / "0001.txt").write_text(text, encoding="utf-8")
+    write_json(input_dir / "manifest.json", {
+        "version": 1,
+        "kind": "input",
+        "node_run_id": node_run_id,
+        "node_id": node_id,
+        "items": [{
+            "path": "0001.txt",
+            "input_name": "prompt",
+            "value_type": "text",
+            "source": "a2a.message.parts",
+        }],
+    })
+    write_json(output_dir / "result.json", {
+        "result": result_text,
+        "status": "succeeded",
+        "a2a_task_id": task_id,
+        "node_run_id": node_run_id,
+    })
+    write_json(output_dir / "manifest.json", {
+        "version": 1,
+        "kind": "output",
+        "node_run_id": node_run_id,
+        "node_id": node_id,
+        "status": "succeeded",
+        "outputs": {
+            "result": result_text,
+            "status": "succeeded",
+            "task_id": task_id,
+        },
+        "items": [
+            {"output": "result", "value": result_text, "value_type": "text", "kind": "scalar", "source": "a2a-smoke"},
+            {"output": "status", "value": "succeeded", "value_type": "text", "kind": "scalar", "source": "a2a-smoke"},
+            {"output": "task_id", "value": task_id, "value_type": "text", "kind": "scalar", "source": "a2a-smoke"},
+        ],
+    })
+    finished = datetime.now(timezone.utc)
+    elapsed_ms = int((finished - started).total_seconds() * 1000)
+    steps = [
+        {"id": "create-run", "title": "Create node run workspace", "status": "done", "summary": "A2A Node Run record was allocated.", "started_at": started.isoformat(), "finished_at": started.isoformat(), "elapsed_ms": 0},
+        {"id": "resolve-inputs", "title": "Resolve A2A message parts", "status": "done", "summary": "A2A text parts were materialized into the Node Run input manifest.", "started_at": started.isoformat(), "finished_at": started.isoformat(), "elapsed_ms": 0},
+        {"id": "execute-or-dry-run", "title": "Execute A2A smoke node", "status": "done", "summary": "A2A smoke node produced the expected marker.", "started_at": started.isoformat(), "finished_at": finished.isoformat(), "elapsed_ms": elapsed_ms},
+        {"id": "validate-outputs", "title": "Validate declared outputs", "status": "done", "summary": "A2A smoke outputs were written to manifest.json.", "started_at": finished.isoformat(), "finished_at": finished.isoformat(), "elapsed_ms": 0},
+    ]
+    events = node_run_events_from_steps(node_run_id, node_id, steps, finished.isoformat())
+    result = {
+        "node_run_id": node_run_id,
+        "pipeline_id": node_run_id,
+        "runtime_id": sop.get("runtime_id", ""),
+        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+        "workflow_id": workflow_id_for_sop(sop),
+        "node_id": node_id,
+        "node_title": "A2A Smoke Echo",
+        "status": "done",
+        "mode": "a2a-node",
+        "input_source": "a2a-message",
+        "started_at": started.isoformat(),
+        "finished_at": finished.isoformat(),
+        "elapsed_ms": elapsed_ms,
+        "pending": False,
+        "reason": "",
+        "steps": steps,
+        "events": events,
+        "artifacts": [{
+            "id": "node-run-result",
+            "producer": node_id,
+            "type": "node-run.result",
+            "format": "json",
+            "path": f"raw/node-runs/{node_run_id}/result.json",
+            "title": "Node Run diagnostic result",
+            "resolution": "recorded",
+        }],
+        "actual_outputs": {"result": result_text, "status": "succeeded", "task_id": task_id},
+        "core_outputs": [
+            {"name": "result", "kind": "scalar", "type": "scalar", "value": result_text, "files": [], "artifacts": []},
+            {"name": "status", "kind": "scalar", "type": "scalar", "value": "succeeded", "files": [], "artifacts": []},
+            {"name": "task_id", "kind": "scalar", "type": "scalar", "value": task_id, "files": [], "artifacts": []},
+        ],
+        "business_output_status": {
+            "status": "passed",
+            "expected_outputs": ["result", "status", "task_id"],
+            "present_outputs": ["result", "status", "task_id"],
+            "missing_required_outputs": [],
+            "business_outputs": {"result": result_text, "status": "succeeded", "task_id": task_id},
+            "business_artifact_count": 0,
+        },
+        "business_artifacts": [],
+        "output_directory": safe_relative_file(wiki, output_dir),
+        "output_manifest": safe_relative_file(wiki, output_dir / "manifest.json"),
+        "input_directory": safe_relative_file(wiki, input_dir),
+        "input_manifest": safe_relative_file(wiki, input_dir / "manifest.json"),
+        "validation": {"status": "passed", "missing_outputs": [], "unexpected_outputs": []},
+        "a2a": {"task_id": task_id, "context_id": context_id},
+        "detail": {"a2a_request": mask_data(payload)},
+    }
+    write_json(workspace / "input.json", payload)
+    write_json(workspace / "result.json", result)
+    write_jsonl(workspace / "events.jsonl", events)
+    task = a2a_task(task_id, context_id, "completed", result_text, [
+        a2a_artifact("a2a-smoke-result.txt", [a2a_text_part(result_text)]),
+        a2a_artifact("node-run-result.json", [a2a_data_part({
+            "node_run_id": node_run_id,
+            "output_manifest": result["output_manifest"],
+            "actual_outputs": result["actual_outputs"],
+        }, "node-run-result.json")]),
+    ], {
+        "runtime_id": result["runtime_id"],
+        "instance_id": result["instance_id"],
+        "node_id": node_id,
+        "node_run_id": node_run_id,
+        "output_manifest": result["output_manifest"],
+    })
+    return task
+
+
+def a2a_task_from_node_run_result(sop, node_id, payload, http_code, result):
+    payload = payload if isinstance(payload, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    task_id = a2a_task_id(f"a2a-task-{node_id}", {"node_run_id": result.get("node_run_id"), "payload": payload})
+    context_id = str((a2a_extract_message(payload) or {}).get("contextId") or (a2a_extract_message(payload) or {}).get("context_id") or f"ctx-{task_id[-8:]}")
+    run_status = str(result.get("status") or "").lower()
+    state = "working" if result.get("pending") else "completed" if http_code < 400 and run_status in {"done", "passed", "success", "succeeded"} else "failed"
+    actual_outputs = result.get("actual_outputs") if isinstance(result.get("actual_outputs"), dict) else {}
+    text = (
+        str(actual_outputs.get("result") or actual_outputs.get("summary") or "")
+        or result.get("reason")
+        or result.get("status")
+        or f"Node {node_id} finished with status {run_status or http_code}."
+    )
+    artifacts = [
+        a2a_artifact("node-run-result.json", [a2a_data_part(mask_data({
+            "node_run_id": result.get("node_run_id"),
+            "status": result.get("status"),
+            "actual_outputs": actual_outputs,
+            "business_output_status": result.get("business_output_status") or {},
+            "output_manifest": result.get("output_manifest") or "",
+        }), "node-run-result.json")])
+    ]
+    if text:
+        artifacts.insert(0, a2a_artifact("node-output.txt", [a2a_text_part(text)]))
+    return a2a_task(task_id, context_id, state, text, artifacts, {
+        "runtime_id": sop.get("runtime_id", ""),
+        "instance_id": sop.get("instance_id") or sop.get("id", ""),
+        "node_id": node_id,
+        "node_run_id": result.get("node_run_id") or "",
+        "http_status": http_code,
+        "node_run_status": result.get("status") or "",
+        "output_manifest": result.get("output_manifest") or "",
+    })
+
+
+def run_a2a_node_task(sop, node_id, request):
+    payload = a2a_payload(request)
+    if node_id == A2A_SMOKE_NODE_ID:
+        return 200, write_a2a_smoke_node_run(sop, node_id, payload)
+    if node_registry_item(sop, node_id) is None:
+        return 404, a2a_task(
+            a2a_task_id(f"a2a-task-{node_id}", {"missing": True}),
+            "ctx-missing-node",
+            "failed",
+            f"Node {node_id!r} not found.",
+            metadata={"node_id": node_id},
+        )
+    manual_inputs = a2a_node_manual_inputs(sop, node_id, payload)
+    configuration = payload.get("configuration") if isinstance(payload.get("configuration"), dict) else {}
+    return_immediately = bool(configuration.get("returnImmediately") or configuration.get("return_immediately"))
+    body = {
+        "mode": "real-node",
+        "input_source": "manual",
+        "manual_inputs": manual_inputs,
+        "sync": not return_immediately,
+        "a2a": {
+            "protocol_version": A2A_PROTOCOL_VERSION,
+            "message": a2a_extract_message(payload),
+            "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+        },
+    }
+    http_code, result = create_node_run(sop, workflow_id_for_sop(sop), node_id, body)
+    return http_code, a2a_task_from_node_run_result(sop, node_id, payload, http_code, result)
+
+
+def handle_a2a_instance_rpc(sop, request):
+    if not a2a_rpc_supported(request):
+        return 400, a2a_rpc_response(request, error={"code": -32601, "message": f"Unsupported A2A method: {a2a_method(request)}"})
+    task = run_a2a_instance_task(sop, request)
+    return 200, a2a_rpc_response(request, task)
+
+
+def handle_a2a_node_rpc(sop, node_id, request):
+    if not a2a_rpc_supported(request):
+        return 400, a2a_rpc_response(request, error={"code": -32601, "message": f"Unsupported A2A method: {a2a_method(request)}"})
+    http_code, task = run_a2a_node_task(sop, node_id, request)
+    return (200 if http_code < 500 else http_code), a2a_rpc_response(request, task)
+
+
 def trigger_node_test(sop, node_id, body):
     """Single-node isolated test, callable run-less from the asset center or from
     a Run's node panel. Reuses the engine's --test isolation + dependency guards.
@@ -14732,6 +15341,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path == []:
                 return json_response(self, 200, {"status": "ok", "service": "sop-bridge", "runtime": runtime_info()})
+            if len(path) in {4, 5} and path[0:2] == ["a2a", "agents"] and (
+                    path[3] == "agent-card.json" or (len(path) == 5 and path[3] == ".well-known" and path[4] == "agent-card.json")):
+                sop = find_sop(path[2])
+                if not sop:
+                    return json_response(self, 404, {"detail": "A2A instance agent not found"})
+                return json_response(self, 200, a2a_agent_card(sop, request_endpoint(self)))
+            if len(path) in {6, 7} and path[0:2] == ["a2a", "agents"] and path[3] == "nodes" and (
+                    path[5] == "agent-card.json" or (len(path) == 7 and path[5] == ".well-known" and path[6] == "agent-card.json")):
+                sop = find_sop(path[2])
+                if not sop:
+                    return json_response(self, 404, {"detail": "A2A instance agent not found"})
+                if path[4] != A2A_SMOKE_NODE_ID and node_registry_item(sop, path[4], request_endpoint(self)) is None:
+                    return json_response(self, 404, {"detail": f"A2A node agent {path[4]!r} not found"})
+                return json_response(self, 200, a2a_agent_card(sop, request_endpoint(self), path[4]))
             if path == ["api", "sop"]:
                 return json_response(self, 200, sop_manifest())
             if path == ["api", "sop", "runtime"]:
@@ -15272,6 +15895,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = {}
 
         path = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+
+        if len(path) == 4 and path[0:2] == ["a2a", "agents"] and path[3] == "rpc":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "A2A instance agent not found"})
+            status, result = handle_a2a_instance_rpc(sop, data)
+            return json_response(self, status, result)
+
+        if len(path) == 6 and path[0:2] == ["a2a", "agents"] and path[3] == "nodes" and path[5] == "rpc":
+            sop = find_sop(path[2])
+            if not sop:
+                return json_response(self, 404, {"detail": "A2A instance agent not found"})
+            status, result = handle_a2a_node_rpc(sop, path[4], data)
+            return json_response(self, status, result)
 
         # POST /api/sop/runtime/hermes-smoke  → server-side signed Hermes connectivity check.
         if path == ["api", "sop", "runtime", "hermes-smoke"]:
