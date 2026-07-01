@@ -3872,8 +3872,12 @@ DIAGNOSTIC_OUTPUT_NAMES = {
 }
 
 
+def output_name_key(name):
+    return str(name or "").strip().lower().replace("-", "_")
+
+
 def is_business_output_name(name):
-    return str(name or "").strip().lower() not in DIAGNOSTIC_OUTPUT_NAMES
+    return output_name_key(name) not in DIAGNOSTIC_OUTPUT_NAMES
 
 
 def output_value_present(value):
@@ -3918,6 +3922,7 @@ def declared_outputs_from_node_run_result(sop, node_id, result=None, declared_ou
 def business_output_status_for(sop, node_id, actual_outputs, declared_outputs=None, artifacts=None, result=None):
     declared_outputs = declared_outputs_from_node_run_result(sop, node_id, result, declared_outputs)
     expected_names = [name for name in declared_outputs.keys() if is_business_output_name(name)]
+    expected_keys = {output_name_key(name) for name in expected_names}
     required_names = [
         name
         for name, spec in declared_outputs.items()
@@ -3926,7 +3931,26 @@ def business_output_status_for(sop, node_id, actual_outputs, declared_outputs=No
     business_outputs = business_actual_outputs(actual_outputs)
     present_names = [name for name in expected_names if output_value_present((actual_outputs or {}).get(name))]
     missing_required = [name for name in required_names if name not in present_names]
-    artifact_count = len([item for item in (artifacts or []) if isinstance(item, dict) and is_business_output_name(item.get("output") or item.get("name") or item.get("id"))])
+    artifact_output_keys = []
+    for item in artifacts or []:
+        if not isinstance(item, dict):
+            continue
+        raw_name = item.get("output") or item.get("output_name") or item.get("name") or item.get("id")
+        if not is_business_output_name(raw_name):
+            continue
+        key = output_name_key(raw_name)
+        if expected_keys and key not in expected_keys:
+            continue
+        artifact_output_keys.append(key)
+    artifact_count = len(artifact_output_keys)
+    if expected_names and artifact_output_keys:
+        present_keys = {output_name_key(name) for name in present_names}
+        for name in expected_names:
+            key = output_name_key(name)
+            if key in artifact_output_keys and key not in present_keys:
+                present_names.append(name)
+                present_keys.add(key)
+    missing_required = [name for name in required_names if name not in present_names]
     result = result if isinstance(result, dict) else {}
     execution_status = str(
         result.get("status")
