@@ -4821,7 +4821,7 @@ def validate_workflow_edge_draft_input(sop, workflow_id, spec):
     upstream = str(spec.get("upstream_node_id") or edge.get("from") or edge.get("source") or "").strip()
     downstream = str(spec.get("downstream_node_id") or edge.get("to") or edge.get("target") or "").strip()
     instruction = str(spec.get("edge_handoff_instruction") or edge.get("instruction") or "").strip()
-    nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
+    nodes = workflow_draft_known_nodes(sop)
     if not upstream:
         errors.append({"field": "upstream_node_id", "code": "required", "message": "upstream_node_id is required"})
     elif upstream not in nodes:
@@ -5369,12 +5369,21 @@ def workflow_draft_edge_specs(sop, workflow_id, data):
     return specs
 
 
+def workflow_draft_known_nodes(sop):
+    nodes = {}
+    if isinstance(sop.get("nodes"), dict):
+        nodes.update(sop.get("nodes") or {})
+    for node_id, node in runtime_node_catalog_items().items():
+        nodes.setdefault(node_id, node)
+    return nodes
+
+
 def validate_workflow_draft_input(sop, workflow_id, data):
     data = data if isinstance(data, dict) else {}
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else data
     nodes = draft.get("nodes") if isinstance(draft.get("nodes"), list) else []
     edges = draft.get("edges") if isinstance(draft.get("edges"), list) else []
-    known_nodes = sop.get("nodes") if isinstance(sop.get("nodes"), dict) else {}
+    known_nodes = workflow_draft_known_nodes(sop)
     errors = []
     warnings = []
     seen_nodes = set()
@@ -5526,6 +5535,16 @@ def generate_workflow_draft_runtime_sop(sop, workflow_id, data):
     if not isinstance(runtime_doc, dict):
         runtime_doc = {}
     nodes = runtime_doc.get("nodes") if isinstance(runtime_doc.get("nodes"), dict) else {}
+    draft_manifest = read_json(draft_dir / "workflow_draft.json") or {}
+    draft_payload = draft_manifest.get("draft") if isinstance(draft_manifest.get("draft"), dict) else {}
+    draft_nodes = draft_payload.get("nodes") if isinstance(draft_payload.get("nodes"), list) else []
+    for item in draft_nodes:
+        node_id = str((item or {}).get("nodeId") or (item or {}).get("node_id") or "").strip() if isinstance(item, dict) else ""
+        if not node_id or node_id in nodes:
+            continue
+        runtime_node = runtime_node_catalog_item(node_id)
+        if isinstance(runtime_node, dict):
+            nodes[node_id] = copy.deepcopy(runtime_node)
     errors = []
     edges = runtime_doc.get("edges") if isinstance(runtime_doc.get("edges"), list) else []
     before_edges = copy.deepcopy(edges)
@@ -5567,6 +5586,7 @@ def generate_workflow_draft_runtime_sop(sop, workflow_id, data):
             "draft_id": draft_dir.name,
             "draft_path": str(draft_dir),
         }
+    runtime_doc["nodes"] = nodes
     runtime_doc["edges"] = edges
     runtime_doc["wiki_local_path"] = sop.get("wiki_local_path", "")
     if sop.get("repo"):
@@ -5593,7 +5613,6 @@ def generate_workflow_draft_runtime_sop(sop, workflow_id, data):
         "message": "workflow draft Runtime SOP snapshot prepared; active sop.yaml is unchanged",
     }
     manifest_path.write_text(json.dumps(mask_data(result), ensure_ascii=False, indent=2), encoding="utf-8")
-    draft_manifest = read_json(draft_dir / "workflow_draft.json") or {}
     draft_manifest["runtime_sop_status"] = "runtime_sop_ready"
     draft_manifest["runtime_sop_path"] = str(runtime_sop_path)
     draft_manifest["updated_at"] = _now_iso_utc()
